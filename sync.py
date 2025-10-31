@@ -281,30 +281,57 @@ FRAME_DT = 1.0 / TARGET_FPS
 IDLE_TIMEOUT = 1.5
 
 # Status
+
+# --- STATUS: 1 linha, sem wrap, com truncamento à largura do terminal ---
+import shutil
+
 def print_status(effect_name, ctx, metrics):
+    """
+    Escreve o status em **uma única linha**:
+      - Limpa a linha atual (ESC[2K) e escreve com '\r' no início;
+      - Trunca ao número de colunas do terminal, evitando quebra automática;
+      - Mantém I/P/CAP instantâneos e a janela de 60s.
+    """
     global _last_status, rx_count, current_palette_name, latency_ms_ema, time_sync_ready
     now = time.time()
-    if (now - _last_status) > 0.25:
-        lat_txt = "-.-" if (not time_sync_ready or latency_ms_ema is None) else f"{latency_ms_ema:5.1f}"
-        sync_tag = "✓" if time_sync_ready else " "
-        i_txt = f"{ctx.current_a_ema:4.1f}" if ctx.current_a_ema is not None else "--.-"
-        p_txt = f"{ctx.power_w_ema:5.1f}"    if ctx.power_w_ema is not None else "--.-"
-        cap_txt = f" CAP:{int((1.0-ctx.last_cap_scale)*100):2d}%" if ctx.last_cap_scale < 0.999 else ""
-        # janela 60s
-        i1m_txt = ""
-        try:
-            st = metrics.get_window_stats(60) if metrics else None
-            if st:
-                i1m_avg, _i1m_min, i1m_max, p1m_avg, _p1m_min, p1m_max, cap1m_avg, cap1m_max = st
-                i1m_txt = f"  I1m:{i1m_avg:4.1f}/{i1m_max:4.1f}A  P1m:{p1m_avg:5.1f}/{p1m_max:5.1f}W  CAP1m:{int(cap1m_avg*100):2d}%/{int(cap1m_max*100):2d}%"
-        except Exception:
-            pass
-        sys.stdout.write(
-            f"\rRX: {rx_count} Efeito: {effect_name:<28} Paleta: {current_palette_name:<10} "
-            f"LAT: {lat_txt} ms {sync_tag}  I: {i_txt}A  P: {p_txt}W{cap_txt}{i1m_txt}"
-        )
-        sys.stdout.flush()
-        _last_status = now
+    if (now - _last_status) <= 0.25:
+        return
+
+    # Campos instantâneos
+    lat_txt = "-.-" if (not time_sync_ready or latency_ms_ema is None) else f"{latency_ms_ema:4.1f}"
+    sync_tag = "✓" if time_sync_ready else " "
+    i_txt = "--.-" if ctx.current_a_ema is None else f"{ctx.current_a_ema:3.1f}"
+    p_txt = "--.-" if ctx.power_w_ema   is None else f"{ctx.power_w_ema:4.1f}"
+    cap_txt = f" CAP:{int((1.0-ctx.last_cap_scale)*100):2d}%" if ctx.last_cap_scale < 0.999 else ""
+
+    # Janela 60s (curta)
+    i1m_txt = ""
+    try:
+        st = metrics.get_window_stats(60) if metrics else None
+        if st:
+            i1m_avg, _i1m_min, i1m_max, p1m_avg, _p1m_min, p1m_max, cap1m_avg, cap1m_max = st
+            i1m_txt = (f"  I1m:{i1m_avg:3.1f}/{i1m_max:3.1f}  "
+                       f"P1m:{p1m_avg:4.1f}/{p1m_max:4.1f}  "
+                       f"CAP1m:{int(cap1m_avg*100):2d}%/{int(cap1m_max*100):2d}%")
+    except Exception:
+        pass
+
+    # Linha base (rótulos compactos)
+    line = (f"RX:{rx_count:4d}  Ef:{effect_name:.28s}  Pal:{current_palette_name:.10s}  "
+            f"LAT:{lat_txt} ms {sync_tag}  I:{i_txt}A  P:{p_txt}W{cap_txt}{i1m_txt}")
+
+    # Largura do terminal + truncamento (evita wrap)
+    cols = shutil.get_terminal_size(fallback=(120, 20)).columns
+    ellipsis = "…"
+    if len(line) > max(1, cols):
+        # Deixa 1 coluna “de respiro” e adiciona reticências
+        cut = max(0, cols - len(ellipsis))
+        line = (line[:cut] + ellipsis) if cut > 0 else line[:cols]
+
+    # Escreve 1 linha só: \r + ESC[2K (clear) + conteúdo
+    sys.stdout.write("\r\033[2K" + line)
+    sys.stdout.flush()
+    _last_status = now
 
 SIGNAL_HOLD = 0.5
 
