@@ -23,6 +23,10 @@ sync.py               # Principal: RX UDP, time-sync TCP, EQ, scheduler, métric
 - Alimentação 5V com injeção em múltiplos pontos para tiras longas.
 
 ## Uso
+Certifique-se que executou:
+sudo /opt/led-env/bin/python3 -m pip install --upgrade pip
+sudo /opt/led-env/bin/python3 -m pip install rpi_ws281x adafruit-circuitpython-neopixel
+sudo /opt/led-env/bin/python3 -m pip install --force-reinstall Adafruit-Blinka
 ```
 python3 sync.py --metrics-log /var/tmp/led-metrics.csv --metrics-interval 1.0 --metrics-windows 60,300,900
 ```

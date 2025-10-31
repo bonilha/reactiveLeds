@@ -310,7 +310,7 @@ SIGNAL_HOLD = 0.5
 
 def main():
     global current_palette, current_palette_name, base_hue_offset, hue_seed, last_palette_h0
-    global stop_flag, latency_ms_ema, dynamic_floor
+    global stop_flag, latency_ms_ema, dynamic_floor, latest_packet  # <— importante!
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--metrics-log", type=str, default=None,
@@ -350,7 +350,7 @@ def main():
     effect_max_interval = 300.0
     current_effect = 0
 
-    # Log inicial de paleta
+    # Paleta inicial
     def apply_new_colorset():
         nonlocal current_effect, last_effect_change
         pal, strategy, h0 = get_next_palette()
@@ -412,8 +412,7 @@ def main():
             with latest_lock:
                 if latest_packet is not None:
                     pkt = latest_packet; 
-                    # apenas consome (single queue)
-                    # não definimos None para permitir pequenos buffers
+                    # consome o pacote
                     latest_packet = None
             if pkt is not None:
                 _type, bands, beat_flag, transition_flag, ts_pc_ns = pkt
