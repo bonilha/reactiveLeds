@@ -88,11 +88,32 @@ class FXContext:
         rgb = np.stack([r, g, b], axis=-1)
         return np.clip((rgb * 255.0).round(), 0, 255).astype(np.uint8)
 
-    def segment_mean_from_cumsum(self, bands_float, starts, ends):
-        cs = np.concatenate(([0.0], np.cumsum(bands_float, dtype=np.float32)))
-        sums = cs[ends] - cs[starts]
-        lens = (ends - starts).astype(np.float32)
-        return sums / np.maximum(lens, 1.0)
+def segment_mean_from_cumsum(self, bands_float, starts, ends):
+    # Calcula a média das bandas mapeando para N LEDs (len(starts)/len(ends)).
+    # Torna-se robusto ao tamanho de bands (recalcula starts/ends se preciso).
+
+    bands_float = np.asarray(bands_float, dtype=np.float32)
+    n_bands = int(bands_float.shape[0])
+
+    # Prefix-sum das bandas (len == n_bands + 1)
+    cs = np.concatenate(([0.0], np.cumsum(bands_float, dtype=np.float32)))
+
+    # Garantir que starts/ends são arrays inteiros
+    starts = np.asarray(starts, dtype=np.int32)
+    ends   = np.asarray(ends,   dtype=np.int32)
+
+    # Se as tabelas não combinarem com o tamanho real de bands, recalcula
+    # alvo = número de LEDs (comprimento de starts/ends)
+    if ends.size == 0 or starts.size == 0 or np.max(ends) >= cs.shape[0]:
+        n_leds_target = int(max(len(starts), len(ends)))
+        s2, e2 = self._precompute_segment_starts_ends(n_bands, n_leds_target)
+        starts, ends = s2.astype(np.int32), e2.astype(np.int32)
+
+    # Média por segmento: soma parcial / largura
+    sums = cs[ends] - cs[starts]
+    lens = (ends - starts).astype(np.float32)
+    return sums / np.maximum(lens, 1.0)
+
 
     def to_pixels_and_show(self, rgb_array_u8):
         """Render com limitador de corrente e métricas."""
