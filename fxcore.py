@@ -64,7 +64,7 @@ class FXContext:
     @staticmethod
     def amplify_quad(v):
         v = np.asarray(v, dtype=np.uint16)
-        return (v * v) // 255
+        return np.clip((v * v * 12) // (255 * 10), 0, 255).astype(np.uint8)  # ganho ajustado
 
     def apply_floor_vec(self, v, active, floor_val=None):
         if not active:
@@ -85,7 +85,7 @@ class FXContext:
 
     @staticmethod
     def hsv_to_rgb_bytes_vec(h, s, v):
-        h = h.astype(np.float32) / 255.0
+        h = (h % 256).astype(np.uint8)
         s = s.astype(np.float32) / 255.0
         v = v.astype(np.float32) / 255.0
         i = np.floor(h * 6.0).astype(np.int32) % 6

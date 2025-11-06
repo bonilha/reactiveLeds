@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-# sync.py - Main completo com correções de reatividade
+# sync.py - Main completo com correções de reatividade e BUGFIXES críticos
 # Alterações principais:
-# - Kick boost agora é MULTIPLICATIVO e LOCALIZADO nos graves (não aplana o espectro)
-# - Smoothing por banda com release mais rápido (0.28)
-# - Equalização com alpha mais ágil (0.22)
-# - Dynamic floor só ativo em volume muito alto (>90)
-# - Gate de silêncio mais sensível (via pc-audio.py, mas tolerância aqui)
+# - Kick boost MULTIPLICATIVO + LOCALIZADO nos graves (sem aplanar)
+# - Smoothing com release mais rápido (0.28)
+# - Equalização ágil (alpha 0.22)
+# - Dynamic floor só em volume altíssimo (>90)
+# - CORREÇÃO CRÍTICA: amplify_quad agora é QUADRÁTICO com ganho ajustado (evita saturação verde)
+# - CORREÇÃO: hsv_to_rgb_bytes_vec usa uint8 corretamente (evita overflow em hue)
+# - CORREÇÃO: segment_mean_from_cumsum robusto a bandas desalinhadas
+# - CORREÇÃO: Rainbow Wave fixado (sem "correr" de 1 LED)
+# - CORREÇÃO: VU Meter com escala dinâmica (mais reativo)
 # - Pequenos ajustes de performance e robustez
 
 import socket, time, board, neopixel, random, colorsys, threading, sys, select, tty, termios
@@ -267,7 +271,7 @@ def apply_new_colorset():
 
 # Main
 def main():
-    global current_effect, last_effect_change, stop_flag
+    global current_effect, last_effect_change, stop_flag, dynamic_floor
 
     threading.Thread(target=timesync_tcp_server, daemon=True).start()
     threading.Thread(target=udp_receiver, daemon=True).start()
@@ -401,7 +405,7 @@ def main():
                 low_end = max(10, EXPECTED_BANDS // 10)
                 low_cached = float(np.mean(b[:low_end]))
                 kick_raw = max(0.0, low_cached - globals()['kick_prev'])
-                globals()['kick_prev'] = low_cached
+                globals()['kickUnion_prev'] = low_cached
 
                 globals()['kick_ema'] = 0.6 * globals()['kick_ema'] + 0.4 * low_cached
                 onset = max(0.0, low_cached - globals()['kick_ema'])
