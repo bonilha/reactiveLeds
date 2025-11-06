@@ -103,36 +103,58 @@ def clamp01(x): return x % 1.0
 
 def build_palette_from_strategy(h0, strategy, num_colors=5):
     import colorsys, random
+    
     def hsv_to_rgb_bytes(h, s, v):
-        r,g,b = colorsys.hsv_to_rgb(h, s, v)
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
         return (int(r*255), int(g*255), int(b*255))
+    
+    # Complementar: 2 hues opostos + variações
     if strategy == "complementar":
-        hA = h0 % 1.0; hB = (h0 + 0.5) % 1.0; d = COMPLEMENT_DELTA
+        hA = h0 % 1.0
+        hB = (h0 + 0.5) % 1.0
+        d = COMPLEMENT_DELTA
         hues = [hA, (hA+d)%1.0, (hA-d)%1.0, hB, (hB+d)%1.0, (hB-d)%1.0]
-        s_choices = [0.60, 0.70, 0.80, 0.85]; v_choices = [0.70, 0.80, 0.90, 1.00]
+        s_choices = [0.60, 0.70, 0.80, 0.85]
+        v_choices = [0.70, 0.80, 0.90, 1.00]
         pal = []
         while len(pal) < num_colors:
             h = random.choice(hues)
-            if len(pal) == 0: s,v = 0.75,0.95
-            elif len(pal) == 1: s,v = 0.65,0.75
-            else: s,v = random.choice(s_choices), random.choice(v_choices)
+            if len(pal) == 0:
+                s, v = 0.75, 0.95
+            elif len(pal) == 1:
+                s, v = 0.65, 0.75
+            else:
+                s = random.choice(s_choices)
+                v = random.choice(v_choices)
             pal.append(hsv_to_rgb_bytes(h, s, v))
         return pal
-    if strategy == "analoga":
-        step = 0.10; hues = [clamp01(h0 + k*step) for k in (-2,-1,0,1,2)]
+    
+    # Análoga: 5 hues próximos
+    elif strategy == "analoga":
+        step = 0.10
+        hues = [clamp01(h0 + k*step) for k in (-2, -1, 0, 1, 2)]
+    
+    # Tríade: 3 hues equidistantes (120° cada)
     elif strategy == "triade":
         hues = [h0, clamp01(h0 + 1/3), clamp01(h0 + 2/3)]
+    
+    # Tétrade: 4 hues equidistantes (90° cada)
     elif strategy == "tetrade":
         hues = [h0, clamp01(h0 + 0.25), clamp01(h0 + 0.5), clamp01(h0 + 0.75)]
-    else:
-        off = 1/6; hues = [h0, clamp01(h0 + 0.5 - off), clamp01(h0 + 0.5 + off)]
-    import random
+    
+    # Split-complementar: base + 2 adjacentes ao complemento
+    else:  # "split"
+        off = 1/6
+        hues = [h0, clamp01(h0 + 0.5 - off), clamp01(h0 + 0.5 + off)]
+    
+    # Gera paleta com variações de saturação e valor
     pal = []
     while len(pal) < num_colors:
         h = random.choice(hues)
         s = random.uniform(0.55, 0.85)
         v = random.uniform(0.70, 1.00)
         pal.append(hsv_to_rgb_bytes(h, s, v))
+    
     return pal
 
 base_hue_offset = random.randint(0, 255)
