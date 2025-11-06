@@ -511,6 +511,7 @@ def main():
 
             active = (now < signal_active_until)
             active_rising = (not prev_active) and active
+            
             if active:
                 if active_rising or bands_changed or not eq_valid:
                     eq_cached = equalize_bands(last_bands.astype(np.uint8))

@@ -7,11 +7,9 @@ _rainbow_wave_pos = 0
 def effect_line_spectrum(ctx, bands_u8, beat_flag, active):
     arr = np.asarray(bands_u8, dtype=np.float32)
     v_raw = ctx.segment_mean_from_cumsum(arr, ctx.SEG_STARTS_FULL, ctx.SEG_ENDS_FULL)
-    v_boost = np.clip((v_raw * 160 // 100).astype(np.uint16), 0, 255)
-    v = ctx.amplify_quad(v_boost)
-    v = ctx.apply_floor_vec(v, active, None)
-    # v = ctx.amplify_quad(v_raw.astype(np.uint16))
-    # v = ctx.apply_floor_vec(v, active, None)
+    v_lin = np.clip(v_raw.astype(np.uint16), 0, 255)
+    v_quad = ctx.amplify_quad(v_lin)  # v^2/255
+    v = ((v_quad + v_lin) // 2)       # média dos dois -> curva mais suave
     hue = (ctx.base_hue_offset + (ctx.I_ALL * 3) + (ctx.hue_seed >> 1) + (v >> 3)) % 256
     sat = np.maximum(0, ctx.base_saturation - (v >> 2)).astype(np.uint8)
     val = np.clip(v, 0, 255).astype(np.uint8)
