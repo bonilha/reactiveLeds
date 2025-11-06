@@ -72,28 +72,34 @@ def timesync_tcp_server():
             time.sleep(0.05)
 
 # Equalização / piso dinâmico (mesmo princípio do original)
-EQ_ALPHA = 0.15
+EQ_ALPHA = 0.28 #0.15
 EQ_TARGET = 64.0
 band_ema = np.ones(EXPECTED_BANDS, dtype=np.float32) * 32.0
 TILT_MIN, TILT_MAX = 0.9, 1.8
 tilt_curve = np.exp(np.linspace(np.log(TILT_MAX), np.log(TILT_MIN), EXPECTED_BANDS)).astype(np.float32)
-FLOOR_FACTOR = 0.05
-dynamic_floor = 0
+FLOOR_FACTOR = 0.02 #0.05
+dynamic_floor = int(min(20, max(0, mean_val * FLOOR_FACTOR))) #0
 
 def equalize_bands(bands_u8):
     global band_ema
     x = np.asarray(bands_u8, dtype=np.float32)
-    band_ema = (1.0 - EQ_ALPHA) * band_ema + EQ_ALPHA * x
-    gain = EQ_TARGET / np.maximum(band_ema, 1.0)
+    # REDUZIDO: alpha mais lento pra não "engolir" picos
+    band_ema = (1.0 - 0.15) * band_ema + 0.15 * x
+    gain = 64.0 / np.maximum(band_ema, 1.0)
     eq = x * gain * tilt_curve
     return np.clip(eq, 0.0, 255.0).astype(np.uint8)
 
 def compute_dynamic_floor(eq_bands, active):
     global dynamic_floor
     if not active:
-        dynamic_floor = 0; return
+        dynamic_floor = 0
+        return
+    # Só aplica floor se a música for MUITO alta
     mean_val = float(np.mean(eq_bands))
-    dynamic_floor = int(min(28, max(0, mean_val * FLOOR_FACTOR)))
+    if mean_val > 80:  # era 0, agora só ativa em volume alto
+        dynamic_floor = int(min(15, mean_val * 0.015))  # max 15, era 28
+    else:
+        dynamic_floor = 0
 
 # Paletas (simplificado / o suficiente para manter fluxo)
 STRATEGIES = ["complementar", "analoga", "triade", "tetrade", "split"]
@@ -493,6 +499,8 @@ def main():
                     bands_changed = not np.allclose(smoothed, last_bands, atol=1e-3)
                     last_bands[:] = smoothed
                     last_beat = int(beat_flag)
+                    if last_beat == 1:
+                        last_beat = 0  # será sobrescrito se vier novo
 
                 # troca de efeito por transição ou 5min
                 time_up = (now - last_effect_change) > effect_max_interval
@@ -511,6 +519,7 @@ def main():
 
             active = (now < signal_active_until)
             active_rising = (not prev_active) and active
+
             if active:
                 if active_rising or bands_changed or not eq_valid:
                     eq_cached = equalize_bands(last_bands.astype(np.uint8))
@@ -528,14 +537,30 @@ def main():
 
             b = eq_cached.copy()
             # kick boost simples
+# === sync.py === SUBSTITUA o bloco do kick boost (dentro do main loop) ===
+            # KICK BOOST REATIVO (agora com onset + beat_flag)
             if eq_valid:
-                if 'kick_ema' not in globals(): globals()['kick_ema'] = 0.0
-                low_cached = float(np.mean(b[:max(8, EXPECTED_BANDS//12)]))
-                globals()['kick_ema'] = 0.85*globals()['kick_ema'] + 0.15*low_cached
-                kick = max(0.0, low_cached - globals()['kick_ema']) * 1.8
-                if kick > 0:
-                    b = np.clip(b.astype(np.float32) + kick, 0, 255).astype(np.uint8)
+                if 'kick_ema' not in globals(): 
+                    globals()['kick_ema'] = 0.0
+                    globals()['kick_prev'] = 0.0
 
+                low_cached = float(np.mean(b[:max(6, EXPECTED_BANDS//15)]))  # mais foco em 40-80Hz
+                kick_raw = max(0.0, low_cached - globals()['kick_prev'])
+                globals()['kick_prev'] = low_cached
+
+                # EMA mais rápida + boost só em onset
+                globals()['kick_ema'] = 0.6 * globals()['kick_ema'] + 0.4 * low_cached
+                onset = max(0.0, low_cached - globals()['kick_ema'])
+
+                # Boost extra se beat_flag == 1
+                kick_intensity = onset * 2.2
+                if last_beat == 1:
+                    kick_intensity += 60  # explosão no beat detectado
+
+                if kick_intensity > 0:
+                    boost = np.clip(kick_intensity, 0, 120)
+                    b = np.clip(b.astype(np.float32) + boost, 0, 255).astype(np.uint8)
+                    
             # Render efeito atual
             name, func = effects[current_effect]
             func(b if active else np.zeros_like(b), last_beat if active else 0, active)
