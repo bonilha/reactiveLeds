@@ -499,6 +499,8 @@ def main():
                     bands_changed = not np.allclose(smoothed, last_bands, atol=1e-3)
                     last_bands[:] = smoothed
                     last_beat = int(beat_flag)
+                    if last_beat == 1:
+                        last_beat = 0  # será sobrescrito se vier novo
 
                 # troca de efeito por transição ou 5min
                 time_up = (now - last_effect_change) > effect_max_interval
@@ -552,15 +554,13 @@ def main():
 
                 # Boost extra se beat_flag == 1
                 kick_intensity = onset * 2.2
-                last_beat = int(beat_flag)
-                # Reseta beat_flag após 1 frame (pra não repetir explosão)
                 if last_beat == 1:
-                    last_beat = 0  # será sobrescrito se vier novo
-                    
+                    kick_intensity += 60  # explosão no beat detectado
+
                 if kick_intensity > 0:
                     boost = np.clip(kick_intensity, 0, 120)
                     b = np.clip(b.astype(np.float32) + boost, 0, 255).astype(np.uint8)
-
+                    
             # Render efeito atual
             name, func = effects[current_effect]
             func(b if active else np.zeros_like(b), last_beat if active else 0, active)
