@@ -72,13 +72,13 @@ def timesync_tcp_server():
             time.sleep(0.05)
 
 # Equalização / piso dinâmico (mesmo princípio do original)
-EQ_ALPHA = 0.15
+EQ_ALPHA = 0.28 #0.15
 EQ_TARGET = 64.0
 band_ema = np.ones(EXPECTED_BANDS, dtype=np.float32) * 32.0
 TILT_MIN, TILT_MAX = 0.9, 1.8
 tilt_curve = np.exp(np.linspace(np.log(TILT_MAX), np.log(TILT_MIN), EXPECTED_BANDS)).astype(np.float32)
-FLOOR_FACTOR = 0.05
-dynamic_floor = 0
+FLOOR_FACTOR = 0.02 #0.05
+dynamic_floor = int(min(20, max(0, mean_val * FLOOR_FACTOR))) #0
 
 def equalize_bands(bands_u8):
     global band_ema
