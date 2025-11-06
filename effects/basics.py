@@ -9,39 +9,44 @@ def effect_line_spectrum(ctx, bands_u8, beat_flag, active):
     v_raw = ctx.segment_mean_from_cumsum(arr, ctx.SEG_STARTS_FULL, ctx.SEG_ENDS_FULL)
     v_lin = np.clip(v_raw.astype(np.uint16), 0, 255)
     v_quad = ctx.amplify_quad(v_lin)
-    v = ((v_quad * 0.7 + v_lin * 0.3) // 1).astype(np.uint8)  # mais linear
 
-    # EXPLOSÃO NO BEAT
+    # Mais explosivo
+    v = v_quad.astype(np.uint8)
+
+    # Explosão no beat
     if beat_flag == 1 and active:
-        v = np.clip(v.astype(np.uint16) + 100, 0, 255).astype(np.uint8)
+        v = np.clip(v.astype(np.uint16) + 150, 0, 255).astype(np.uint8)
 
     hue = (ctx.base_hue_offset + (ctx.I_ALL * 3) + (ctx.hue_seed >> 1) + (v >> 2)) % 256
-    sat = np.maximum(50, ctx.base_saturation - (v >> 3)).astype(np.uint8)  # sat mínima
-    val = ctx.apply_floor_vec(v, active, 8)  # floor baixo
+    sat = np.maximum(30, ctx.base_saturation - (v >> 3)).astype(np.uint8)
+    val = ctx.apply_floor_vec(v, active, 8)
+
     rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, val)
     ctx.to_pixels_and_show(rgb)
 
-# === effects/basics.py === SUBSTITUA effect_mirror_spectrum ===
+
 def effect_mirror_spectrum(ctx, bands_u8, beat_flag, active):
     arr = np.asarray(bands_u8, dtype=np.float32)
     v_raw = ctx.segment_mean_from_cumsum(arr, ctx.SEG_STARTS_HALF, ctx.SEG_ENDS_HALF)
     v = ctx.amplify_quad(v_raw.astype(np.uint16))
     v = ctx.apply_floor_vec(v, active, 5)
 
-    # PULSO FORTE NO BEAT
+    # Pulso forte no beat
     if beat_flag == 1 and active:
         center = ctx.CENTER
-        dist = np.abs(np.arange(ctx.CENTER) - center//2)
-        pulse = np.clip(180 - dist * 6, 0, 255).astype(np.uint8)
+        dist = np.abs(np.arange(ctx.CENTER) - center // 2)
+        pulse = np.clip(220 - dist * 6, 0, 255).astype(np.uint8)
         v = np.maximum(v, pulse)
 
     hue = (ctx.base_hue_offset + (ctx.I_LEFT * 4) + (ctx.hue_seed >> 1) + (v >> 2)) % 256
-    sat = np.maximum(60, ctx.base_saturation - (v >> 3)).astype(np.uint8)
+    sat = np.maximum(30, ctx.base_saturation - (v >> 3)).astype(np.uint8)
     val = v
+
     left_rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, val)
     rgb = np.zeros((ctx.LED_COUNT, 3), dtype=np.uint8)
     rgb[ctx.I_LEFT] = left_rgb
-    rgb[ctx.I_RIGHT] = left_rgb[::-1]  # espelha certinho
+    rgb[ctx.I_RIGHT] = left_rgb[::-1]
+
     ctx.to_pixels_and_show(rgb)
     
 def effect_rainbow_wave(ctx, bands_u8, beat_flag, active):

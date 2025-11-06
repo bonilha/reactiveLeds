@@ -536,30 +536,30 @@ def main():
                     eq_valid = False
 
             b = eq_cached.copy()
-            # kick boost simples
-# === sync.py === SUBSTITUA o bloco do kick boost (dentro do main loop) ===
-            # KICK BOOST REATIVO (agora com onset + beat_flag)
+
+            # KICK BOOST REATIVO (mais agressivo)
             if eq_valid:
-                if 'kick_ema' not in globals(): 
+                if 'kick_ema' not in globals():
                     globals()['kick_ema'] = 0.0
                     globals()['kick_prev'] = 0.0
 
-                low_cached = float(np.mean(b[:max(6, EXPECTED_BANDS//15)]))  # mais foco em 40-80Hz
+                low_cached = float(np.mean(b[:max(6, EXPECTED_BANDS // 15)]))  # foco em 40-80Hz
                 kick_raw = max(0.0, low_cached - globals()['kick_prev'])
                 globals()['kick_prev'] = low_cached
 
                 # EMA mais rápida + boost só em onset
-                globals()['kick_ema'] = 0.6 * globals()['kick_ema'] + 0.4 * low_cached
+                globals()['kick_ema'] = 0.5 * globals()['kick_ema'] + 0.5 * low_cached
                 onset = max(0.0, low_cached - globals()['kick_ema'])
 
                 # Boost extra se beat_flag == 1
-                kick_intensity = onset * 2.2
+                kick_intensity = onset * 3.0
                 if last_beat == 1:
-                    kick_intensity += 60  # explosão no beat detectado
+                    kick_intensity += 100
 
                 if kick_intensity > 0:
-                    boost = np.clip(kick_intensity, 0, 120)
+                    boost = np.clip(kick_intensity, 0, 150)
                     b = np.clip(b.astype(np.float32) + boost, 0, 255).astype(np.uint8)
+
                     
             # Render efeito atual
             name, func = effects[current_effect]
