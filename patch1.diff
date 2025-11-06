@@ -1,0 +1,282 @@
+diff --git a/effects/bass_ripple_v2.py b/effects/bass_ripple_v2.py
+new file mode 100644
+--- /dev/null
++++ b/effects/bass_ripple_v2.py
+@@ -0,0 +1,18 @@
++import math
++from utils import hsv_to_rgb
++
++def update_bass_ripple_v2(strip, num_leds, bass_energy):
++    center = num_leds // 2
++    intensity = min(255, bass_energy * 400)
++
++    for i in range(num_leds):
++        dist = abs(i - center) / center if center > 0 else 0
++        pulse = intensity * (1 - math.pow(dist, 1.5))
++        pulse = max(0, pulse)
++
++        r, g, b = hsv_to_rgb(0.0, 1.0, pulse / 255.0)
++        strip[i] = (int(r*255), int(g*255), int(b*255))
++
++    return strip
+diff --git a/effects/beat_outward.py b/effects/beat_outward.py
+new file mode 100644
+--- /dev/null
++++ b/effects/beat_outward.py
+@@ -0,0 +1,28 @@
++from utils import hsv_to_rgb
++
++class BeatOutward:
++    def __init__(self, num_leds):
++        self.num_leds = num_leds
++        self.wave_speed = 0
++        self.amplitude = 0.0
++        self.center = num_leds // 2
++
++    def trigger(self):
++        self.wave_speed = 3
++        self.amplitude = 1.0
++
++    def update(self, strip, beat_detected):
++        if beat_detected:
++            self.trigger()
++
++        for i in range(self.num_leds):
++            dist = abs(i - self.center)
++            if dist < self.wave_speed:
++                amp = self.amplitude * pow(1 - dist / self.num_leds, 0.7)
++                r, g, b = hsv_to_rgb(0.0, 1.0, amp)
++                strip[i] = (int(r*255), int(g*255), int(b*255))
++            else:
++                strip[i] = (0, 0, 0)
++
++        self.wave_speed += 3
++        self.amplitude *= 0.9
++        return strip
+diff --git a/effects/centroid_comet.py b/effects/centroid_comet.py
+new file mode 100644
+--- /dev/null
++++ b/effects/centroid_comet.py
+@@ -0,0 +1,22 @@
++from utils import hsv_to_rgb
++
++def update_centroid_comet(strip, num_leds, freq_bands):
++    if not freq_bands:
++        return strip
++
++    max_idx = freq_bands.index(max(freq_bands))
++    head = int(max_idx / len(freq_bands) * num_leds)
++    tail_len = int(max(freq_bands) * 20) + 5
++    max_energy = max(freq_bands)
++
++    for i in range(num_leds):
++        dist = abs(i - head)
++        if dist < tail_len:
++            brightness = 1.0 - (dist / tail_len)
++            brightness *= (freq_bands[max_idx] / max_energy if max_energy > 0 else 0)
++            r, g, b = hsv_to_rgb(0.6, 1.0, brightness)
++            strip[i] = (int(r*255), int(g*255), int(b*255))
++        else:
++            strip[i] = (0, 0, 0)
++    return strip
+diff --git a/effects/energy_sparks.py b/effects/energy_sparks.py
+new file mode 100644
+--- /dev/null
++++ b/effects/energy_sparks.py
+@@ -0,0 +1,36 @@
++import random
++from utils import hsv_to_rgb
++
++class EnergySparks:
++    def __init__(self, num_leds):
++        self.num_leds = num_leds
++        self.sparks = []
++        self.max_sparks = 8
++
++    def update(self, strip, bass_beat_detected, bass_energy):
++        if bass_beat_detected and len(self.sparks) < self.max_sparks:
++            pos = random.randint(0, self.num_leds - 1)
++            direction = random.choice([-1, 1])
++            self.sparks.append({'pos': pos, 'life': 1.0, 'dir': direction})
++
++        new_sparks = []
++        for s in self.sparks:
++            s['pos'] += s['dir'] * 2
++            s['life'] *= 0.88
++
++            if 0 <= s['pos'] < self.num_leds and s['life'] >= 0.1:
++                r, g, b = hsv_to_rgb(0.15, 1.0, s['life'])
++                strip[int(s['pos'])] = (int(r*255), int(g*255), int(b*255))
++                new_sparks.append(s)
++
++        self.sparks = new_sparks
++        return strip
++
++    def clear(self):
++        self.sparks = []
+diff --git a/effects/line_spectrum_hsv.py b/effects/line_spectrum_hsv.py
+new file mode 100644
+--- /dev/null
++++ b/effects/line_spectrum_hsv.py
+@@ -0,0 +1,22 @@
++import colorsys
++
++def update_line_spectrum(strip, num_leds, spectrum):
++    for i in range(num_leds):
++        h = (i / num_leds) % 1.0
++        s = 1.0
++        v = min(1.0, spectrum[i] * 3.0)
++        v = round(v * 8) / 8
++        if v < 0.1:
++            v = 0
++
++        r, g, b = colorsys.hsv_to_rgb(h, s, v)
++        r, g, b = int(r*255), int(g*255), int(b*255)
++
++        if i < len(strip):
++            cr, cg, cb = strip[i]
++            if abs(cr - r) > 10 or abs(cg - g) > 10 or abs(cb - b) > 10:
++                strip[i] = (r, g, b)
++    return strip
+diff --git a/effects/mirror_spectrum_hsv.py b/effects/mirror_spectrum_hsv.py
+new file mode 100644
+--- /dev/null
++++ b/effects/mirror_spectrum_hsv.py
+@@ -0,0 +1,28 @@
++import colorsys
++
++def update_mirror_spectrum(strip, num_leds, spectrum):
++    half = num_leds // 2
++    left = [(0,0,0)] * half
++    right = [(0,0,0)] * (num_leds - half)
++
++    # esquerda
++    for i in range(half):
++        if i < len(spectrum):
++            h = (i / half) % 1.0
++            v = min(1.0, spectrum[i] * 3.0)
++            v = round(v * 8) / 8
++            if v < 0.1: v = 0
++            r, g, b = colorsys.hsv_to_rgb(h, 1.0, v)
++            left[i] = (int(r*255), int(g*255), int(b*255))
++
++    # espelha
++    for i in range(half):
++        if i < len(spectrum):
++            r, g, b = left[half - 1 - i] if i < half else (0,0,0)
++            right[num_leds - half + i] = (r, g, b)
++
++    strip[:half] = left
++    strip[half:] = right[:num_leds-half]
++    return strip
+diff --git a/effects/quantized_sections.py b/effects/quantized_sections.py
+new file mode 100644
+--- /dev/null
++++ b/effects/quantized_sections.py
+@@ -0,0 +1,40 @@
++from utils import hsv_to_rgb, lerp_color
++
++def update_quantized_sections(strip, num_leds, bands):
++    if len(bands) < 8:
++        bands += [0] * (8 - len(bands))
++
++    palette = [0.0, 0.08, 0.16, 0.33, 0.5, 0.66, 0.83, 0.91]
++    section_size = num_leds // 8
++
++    for s in range(8):
++        energy = bands[s]
++        base_hue = palette[s]
++        hue = (base_hue + energy * 0.15) % 1.0
++
++        start = s * section_size
++        end = min(start + section_size, num_leds)
++        for i in range(start, end):
++            r, g, b = hsv_to_rgb(hue, 1.0, energy)
++            strip[i] = (int(r*255), int(g*255), int(b*255))
++
++        if s > 0 and start > 0:
++            prev = strip[start - 1]
++            curr = strip[start]
++            strip[start - 1] = lerp_color(prev, curr, 0.5)
++
++    for i in range(8 * section_size, num_leds):
++        strip[i] = strip[i % (8 * section_size)]
++
++    return strip
+diff --git a/effects/vu_meter_hsv.py b/effects/vu_meter_hsv.py
+new file mode 100644
+--- /dev/null
++++ b/effects/vu_meter_hsv.py
+@@ -0,0 +1,22 @@
++import colorsys
++
++class VUMeterHSV:
++    def __init__(self, num_leds):
++        self.num_leds = num_leds
++        self.current_level = 0.0
++
++    def update(self, strip, bass_energy):
++        target = int(bass_energy * self.num_leds)
++        self.current_level += (target - self.current_level) * 0.35
++        level = int(self.current_level)
++
++        for i in range(self.num_leds):
++            if i < level:
++                h = 0.3 - (i / self.num_leds) * 0.3
++                r, g, b = colorsys.hsv_to_rgb(h, 1.0, 1.0)
++                strip[i] = (int(r*255), int(g*255), int(b*255))
++            else:
++                strip[i] = (0, 0, 0)
++
++        self.current_level *= 0.92
++        return strip
+diff --git a/effects/waterfall.py b/effects/waterfall.py
+new file mode 100644
+--- /dev/null
++++ b/effects/waterfall.py
+@@ -0,0 +1,34 @@
++import random
++
++class Waterfall:
++    def __init__(self, num_leds):
++        self.num_leds = num_leds
++        self.filling = True
++        self.fill_pos = 0
++        self.drop_speed = 0.8
++
++    def update(self, strip, trigger=False):
++        if trigger:
++            self.filling = True
++            self.fill_pos = 0
++            self.drop_speed = 0.8
++
++        if self.filling:
++            self.fill_pos += 3
++            for i in range(min(self.fill_pos, self.num_leds)):
++                strip[i] = (255, 255, 255)
++            if self.fill_pos >= self.num_leds:
++                self.filling = False
++        else:
++            self.drop_speed = min(2.5, self.drop_speed + 0.05)
++            for i in range(self.num_leds - 1, -1, -1):
++                if random.random() < self.drop_speed / 100:
++                    strip[i] = strip[i-1] if i > 0 else (0, 0, 0)
++
++        return strip
+diff --git a/utils.py b/utils.py
+new file mode 100644
+--- /dev/null
++++ b/utils.py
+@@ -0,0 +1,12 @@
++import colorsys
++
++def hsv_to_rgb(h, s, v):
++    return colorsys.hsv_to_rgb(h, s, v)
++
++def lerp_color(c1, c2, t):
++    return (
++        int(c1[0] + (c2[0] - c1[0]) * t),
++        int(c1[1] + (c2[1] - c1[1]) * t),
++        int(c1[2] + (c2[2] - c1[2]) * t)
++    )
+
