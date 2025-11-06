@@ -360,8 +360,6 @@ def main():
     pt = threading.Thread(target=palette_worker, daemon=True); pt.start()
     it = threading.Thread(target=input_thread, daemon=True); it.start()
 
-    apply_new_colorset()
-
     # Contexto dos efeitos (power-cap + métricas)
     ctx = FXContext(
         pixels=pixels,
