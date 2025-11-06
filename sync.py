@@ -129,7 +129,7 @@ def build_palette_from_strategy(h0, strategy, num_colors=5):
             pal.append(hsv_to_rgb_bytes(h, s, v))
         return pal
     
-    # Análoga: 5 hues próximos
+    # Análoga: 5 hues próximos (±20°)
     elif strategy == "analoga":
         step = 0.10
         hues = [clamp01(h0 + k*step) for k in (-2, -1, 0, 1, 2)]
@@ -142,7 +142,7 @@ def build_palette_from_strategy(h0, strategy, num_colors=5):
     elif strategy == "tetrade":
         hues = [h0, clamp01(h0 + 0.25), clamp01(h0 + 0.5), clamp01(h0 + 0.75)]
     
-    # Split-complementar: base + 2 adjacentes ao complemento
+    # Split-complementar: base + 2 adjacentes ao complemento (padrão)
     else:  # "split"
         off = 1/6
         hues = [h0, clamp01(h0 + 0.5 - off), clamp01(h0 + 0.5 + off)]
@@ -156,6 +156,7 @@ def build_palette_from_strategy(h0, strategy, num_colors=5):
         pal.append(hsv_to_rgb_bytes(h, s, v))
     
     return pal
+
 
 base_hue_offset = random.randint(0, 255)
 hue_seed = random.randint(0, 255)
@@ -401,16 +402,22 @@ def main():
 
     # Paleta inicial
     def apply_new_colorset():
+        global current_palette_name  # ← ADICIONAR ESTA LINHA!
         nonlocal current_effect, last_effect_change
+        
         pal, strategy, h0 = get_next_palette()
-        current_palette[:] = pal; 
-        # atualiza seeds no ctx
+        current_palette[:] = pal
+        current_palette_name = strategy  # ← ADICIONAR ESTA LINHA!
+        
+        # Atualiza seeds no ctx
         ctx.base_hue_offset = int(h0 * 255)
-        ctx.hue_seed = random.randint(0,255)
-        # rotação leve
+        ctx.hue_seed = random.randint(0, 255)
+        
+        # Rotação leve para tríades
         if strategy == "triade" and len(current_palette) > 1:
-            rot = random.randint(1, len(current_palette)-1)
+            rot = random.randint(1, len(current_palette) - 1)
             current_palette[:] = current_palette[rot:] + current_palette[:rot]
+        
         last_effect_change = time.time()
 
     apply_new_colorset()
