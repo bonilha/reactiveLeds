@@ -85,7 +85,7 @@ def timesync_tcp_server():
             time.sleep(0.05)
 
 # Equalização mais ágil
-EQ_ALPHA = 0.22
+EQ_ALPHA = 0.40
 EQ_TARGET = 64.0
 band_ema = np.ones(EXPECTED_BANDS, dtype=np.float32) * 32.0
 TILT_MIN, TILT_MAX = 0.9, 1.8
@@ -298,7 +298,7 @@ def main():
 
     IDLE_TIMEOUT = 2.0
     last_rx_ts = time.time()
-    FRAME_DT = 1/60
+    FRAME_DT = 1/75
     next_frame = time.time()
 
     apply_new_colorset()
@@ -351,7 +351,7 @@ def main():
                     if 'ar_prev' not in globals():
                         globals()['ar_prev'] = np.zeros(EXPECTED_BANDS, dtype=np.float32)
                     prev = globals()['ar_prev']
-                    attack, release = 0.70, 0.28
+                    attack, release = 0.88, 0.45
                     alpha = np.where(bands_arr > prev, attack, release).astype(np.float32)
                     smoothed = (alpha * bands_arr + (1.0 - alpha) * prev).astype(np.float32)
                     globals()['ar_prev'] = smoothed
@@ -415,7 +415,7 @@ def main():
                     kick_intensity += 60
 
                 if kick_intensity > 0:
-                    boost_factor = 1.0 + (kick_intensity / 255.0) * 0.8  # max ~1.8x
+                    boost_factor = 1.0 + (kick_intensity / 255.0) * 1.2  # max ~1.8x
                     b[:low_end] = np.clip(b[:low_end].astype(np.float32) * boost_factor, 0, 255).astype(np.uint8)
                     globals()['boost_decay'] = kick_intensity
                 else:

@@ -43,15 +43,15 @@ NUM_BANDS = 150
 BLOCK_SIZE = 1024
 FMIN = 20.0
 FMAX = 16000.0
-EMA_ALPHA = 0.75
+EMA_ALPHA = 0.35
 
 # Beat detection
-ENERGY_BUFFER_SIZE = 10
-BEAT_THRESHOLD = 1.2
+ENERGY_BUFFER_SIZE = 8
+BEAT_THRESHOLD = 1.15
 BEAT_HEIGHT_MIN = 0.08
 
 # Envio
-MAX_FPS = 50
+MAX_FPS = 75
 MIN_SEND_INTERVAL = 1.0 / MAX_FPS
 
 # Time-sync (estrito)
@@ -308,9 +308,9 @@ def main():
     parser.add_argument("--resume-stable", type=float, default=0.4)
     parser.add_argument("--resync", type=float, default=RESYNC_INTERVAL_SEC)
     # Novos ajustes
-    parser.add_argument("--avg-ema", type=float, default=0.05, help="Alpha EMA do AVG usado no gate (reduzido para spikes).")
-    parser.add_argument("--rms-ema", type=float, default=0.05, help="Alpha EMA do RMS usado no gate (reduzido para spikes).")
-    parser.add_argument("--norm-peak-ema", type=float, default=0.10, help="Alpha da EMA do pico para normalização espectral.")
+    parser.add_argument("--avg-ema", type=float, default=0.15, help="Alpha EMA do AVG usado no gate (reduzido para spikes).")
+    parser.add_argument("--rms-ema", type=float, default=0.15, help="Alpha EMA do RMS usado no gate (reduzido para spikes).")
+    parser.add_argument("--norm-peak-ema", type=float, default=0.25, help="Alpha da EMA do pico para normalização espectral.")
     parser.add_argument("--debug-rms", type=str, default=None, help="Log RMS/AVG/active/block_max to file.log")
 
     args = parser.parse_args()
@@ -346,8 +346,8 @@ def main():
     last_debug = 0.0
 
     # Filtros mediana para spikes (deque maxlen=7 para mais smoothing)
-    rms_mediana = deque(maxlen=7)
-    avg_mediana = deque(maxlen=7)
+    rms_mediana = deque(maxlen=3)
+    avg_mediana = deque(maxlen=3)
 
     def send_packet(bands_u8, beat_flag, transition_flag):
         """Envia um pacote (loop principal controla cadência e gating)."""
