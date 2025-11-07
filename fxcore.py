@@ -20,7 +20,7 @@ class FXContext:
         self.I_LEFT = np.arange(self.CENTER, dtype=np.int32)
         self.I_RIGHT = self.LED_COUNT - 1 - self.I_LEFT
 
-        # Paleta / seeds (o principal pode atualizar ao trocar paleta)
+        # Paleta / seeds
         self.base_hue_offset = int(base_hue_offset)
         self.hue_seed = int(hue_seed)
         self.base_saturation = int(base_saturation)
@@ -41,11 +41,32 @@ class FXContext:
         self._power_w_ema = None
         self._last_cap_scale = 1.0
 
-        # Segmentações FULL e HALF (índices de bandas por LED)
+        # Segmentações FULL e HALF
         self.SEG_STARTS_FULL, self.SEG_ENDS_FULL = self._precompute_segment_starts_ends(self.LED_COUNT, self.LED_COUNT)
         self.SEG_STARTS_HALF, self.SEG_ENDS_HALF = self._precompute_segment_starts_ends(self.LED_COUNT, self.CENTER)
 
-    # ---------- getters para o status ----------
+        # --- Buffers/flags internos para performance ---
+        self._bpp = int(getattr(self.pixels, "bpp", 3))
+        self._rgbw_buf = np.empty((self.LED_COUNT, 4), dtype=np.uint8) if self._bpp == 4 else None
+
+        # tentativa de detectar caminhos rápidos de envio (feature-check)
+        self._fast_targets = []
+        try:
+            # PixelBuf pós-brilho (algumas versões)
+            if hasattr(self.pixels, "_post_brightness_buffer"):
+                buf = self.pixels._post_brightness_buffer  # type: ignore[attr-defined]
+                if buf is not None:
+                    self._fast_targets.append(("post_brightness", buf))
+        except Exception:
+            pass
+        try:
+            # Algumas versões expõem 'buf'
+            if hasattr(self.pixels, "buf"):
+                self._fast_targets.append(("buf", self.pixels.buf))
+        except Exception:
+            pass
+
+    # ---------- getters ----------
     @property
     def current_a_ema(self):
         return self._current_a_ema
@@ -60,7 +81,7 @@ class FXContext:
     @staticmethod
     def amplify_quad(v):
         v = np.asarray(v, dtype=np.uint16)
-        return np.clip((v * v * 12) // (255 * 10), 0, 255).astype(np.uint8)  # ganho ajustado
+        return np.clip((v * v * 12) // (255 * 10), 0, 255).astype(np.uint8)
 
     def apply_floor_vec(self, v, active, floor_val=None):
         if not active:
@@ -70,9 +91,6 @@ class FXContext:
 
     @staticmethod
     def _precompute_segment_starts_ends(n_bands, n_leds):
-        """
-        Gera os vetores starts/ends para fazer média de bandas em n_leds segmentos.
-        """
         i = np.arange(n_leds, dtype=np.int32)
         starts = (i * n_bands) // n_leds
         ends = ((i + 1) * n_bands) // n_leds
@@ -83,13 +101,11 @@ class FXContext:
     def hsv_to_rgb_bytes_vec(h, s, v):
         """
         Conversão HSV vetorizada robusta.
-        Aceita:
-        - h: uint8 (0..255) OU float (0..1) -> internamente normalizado para 0..1
+        - h: uint8 (0..255) ou float (0..1) -> normalizado
         - s: uint8 (0..255)
         - v: uint8 (0..255)
-        Retorna: np.uint8[*,3] em formato RGB.
+        Retorna: np.uint8[*,3]
         """
-        # --- Normalizar H para 0..1 com segurança ---
         h = np.asarray(h)
         if np.issubdtype(h.dtype, np.integer):
             hf = (h.astype(np.float32) / 255.0)
@@ -97,11 +113,9 @@ class FXContext:
             hf = h.astype(np.float32)
         hf = np.mod(hf, 1.0)
 
-        # --- Normalizar S e V para 0..1 ---
         s = np.asarray(s).astype(np.float32) / 255.0
         v = np.asarray(v).astype(np.float32) / 255.0
 
-        # --- Conversão vetorizada ---
         i = np.floor(hf * 6.0).astype(np.int32)
         f = hf * 6.0 - i.astype(np.float32)
         i = i % 6
@@ -125,27 +139,24 @@ class FXContext:
         return np.clip((rgb * 255.0).round(), 0, 255).astype(np.uint8)
 
     @staticmethod
-    def _rgb_to_rgbw(arr_rgb_u8):
+    def _rgb_to_rgbw_inplace(src_rgb_u8, dst_rgbw_u8):
         """
-        Converte RGB -> RGBW por extração de branco:
-        W = min(R,G,B); R,G,B = R-W, G-W, B-W.
+        Converte RGB -> RGBW por extração de branco, IN-PLACE no destino.
+        src_rgb_u8: (N,3) uint8
+        dst_rgbw_u8: (N,4) uint8 (reutilizável)
         """
-        r = arr_rgb_u8[:, 0].astype(np.int16)
-        g = arr_rgb_u8[:, 1].astype(np.int16)
-        b = arr_rgb_u8[:, 2].astype(np.int16)
+        r = src_rgb_u8[:, 0].astype(np.int16)
+        g = src_rgb_u8[:, 1].astype(np.int16)
+        b = src_rgb_u8[:, 2].astype(np.int16)
         w = np.minimum(np.minimum(r, g), b)
-        r2 = (r - w).clip(0, 255).astype(np.uint8)
-        g2 = (g - w).clip(0, 255).astype(np.uint8)
-        b2 = (b - w).clip(0, 255).astype(np.uint8)
-        w2 = w.clip(0, 255).astype(np.uint8)
-        return np.stack([r2, g2, b2, w2], axis=-1)
 
-    # ---------- mapeamento de bandas -> LEDs ----------
+        dst_rgbw_u8[:, 0] = (r - w).clip(0, 255).astype(np.uint8)
+        dst_rgbw_u8[:, 1] = (g - w).clip(0, 255).astype(np.uint8)
+        dst_rgbw_u8[:, 2] = (b - w).clip(0, 255).astype(np.uint8)
+        dst_rgbw_u8[:, 3] = w.clip(0, 255).astype(np.uint8)
+        return dst_rgbw_u8
+
     def segment_mean_from_cumsum(self, bands_float, starts, ends):
-        """
-        Média das bandas mapeadas para N LEDs (N = len(starts) = len(ends)).
-        • Se starts/ends estiverem desalinhados ao tamanho real de bands, recalcula.
-        """
         bands_float = np.asarray(bands_float, dtype=np.float32)
         n_bands = int(bands_float.shape[0])
         cs = np.concatenate(([0.0], np.cumsum(bands_float, dtype=np.float32)))
@@ -159,19 +170,19 @@ class FXContext:
         lens = (ends - starts).astype(np.float32)
         return sums / np.maximum(lens, 1.0)
 
-    # ---------- render com 'power cap' + métricas ----------
     def to_pixels_and_show(self, rgb_array_u8):
         """
         Define os pixels e apresenta o frame, com:
         - Estimativa de corrente/potência
-        - Auto-cap de brilho por frame para respeitar CURRENT_BUDGET_A
-        - Alimenta coletor de métricas (se existir)
+        - Auto-cap por frame para respeitar CURRENT_BUDGET_A
+        - Métricas (se houver)
+        - Fast-path de envio quando possível (evita tolist())
         """
-        if not isinstance(rgb_array_u8, np.ndarray):
-            arr = np.asarray(rgb_array_u8, dtype=np.uint8)
+        # Normaliza entrada só quando necessário
+        if isinstance(rgb_array_u8, np.ndarray) and rgb_array_u8.dtype == np.uint8 and rgb_array_u8.ndim == 2 and rgb_array_u8.shape[1] == 3 and rgb_array_u8.shape[0] == self.LED_COUNT:
+            arr = rgb_array_u8  # usa como está
         else:
-            arr = rgb_array_u8
-        arr = arr.reshape(self.LED_COUNT, 3).astype(np.uint8)
+            arr = np.asarray(rgb_array_u8, dtype=np.uint8).reshape(self.LED_COUNT, 3)
 
         # Consumo de cor (antes do cap)
         sum_rgb_unscaled = float(np.sum(arr, dtype=np.uint64))
@@ -187,12 +198,12 @@ class FXContext:
         if scale < 0.999:
             arr = np.clip(arr.astype(np.float32) * scale, 0, 255).astype(np.uint8)
 
-        # Consumo pós-cap (sem novo sum: reutiliza unscaled * scale)
+        # Consumo pós-cap sem novo sum
         i_color_mA = i_color_mA_unscaled * scale
         i_total_A = (i_color_mA + i_idle_mA) / 1000.0
         p_total_W = 5.0 * i_total_A
 
-        # EMAs para status
+        # EMAs
         if self._current_a_ema is None:
             self._current_a_ema = i_total_A
             self._power_w_ema = p_total_W
@@ -200,21 +211,40 @@ class FXContext:
             self._current_a_ema = 0.80 * self._current_a_ema + 0.20 * i_total_A
             self._power_w_ema = 0.80 * self._power_w_ema + 0.20 * p_total_W
 
-        # métricas por segundo (se houver)
+        # métricas
         if self.metrics is not None:
             try:
                 self.metrics.on_frame(time.time(), i_total_A, p_total_W, self._last_cap_scale)
             except Exception:
                 pass
 
-        # ---- Suporte RGBW ----
-        bpp = getattr(self.pixels, "bpp", 3)
-        if bpp == 4:
-            arr_to_send = self._rgb_to_rgbw(arr)
+        # Preparar buffer a enviar
+        if self._bpp == 4:
+            arr_to_send = self._rgb_to_rgbw_inplace(arr, self._rgbw_buf)
         else:
             arr_to_send = arr
 
-        # Envia (manter caminho compatível com a lib neopixel)
-        # Observação: o caminho seguro e compatível continua usando lista.
-        self.pixels[:] = arr_to_send.tolist()
-        self.pixels.show()
+        # --- Envio: tenta caminho rápido por bytes/memoryview ---
+        raw = None
+        try:
+            raw = arr_to_send.reshape(-1).tobytes()  # sem listas Python
+        except Exception:
+            pass
+
+        sent = False
+        if raw is not None:
+            for kind, target in self._fast_targets:
+                try:
+                    mv = memoryview(target)
+                    if (not mv.readonly) and len(mv) == len(raw):
+                        mv[:] = raw
+                        self.pixels.show()
+                        sent = True
+                        break
+                except Exception:
+                    continue
+
+        if not sent:
+            # Fallback compatível: caminho seguro
+            self.pixels[:] = arr_to_send.tolist()
+            self.pixels.show()
