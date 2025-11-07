@@ -17,17 +17,20 @@ LEN_A1 = 161
 UDP_PORT = 5005
 TCP_TIME_PORT = 5006
 
+# ---- Config LEDs ----
 LED_COUNT = 300
 LED_PIN = board.D18
-ORDER = neopixel.GRB
-BRIGHTNESS = 0.7
-LED_IS_RGBW = False  # <<< coloque True se sua fita for SK6812 (RGBW). Se for WS2812B, deixe False.
+ORDER = neopixel.GRB         # sua fita é GRB
+BRIGHTNESS = 1.0            # alto temporário p/ diagnóstico
+LED_IS_RGBW = False         # WS2812B é RGB; mantenha False
+
+# Instancia NeoPixel conforme tipo
 if LED_IS_RGBW:
     pixels = neopixel.NeoPixel(
         LED_PIN, LED_COUNT,
         brightness=BRIGHTNESS,
         auto_write=False,
-        pixel_order=neopixel.GRBW,   # ordem típica de SK6812
+        pixel_order=neopixel.GRBW,   # ordem típica SK6812 (RGBW)
         bpp=4
     )
 else:
@@ -35,14 +38,13 @@ else:
         LED_PIN, LED_COUNT,
         brightness=BRIGHTNESS,
         auto_write=False,
-        pixel_order=ORDER            # GRB ou RGB conforme seu hardware
+        pixel_order=ORDER            # GRB (WS2812B)
     )
 
 # ---- Debug & bypass helpers ----
-# Se True, ignora o módulo de efeitos e renderiza um fallback em escala de cinza
-BYPASS_EFFECTS = True
-# Loga estatísticas simples 1x/seg
+BYPASS_EFFECTS = True   # mantemos ativo por enquanto para validar o caminho cores->driver
 DEBUG_STATS = True
+ENABLE_SMOKE_TEST = True  # roda um teste R/G/B/Branco/Preto na inicialização
 
 # Sockets
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -65,6 +67,7 @@ time_offset_ns = 0
 time_sync_ready = False
 latency_ms_ema = None
 
+
 def _recv_exact(conn, n):
     buf = b''
     while len(buf) < n:
@@ -73,6 +76,7 @@ def _recv_exact(conn, n):
             raise ConnectionError("TCP encerrado")
         buf += ch
     return buf
+
 
 def timesync_tcp_server():
     global time_offset_ns, time_sync_ready
@@ -101,6 +105,7 @@ def timesync_tcp_server():
                         break
         except Exception:
             time.sleep(0.05)
+
 
 # Paleta
 STRATEGIES = ["complementar", "analoga", "triade", "tetrade", "split"]
@@ -150,6 +155,7 @@ def build_palette_from_strategy(h0, strategy, num_colors=5):
         pal.append(hsv_to_rgb_bytes(h, s, v))
     return pal
 
+
 base_hue_offset = random.randint(0, 255)
 hue_seed = random.randint(0, 255)
 base_saturation = 210
@@ -178,6 +184,7 @@ def get_next_palette():
         return palette_queue.popleft()
     return None
 
+
 # Teclado
 pending_key_change = None
 def key_listener():
@@ -196,6 +203,7 @@ def key_listener():
                     os._exit(0)
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
 
 # UDP receiver compatível (A2 e A1) + métricas de drop
 latest_packet = None
@@ -248,6 +256,7 @@ def udp_receiver():
         except Exception:
             time.sleep(0.001)
 
+
 def print_status(effect_name, ctx):
     now = time.time()
     global _last_status, latency_ms_ema
@@ -260,6 +269,7 @@ def print_status(effect_name, ctx):
     status = f"{effect_name}  {curr:.2f}A {poww:.1f}W cap:{cap:.2f} lat:{lat}"
     print(f"\r{status:<70}", end="", flush=True)
     _last_status = now
+
 
 def apply_new_colorset():
     global base_hue_offset, hue_seed, base_saturation, current_palette, current_palette_name, last_palette_h0
@@ -275,6 +285,17 @@ def apply_new_colorset():
     base_hue_offset = random.randint(0, 255)
     hue_seed = random.randint(0, 255)
     base_saturation = random.randint(190, 230)
+
+
+def hardware_smoke_test(ctx, seconds=0.8):
+    """Acende R, G, B, Branco, Preto para testar caminho pixels.show()."""
+    print(f"[INFO] NeoPixel bpp={getattr(pixels, 'bpp', 'n/a')} order={ORDER} is_rgbw={LED_IS_RGBW}")
+    colors = [(255,0,0), (0,255,0), (0,0,255), (255,255,255), (0,0,0)]
+    for rgb in colors:
+        arr = np.tile(np.array(rgb, dtype=np.uint8), (LED_COUNT, 1))
+        ctx.to_pixels_and_show(arr)
+        time.sleep(seconds)
+
 
 def main():
     # latest_packet é atualizado pela thread udp_receiver e lido/limpo aqui:
@@ -295,6 +316,10 @@ def main():
     )
     ctx.metrics = None
     effects = build_effects(ctx)
+
+    # Smoke test de hardware (diagnóstico rápido)
+    if ENABLE_SMOKE_TEST:
+        hardware_smoke_test(ctx, seconds=0.7)
 
     # Estado local do main
     current_effect = 0
@@ -367,9 +392,7 @@ def main():
                 min_raw = int(bands_u8.min()) if bands_u8.size else 0
                 max_raw = int(bands_u8.max()) if bands_u8.size else 0
 
-                # Gating alinhado ao PC:
-                # • transition=1 com bandas zeradas => desativa
-                # • qualquer pacote "normal" => sustenta ativo por SIGNAL_HOLD
+                # Gating alinhado ao PC
                 if transition_flag == 1 and avg_raw < 0.5:
                     signal_active_until = 0.0
                     last_bands[:] = 0
@@ -393,36 +416,35 @@ def main():
 
                 b = last_bands.copy()
 
-                # Render: efeitos ou fallback
+                # Render: fallback HSV (bypass ativo)
                 try:
-                    # Mapear LED -> banda (150 bandas em 300 LEDs = ~2 LEDs por banda)
+                    # LED -> banda (150 -> 300 LEDs)
                     led_idx = np.arange(LED_COUNT, dtype=np.int32)
                     band_idx = (led_idx * EXPECTED_BANDS) // LED_COUNT
-                    vals = b[band_idx].astype(np.uint8)  # 0..255 por LED
+                    vals = b[band_idx].astype(np.uint8)  # 0..255
 
-                    # Aumentar contraste (gamma)
+                    # Contraste (gamma)
                     v = ((vals.astype(np.float32) / 255.0) ** 1.6) * 255.0
                     v = np.clip(v, 0, 255).astype(np.uint8)
 
-                    # 🔧 FIX AQUI: faça h ser int16 (não uint8), para evitar Overflow no (h % 256)
-                    h = ((led_idx * 256) // LED_COUNT).astype(np.int16)
+                    # Hue varrendo a fita; saturação máxima
+                    h = ((led_idx * 256) // LED_COUNT).astype(np.int16)  # evita overflow interno
                     s = np.full(LED_COUNT, 255, dtype=np.uint8)
 
                     rgb = ctx.hsv_to_rgb_bytes_vec(h, s, v)
                     ctx.to_pixels_and_show(rgb)
                     name = "Fallback Spectrum (HSV)"
                 except Exception as e:
-                    led_idx = np.arange(LED_COUNT, dtype=np.int32)
-                    band_idx = (led_idx * EXPECTED_BANDS) // LED_COUNT
-                    vals = b[band_idx].astype(np.uint8)
-                    v = ((vals.astype(np.float32) / 255.0) ** 1.6) * 255.0
-                    v = np.clip(v, 0, 255).astype(np.uint8)
-                    # 🔧 FIX AQUI TAMBÉM:
-                    h = ((led_idx * 256) // LED_COUNT).astype(np.int16)
-                    s = np.full(LED_COUNT, 255, dtype=np.uint8)
-                    rgb = ctx.hsv_to_rgb_bytes_vec(h, s, v)
+                    # Fallback de segurança: repete bandas em tons de cinza
+                    vals = np.repeat(b.astype(np.uint8), 2)
+                    if vals.size < LED_COUNT:
+                        vals = np.pad(vals, (0, LED_COUNT - vals.size), 'constant')
+                    else:
+                        vals = vals[:LED_COUNT]
+                    rgb = np.stack([vals, vals, vals], axis=-1)
                     ctx.to_pixels_and_show(rgb)
-                    name = f"Fallback Spectrum (HSV, err:{e.__class__.__name__})"
+                    name = f"Fallback Gray (simple, err:{e.__class__.__name__})"
+
                 already_off = False
 
                 # Status + debug mínimo
@@ -451,6 +473,7 @@ def main():
         pixels.fill((0,0,0)); pixels.show()
         print("\n")
 
+
 if __name__ == "__main__":
     main()
-# EOF   
+# EOF
