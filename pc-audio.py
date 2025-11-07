@@ -1,9 +1,10 @@
 # pc-audio.py — Captura, processa e envia bandas PRONTAS (UDP) para o Raspberry Pi.
-# Novo protocolo: PKT_AUDIO_V2 (0xA2)
+# Protocolo: PKT_AUDIO_V2 (0xA2)
 # • FFT 512 (~11.6 ms @44.1 kHz), até 75 FPS (configurável)
-# • Normalização de pico (EMA rápida), equalização por banda (tilt + alvo), opcional smoothing
-# • Detecção de kick e dynamic_floor calculados no PC
+# • Normalização de pico (EMA reativa), equalização por banda (tilt + alvo), smoothing opcional
+# • Detecção de beat/kick e cálculo de dynamic_floor no PC
 # • Gate de silêncio com transition (borda de subida/queda)
+
 import socket
 import time
 import numpy as np
@@ -14,7 +15,6 @@ import platform
 import threading
 import argparse
 from typing import Optional, Union
-import logging
 
 # ------------------------------- Configs -------------------------------
 RASPBERRY_IP = "192.168.66.71"
@@ -26,13 +26,13 @@ BLOCK_SIZE = 512              # resolução temporal (~11.6 ms @ 44.1 kHz)
 FMIN = 20.0
 FMAX = 16000.0
 
-# Espectro bruto -> EMA (deixe 1.0 para "sem EMA" no espectro base)
+# Espectro bruto -> EMA (use 1.0 para "sem EMA" no espectro base)
 RAW_BANDS_EMA_ALPHA = 1.0
 
 # Equalização por banda (sem custo no Pi): alvo e alpha do "analisador" por banda
 EQ_TARGET = 64.0
 EQ_ALPHA = 0.35               # resposta da equalização (ganho adaptativo)
-TILT_MIN, TILT_MAX = 0.9, 1.8 # curva de realce de graves e atenuação nos agudos
+TILT_MIN, TILT_MAX = 0.9, 1.8 # curva de realce de graves / atenuação de agudos
 NORM_PEAK_EMA_ALPHA = 0.40    # normalização reativa: 0.30–0.50 recomendados
 
 # Smoothing leve (opcional) após equalização — use 1.0 para desligado
@@ -171,55 +171,7 @@ def open_with_probe(dev_idx, extra, callback):
     raise last_err if last_err else RuntimeError("Falha ao abrir InputStream.")
 
 
-# ----------------------------- FFT/Bandas ------------------------------
-def make_bands_indices(nfft, sr, num_bands, fmin, fmax_limit):
-    """Retorna arrays vetorizados de inícios/fins por banda (inclusive-exclusivo)."""
-    freqs = np.fft.rfftfreq(nfft, 1.0 / sr)
-    fmax = min(fmax_limit, sr / 2.0)
-    edges = np.geomspace(fmin, fmax, num_bands + 1)
-    edge_idx = np.searchsorted(freqs, edges, side="left").astype(np.int32)
-    a_idx = edge_idx[:-1]
-    b_idx = edge_idx[1:]
-    b_idx = np.maximum(b_idx, a_idx + 1)
-    return a_idx, b_idx
-
-
-def make_compute_bands(sr, block_size, band_starts, band_ends,
-                       raw_ema_alpha, peak_ema_alpha):
-    """
-    Pipeline base (leve): janela -> rfft -> mag -> médias por banda -> log1p -> normalização via EMA do pico
-    Retorna valores (0..1) já normalizados (sem equalização por banda).
-    """
-    window = np.hanning(block_size).astype(np.float32)
-    # EMA do espectro por banda (se raw_ema_alpha<1.0); se 1.0, efetivamente sem EMA
-    ema_bands = np.zeros(len(band_starts), dtype=np.float32)
-    peak_ema = 1.0  # evita divisão por 0
-
-    def compute(block):
-        nonlocal ema_bands, peak_ema
-        x = block * window
-        fft_mag = np.abs(np.fft.rfft(x, n=block_size)).astype(np.float32)
-        cs = np.concatenate(([0.0], np.cumsum(fft_mag, dtype=np.float32)))
-        sums = cs[band_ends] - cs[band_starts]
-        lens = (band_ends - band_starts).astype(np.float32)
-        means = sums / np.maximum(lens, 1.0)
-        vals = np.log1p(means)  # compressão
-        # Normalização por EMA do pico
-        cur_max = float(np.max(vals)) if vals.size else 1.0
-        peak_ema = (1.0 - peak_ema_alpha) * peak_ema + peak_ema_alpha * max(cur_max, 1e-6)
-        norm = max(peak_ema, 1e-6)
-        vals = (vals / norm).clip(0.0, 1.0)
-        # EMA por banda (opcional)
-        if raw_ema_alpha < 1.0:
-            ema_bands = raw_ema_alpha * vals + (1.0 - raw_ema_alpha) * ema_bands
-            return np.clip(ema_bands, 0.0, 1.0)
-        else:
-            return vals
-
-    return compute
-
-
-# ----------------------------- Time Sync ------------------------------
+# ----------------------------- Time Sync -------------------------------
 def _recv_exact(sock, n):
     buf = b''
     while len(buf) < n:
@@ -233,8 +185,9 @@ def _recv_exact(sock, n):
 def time_sync_over_tcp(samples=TIME_SYNC_SAMPLES, timeout=0.6):
     """
     Cliente TCP do time-sync:
-    envia 'TS1'+t0_pc(8) N vezes e recebe 'TS2'+t0_pc+tr_pi(8); escolhe offset do menor RTT;
-    envia 'TS3'+offset(8 signed=True); espera eco. Atualiza _time_sync_ok.
+    envia 'TS1'+t0_pc(8) N vezes e recebe 'TS2'+t0_pc+tr_pi(8) (ambos unsigned).
+    escolhe offset do menor RTT; envia 'TS3'+offset(8 signed=True); espera eco 'TS3'+offset(8).
+    Atualiza _time_sync_ok e retorna True/False.
     """
     global _time_sync_ok
     results = []
@@ -254,7 +207,7 @@ def time_sync_over_tcp(samples=TIME_SYNC_SAMPLES, timeout=0.6):
                 t1 = time.monotonic_ns()
                 rtt = t1 - t0
                 mid = t0 + rtt // 2
-                offset = tr_pi - mid
+                offset = tr_pi - mid  # pode ser NEGATIVO
                 results.append((rtt, offset))
             if not results:
                 _time_sync_ok = False
@@ -285,40 +238,98 @@ def resync_worker(resync_interval):
         time_sync_over_tcp()
 
 
-# ------------------- Estado compartilhado e callback -------------------
+# ----------------------------- FFT/Bandas ------------------------------
+def make_bands_indices(nfft, sr, num_bands, fmin, fmax_limit):
+    """Retorna arrays vetorizados de inícios/fins por banda (inclusive-exclusivo)."""
+    freqs = np.fft.rfftfreq(nfft, 1.0 / sr)
+    fmax = min(fmax_limit, sr / 2.0)
+    edges = np.geomspace(fmin, fmax, num_bands + 1)
+    edge_idx = np.searchsorted(freqs, edges, side="left").astype(np.int32)
+    a_idx = edge_idx[:-1]
+    b_idx = edge_idx[1:]
+    b_idx = np.maximum(b_idx, a_idx + 1)
+    return a_idx, b_idx
+
+
+def make_compute_bands(sr, block_size, band_starts, band_ends,
+                       raw_ema_alpha, peak_ema_alpha):
+    """
+    Pipeline base (leve): janela -> rfft -> mag -> médias por banda -> log1p -> normalização via EMA do pico
+    Retorna valores (0..1) já normalizados (sem equalização por banda).
+    """
+    window = np.hanning(block_size).astype(np.float32)
+    ema_bands = np.zeros(len(band_starts), dtype=np.float32)  # para RAW_BANDS_EMA_ALPHA<1.0
+    peak_ema = 1.0  # evita div/0
+
+    def compute(block):
+        nonlocal ema_bands, peak_ema
+        x = block * window
+        fft_mag = np.abs(np.fft.rfft(x, n=block_size)).astype(np.float32)
+
+        # médias por banda via prefix-sum
+        cs = np.concatenate(([0.0], np.cumsum(fft_mag, dtype=np.float32)))
+        sums = cs[band_ends] - cs[band_starts]
+        lens = (band_ends - band_starts).astype(np.float32)
+        means = sums / np.maximum(lens, 1.0)
+
+        vals = np.log1p(means)  # compressão
+        cur_max = float(np.max(vals)) if vals.size else 1.0
+        peak_ema = (1.0 - peak_ema_alpha) * peak_ema + peak_ema_alpha * max(cur_max, 1e-6)
+        norm = max(peak_ema, 1e-6)
+        vals = (vals / norm).clip(0.0, 1.0)
+
+        # EMA bruta opcional
+        if raw_ema_alpha < 1.0:
+            ema_bands = raw_ema_alpha * vals + (1.0 - raw_ema_alpha) * ema_bands
+            return ema_bands
+        else:
+            return vals
+
+    return compute
+
+
+# ----------------------------- Estado compartilhado --------------------
 class Shared:
     def __init__(self, n_bands):
-        self.bands_eq_u8 = np.zeros(n_bands, dtype=np.uint8)  # bandas finalizadas p/ envio
+        self.bands_eq_u8 = np.zeros(n_bands, dtype=np.uint8)
+        self.beat = 0
+        self.kick_intensity = 0
         self.avg = 0.0
         self.rms = 0.0
         self.avg_ema = 0.0
         self.rms_ema = 0.0
         self.last_update = 0.0
         self.block_max = 0.0
-        self.beat = 0
-        self.kick_intensity = 0
-
 
 shared = Shared(NUM_BANDS)
 
 
-# ------------------------------- Main ---------------------------------
+# ----------------------------- Main -----------------------------------
 def main():
     global tx_count, RESYNC_INTERVAL_SEC
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--debug", action="store_true", help="Imprime RMS/AVG/estado periodicamente.")
+    parser.add_argument("--debug", action="store_true", help="Imprime RMS/AVG/estado do gate periodicamente.")
+    parser.add_argument("--device", type=str, default=None, help="Nome/índice do dispositivo de captura.")
     parser.add_argument("--silence-bands", type=float, default=3.0, help="Limiar de média de bandas para silêncio.")
-    parser.add_argument("--silence-rms", type=float, default=0.00001, help="Limiar de RMS para silêncio.")
+    parser.add_argument("--silence-rms", type=float, default=1e-5, help="Limiar de RMS para silêncio.")
     parser.add_argument("--silence-duration", type=float, default=0.8)
     parser.add_argument("--resume-factor", type=float, default=2.0)
     parser.add_argument("--resume-stable", type=float, default=0.4)
     parser.add_argument("--resync", type=float, default=RESYNC_INTERVAL_SEC)
-    parser.add_argument("--debug-rms", type=str, default=None, help="Log RMS/AVG/active/block_max to file.log")
+    parser.add_argument("--norm-peak-ema", type=float, default=NORM_PEAK_EMA_ALPHA, help="Alpha EMA do pico para normalização espectral.")
+    parser.add_argument("--eq-alpha", type=float, default=EQ_ALPHA, help="Alpha do analisador da equalização por banda.")
+    parser.add_argument("--raw-ema", type=float, default=RAW_BANDS_EMA_ALPHA, help="Alpha da EMA bruta do espectro (1.0 = off).")
+    parser.add_argument("--max-fps", type=int, default=MAX_FPS)
     args = parser.parse_args()
 
-    if args.debug_rms:
-        logging.basicConfig(filename=args.debug_rms, level=logging.INFO, format='%(asctime)s %(message)s')
+    # Atualiza configs de runtime
+    global NORM_PEAK_EMA_ALPHA
+    NORM_PEAK_EMA_ALPHA = float(args.norm_peak_ema)
+    eq_alpha = float(args.eq_alpha)
+    raw_ema = float(args.raw_ema)
+    max_fps = int(args.max_fps)
+    send_interval = 1.0 / max_fps if max_fps > 0 else MIN_SEND_INTERVAL
 
     SILENCE_THRESHOLD = args.silence_bands
     AMP_SILENCE_THRESHOLD = args.silence_rms
@@ -329,59 +340,60 @@ def main():
 
     print("[INFO] Iniciando time-sync TCP (porta 5006)...")
     time_sync_over_tcp()
-    t_sync = threading.Thread(target=resync_worker, args=(RESYNC_INTERVAL_SEC,), daemon=True)
-    t_sync.start()
+    t_sync = threading.Thread(target=resync_worker, args=(RESYNC_INTERVAL_SEC,), daemon=True); t_sync.start()
 
-    # Equalização por banda: tilt + ganho adaptativo
-    tilt_curve = np.exp(np.linspace(np.log(TILT_MAX), np.log(TILT_MIN), NUM_BANDS)).astype(np.float32)
-    band_ema = np.ones(NUM_BANDS, dtype=np.float32) * 32.0  # ponto de partida da equalização
-
-    # Pós-EQ smoothing (attack/release) opcional
-    post_eq_prev = np.zeros(NUM_BANDS, dtype=np.float32)
-
-    # Beat buffer
+    # Beat: buffer circular
     energy_buf = np.zeros(ENERGY_BUFFER_SIZE, dtype=np.float32)
     energy_idx = 0
     energy_count = 0
     last_energy = 0.0
 
-    # Gate
+    # Gate de silêncio
     active = False
     silence_since = None
     resume_since = None
     last_tick = 0.0
     last_debug = 0.0
 
-    # Para construção do pipeline de bandas:
-    band_starts = None
-    band_ends = None
-    compute_bands = None
+    # Equalização (estado)
+    tilt_curve = np.exp(np.linspace(np.log(TILT_MAX), np.log(TILT_MIN), NUM_BANDS)).astype(np.float32)
+    band_ema = np.ones(NUM_BANDS, dtype=np.float32) * (EQ_TARGET / 2.0)
+    post_eq_prev = np.zeros(NUM_BANDS, dtype=np.float32)
 
-    def send_packet(bands_u8, beat_flag, transition_flag, dyn_floor, kick_intensity):
-        """Envia pacote A2 com bandas já equalizadas e métricas auxiliares."""
-        nonlocal tx_count
+    def send_packet(bands_u8: np.ndarray, beat_flag: int, transition_flag: int, dyn_floor: int, kick_intensity: int):
+        """Envia um pacote A2 (loop principal controla cadência e gating)."""
+        global tx_count
         ts_ns = time.monotonic_ns()
-        payload = bytes([PKT_AUDIO_V2]) + ts_ns.to_bytes(8, 'little') \
-                  + bands_u8.tobytes() \
-                  + bytes([beat_flag, transition_flag, dyn_floor, kick_intensity])
+        payload = (
+            bytes([PKT_AUDIO_V2]) +
+            ts_ns.to_bytes(8, 'little') +
+            bands_u8.tobytes() +
+            bytes([beat_flag & 0xFF, transition_flag & 0xFF, dyn_floor & 0xFF, kick_intensity & 0xFF])
+        )
         udp_sock.sendto(payload, (RASPBERRY_IP, UDP_PORT))
         tx_count += 1
 
+    # Callback de áudio (atualiza métricas e bands prontas)
+    compute_bands = None
+
     def audio_cb(indata, frames, time_info, status):
-        nonlocal energy_idx, energy_count, last_energy, post_eq_prev, band_ema
+        nonlocal energy_idx, energy_count, last_energy, band_ema, post_eq_prev
         if status:
             sys.stdout.write("\n"); print(f"[WARN] Audio status: {status}")
+
         # Mono mix
         block = indata.mean(axis=1) if indata.ndim > 1 else indata
         if len(block) < BLOCK_SIZE:
             block = np.pad(block, (0, BLOCK_SIZE - len(block)), "constant")
         if compute_bands is None:
             return
-        base_vals = compute_bands(block[:BLOCK_SIZE])  # 0..1 (float)
+
+        # Base (0..1) normalizada por pico EMA
+        base_vals = compute_bands(block[:BLOCK_SIZE])  # float 0..1
         base_vals255 = (base_vals * 255.0).astype(np.float32)
 
         # Equalização: ganho adaptativo por banda + tilt
-        band_ema = (1.0 - EQ_ALPHA) * band_ema + EQ_ALPHA * base_vals255
+        band_ema = (1.0 - eq_alpha) * band_ema + eq_alpha * base_vals255
         gain = EQ_TARGET / np.maximum(band_ema, 1.0)
         eq = base_vals255 * gain * tilt_curve  # float
         eq = np.clip(eq, 0.0, 255.0).astype(np.float32)
@@ -391,6 +403,7 @@ def main():
             alpha = np.where(eq > post_eq_prev, POST_EQ_SMOOTH_ATTACK, POST_EQ_SMOOTH_RELEASE).astype(np.float32)
             eq = alpha * eq + (1.0 - alpha) * post_eq_prev
             post_eq_prev = eq
+
         bands_u8 = eq.clip(0, 255).astype(np.uint8)
         shared.bands_eq_u8 = bands_u8
 
@@ -418,8 +431,7 @@ def main():
         shared.beat = 1 if is_peak_now else 0
         last_energy = energy
 
-        # Kick intensity (0..255) ~ onset de graves
-        # EMA lenta para baseline + onset positivo
+        # Kick intensity (0..255) ~ onset de graves (EMA lenta p/ baseline)
         if not hasattr(audio_cb, "_kick_ema"):
             audio_cb._kick_ema = 0.0
         audio_cb._kick_ema = 0.60 * audio_cb._kick_ema + 0.40 * (np.mean(low_bands) / 255.0)
@@ -430,7 +442,7 @@ def main():
         shared.kick_intensity = ki
 
     # Abrir stream de áudio
-    cands = choose_candidates(override=None)
+    cands = choose_candidates(override=args.device)
     stream = None
     sr_eff = 44100
     for dev_idx, extra, desc in cands:
@@ -447,9 +459,7 @@ def main():
 
     # Preparar bandas com SR efetivo (vetorizado)
     a_idx, b_idx = make_bands_indices(BLOCK_SIZE, sr_eff, NUM_BANDS, FMIN, FMAX)
-    band_starts, band_ends = a_idx, b_idx
-    compute_bands = make_compute_bands(sr_eff, BLOCK_SIZE, band_starts, band_ends,
-                                       RAW_BANDS_EMA_ALPHA, NORM_PEAK_EMA_ALPHA)
+    compute_bands = make_compute_bands(sr_eff, BLOCK_SIZE, a_idx, b_idx, raw_ema, NORM_PEAK_EMA_ALPHA)
 
     stream.start()
     try:
@@ -522,7 +532,7 @@ def main():
                 continue
 
             # TX ativo: respeita FPS
-            if (now - last_tick) < MIN_SEND_INTERVAL:
+            if (now - last_tick) < send_interval:
                 time.sleep(0.001)
                 continue
             last_tick = now

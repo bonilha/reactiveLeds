@@ -333,7 +333,7 @@ def main():
                 active = (now < signal_active_until)
 
                 b = last_bands.copy()
-                # (Opcional) usar kick_intensity para efeitos que queiram reforço visual
+                # (Opcional) usar kick_intensity em efeitos que queiram reforço visual
 
                 # Render
                 name, func = effects[current_effect]
@@ -362,3 +362,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
