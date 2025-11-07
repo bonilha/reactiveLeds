@@ -25,7 +25,7 @@ pixels = neopixel.NeoPixel(LED_PIN, LED_COUNT, brightness=BRIGHTNESS, auto_write
 
 # ---- Debug & bypass helpers ----
 # Se True, ignora o módulo de efeitos e renderiza um fallback em escala de cinza
-BYPASS_EFFECTS = False
+BYPASS_EFFECTS = True
 # Loga estatísticas simples 1x/seg
 DEBUG_STATS = True
 
@@ -384,23 +384,26 @@ def main():
                         name, func = effects[current_effect]
                         func(b if active else np.zeros_like(b), last_beat if active else 0, active)
                     else:
-                        # Fallback simples: mapeia as 150 bandas em 300 LEDs em tons de cinza
-                        vals = ctx.segment_mean_from_cumsum(
-                            b.astype(np.float32),
-                            ctx.SEG_STARTS_FULL, ctx.SEG_ENDS_FULL
-                        ).clip(0, 255).astype(np.uint8)
-                        rgb = np.stack([vals, vals, vals], axis=-1)
+                        # Fallback ultra-simples: 150 bandas -> 300 LEDs (2 por banda), em cinza.
+                        vals = np.repeat(b.astype(np.uint8), 2)
+                        if vals.size < LED_COUNT:
+                            # Se por algum motivo faltar, completa com zeros
+                            vals = np.pad(vals, (0, LED_COUNT - vals.size), 'constant')
+                        else:
+                            vals = vals[:LED_COUNT]
+                        rgb = np.stack([vals, vals, vals], axis=-1)  # tons de cinza
                         ctx.to_pixels_and_show(rgb)
-                        name = "Fallback Gray"
+                        name = "Fallback Gray (simple)"
                 except Exception as e:
-                    # Em caso de erro no efeito, cai no fallback para garantir luz
-                    vals = ctx.segment_mean_from_cumsum(
-                        b.astype(np.float32),
-                        ctx.SEG_STARTS_FULL, ctx.SEG_ENDS_FULL
-                    ).clip(0, 255).astype(np.uint8)
+                    # Mesmo fallback no except, sem chamadas sofisticadas
+                    vals = np.repeat(b.astype(np.uint8), 2)
+                    if vals.size < LED_COUNT:
+                        vals = np.pad(vals, (0, LED_COUNT - vals.size), 'constant')
+                    else:
+                        vals = vals[:LED_COUNT]
                     rgb = np.stack([vals, vals, vals], axis=-1)
                     ctx.to_pixels_and_show(rgb)
-                    name = f"Fallback Gray (err:{e.__class__.__name__})"
+                    name = f"Fallback Gray (simple, err:{e.__class__.__name__})"
 
                 already_off = False
 
