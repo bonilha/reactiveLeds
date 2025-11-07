@@ -87,7 +87,7 @@ class FXContext:
         Conversão HSV vetorizada robusta.
 
         Aceita:
-        - h: uint8 (0..255) OU float (0..1)  -> internamente normalizado para 0..1
+        - h: uint8 (0..255) OU float (0..1) -> internamente normalizado para 0..1
         - s: uint8 (0..255)
         - v: uint8 (0..255)
 
@@ -105,7 +105,7 @@ class FXContext:
         s = np.asarray(s).astype(np.float32) / 255.0
         v = np.asarray(v).astype(np.float32) / 255.0
 
-        # --- Conversão vetorizada (branchless por máscaras) ---
+        # --- Conversão vetorizada ---
         i = np.floor(hf * 6.0).astype(np.int32)
         f = hf * 6.0 - i.astype(np.float32)
         i = i % 6
@@ -128,6 +128,22 @@ class FXContext:
         rgb = np.stack([r, g, b], axis=-1)
         return np.clip((rgb * 255.0).round(), 0, 255).astype(np.uint8)
 
+    @staticmethod
+    def _rgb_to_rgbw(arr_rgb_u8):
+        """
+        Converte RGB -> RGBW por extração de branco:
+        W = min(R,G,B); R,G,B = R-W, G-W, B-W.
+        """
+        r = arr_rgb_u8[:, 0].astype(np.int16)
+        g = arr_rgb_u8[:, 1].astype(np.int16)
+        b = arr_rgb_u8[:, 2].astype(np.int16)
+        w = np.minimum(np.minimum(r, g), b)
+        r2 = (r - w).clip(0, 255).astype(np.uint8)
+        g2 = (g - w).clip(0, 255).astype(np.uint8)
+        b2 = (b - w).clip(0, 255).astype(np.uint8)
+        w2 = w.clip(0, 255).astype(np.uint8)
+        return np.stack([r2, g2, b2, w2], axis=-1)
+
     # ---------- mapeamento de bandas -> LEDs ----------
     def segment_mean_from_cumsum(self, bands_float, starts, ends):
         """
@@ -136,11 +152,9 @@ class FXContext:
         """
         bands_float = np.asarray(bands_float, dtype=np.float32)
         n_bands = int(bands_float.shape[0])
-        # prefix-sum (len = n_bands + 1)
         cs = np.concatenate(([0.0], np.cumsum(bands_float, dtype=np.float32)))
         starts = np.asarray(starts, dtype=np.int32)
         ends = np.asarray(ends, dtype=np.int32)
-        # Recalcula se houver índice fora do prefixo
         if ends.size == 0 or starts.size == 0 or np.max(ends) >= cs.shape[0]:
             n_leds_target = int(max(len(starts), len(ends)))
             s2, e2 = self._precompute_segment_starts_ends(n_bands, n_leds_target)
@@ -163,13 +177,13 @@ class FXContext:
             arr = rgb_array_u8
         arr = arr.reshape(self.LED_COUNT, 3).astype(np.uint8)
 
-        # Consumo de cor
+        # Consumo de cor (antes do cap)
         sum_rgb = float(np.sum(arr, dtype=np.uint64))
         i_color_mA = (self.WS2812B_MA_PER_CHANNEL / 255.0) * sum_rgb
         i_idle_mA = self.WS2812B_IDLE_MA_PER_LED * float(self.LED_COUNT)
         i_budget_mA = self.CURRENT_BUDGET_A * 1000.0
 
-        # cap scale
+        # Power-cap
         scale = 1.0
         if i_color_mA > 0.0 and (i_color_mA + i_idle_mA) > i_budget_mA:
             scale = max(0.0, (i_budget_mA - i_idle_mA) / i_color_mA)
@@ -198,6 +212,13 @@ class FXContext:
             except Exception:
                 pass
 
+        # ----- Suporte RGBW -----
+        bpp = getattr(self.pixels, "bpp", 3)
+        if bpp == 4:
+            arr_to_send = self._rgb_to_rgbw(arr)
+        else:
+            arr_to_send = arr
+
         # envia
-        self.pixels[:] = arr.tolist()
+        self.pixels[:] = arr_to_send.tolist()
         self.pixels.show()

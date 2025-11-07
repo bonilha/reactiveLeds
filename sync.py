@@ -21,7 +21,22 @@ LED_COUNT = 300
 LED_PIN = board.D18
 ORDER = neopixel.GRB
 BRIGHTNESS = 0.7
-pixels = neopixel.NeoPixel(LED_PIN, LED_COUNT, brightness=BRIGHTNESS, auto_write=False, pixel_order=ORDER)
+LED_IS_RGBW = False  # <<< coloque True se sua fita for SK6812 (RGBW). Se for WS2812B, deixe False.
+if LED_IS_RGBW:
+    pixels = neopixel.NeoPixel(
+        LED_PIN, LED_COUNT,
+        brightness=BRIGHTNESS,
+        auto_write=False,
+        pixel_order=neopixel.GRBW,   # ordem típica de SK6812
+        bpp=4
+    )
+else:
+    pixels = neopixel.NeoPixel(
+        LED_PIN, LED_COUNT,
+        brightness=BRIGHTNESS,
+        auto_write=False,
+        pixel_order=ORDER            # GRB ou RGB conforme seu hardware
+    )
 
 # ---- Debug & bypass helpers ----
 # Se True, ignora o módulo de efeitos e renderiza um fallback em escala de cinza
