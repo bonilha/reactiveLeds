@@ -256,7 +256,7 @@ def apply_new_colorset():
     base_saturation = random.randint(190, 230)
 
 def main():
-    global stop_flag, latency_ms_ema
+    global stop_flag, latency_ms_ema, latest_packet
 
     # Threads auxiliares
     threading.Thread(target=timesync_tcp_server, daemon=True).start()
@@ -391,4 +391,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
