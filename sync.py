@@ -1,28 +1,18 @@
 #!/usr/bin/env python3
-# sync.py - Main completo com correções de reatividade e BUGFIXES críticos
-# Alterações principais:
-# - Kick boost MULTIPLICATIVO + LOCALIZADO nos graves (sem aplanar)
-# - Smoothing com release mais rápido (0.28)
-# - Equalização ágil (alpha 0.22)
-# - Dynamic floor só em volume altíssimo (>90)
-# - CORREÇÃO CRÍTICA: amplify_quad agora é QUADRÁTICO com ganho ajustado (evita saturação verde)
-# - CORREÇÃO: hsv_to_rgb_bytes_vec usa uint8 corretamente (evita overflow em hue)
-# - CORREÇÃO: segment_mean_from_cumsum robusto a bandas desalinhadas
-# - CORREÇÃO: Rainbow Wave fixado (sem "correr" de 1 LED)
-# - CORREÇÃO: VU Meter com escala dinâmica (mais reativo)
-# - Pequenos ajustes de performance e robustez
+# sync.py — Raspberry Pi 3B renderer
+# • Recebe PKT_AUDIO_V2 (0xA2) com bandas já equalizadas (uint8), beat, transition, dynamic_floor e kick_intensity
+# • Sem equalização/EMAs pesadas no Pi; render "on packet" para máxima reatividade
 
-import socket, time, board, neopixel, random, colorsys, threading, sys, select, tty, termios
+import socket, time, board, neopixel, random, threading, sys, select, tty, termios, os
 import numpy as np
 from collections import deque
-from datetime import datetime
 from fxcore import FXContext
 from effects import build_effects
-import argparse, os
 
-PKT_AUDIO = 0xA1
+PKT_AUDIO_V2 = 0xA2
 UDP_PORT = 5005
 TCP_TIME_PORT = 5006
+
 LED_COUNT = 300
 LED_PIN = board.D18
 ORDER = neopixel.GRB
@@ -84,33 +74,12 @@ def timesync_tcp_server():
         except Exception:
             time.sleep(0.05)
 
-# Equalização mais ágil
-EQ_ALPHA = 0.40
-EQ_TARGET = 64.0
-band_ema = np.ones(EXPECTED_BANDS, dtype=np.float32) * 32.0
-TILT_MIN, TILT_MAX = 0.9, 1.8
-tilt_curve = np.exp(np.linspace(np.log(TILT_MAX), np.log(TILT_MIN), EXPECTED_BANDS)).astype(np.float32)
+# Efeitos e paleta
+effects = build_effects()
+current_effect = 0
+last_effect_change = time.time()
+effect_max_interval = 300  # 5 min
 
-def equalize_bands(bands_u8):
-    global band_ema
-    x = np.asarray(bands_u8, dtype=np.float32)
-    band_ema = (1.0 - EQ_ALPHA) * band_ema + EQ_ALPHA * x
-    gain = EQ_TARGET / np.maximum(band_ema, 1.0)
-    eq = x * gain * tilt_curve
-    return np.clip(eq, 0.0, 255.0).astype(np.uint8)
-
-def compute_dynamic_floor(eq_bands, active):
-    global dynamic_floor
-    if not active:
-        dynamic_floor = 0
-        return
-    mean_val = float(np.mean(eq_bands))
-    if mean_val > 90:  # só em volume muito alto
-        dynamic_floor = int(min(12, mean_val * 0.012))
-    else:
-        dynamic_floor = 0
-
-# Paleta
 STRATEGIES = ["complementar", "analoga", "triade", "tetrade", "split"]
 COMPLEMENT_DELTA = 0.06
 
@@ -164,7 +133,6 @@ base_saturation = 210
 current_palette = [(255,255,255)] * 5
 current_palette_name = "analoga"
 last_palette_h0 = 0.0
-
 PALETTE_BUFFER_MAX = 8
 palette_queue = deque(maxlen=PALETTE_BUFFER_MAX)
 palette_thread_stop = threading.Event()
@@ -188,12 +156,6 @@ def get_next_palette():
         return palette_queue.popleft()
     return None
 
-# Efeitos
-effects = build_effects()
-current_effect = 0
-last_effect_change = time.time()
-effect_max_interval = 300  # 5 min
-
 # Teclado
 pending_key_change = None
 def key_listener():
@@ -213,7 +175,7 @@ def key_listener():
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
-# UDP receiver
+# UDP receiver (novo protocolo)
 latest_packet = None
 latest_lock = threading.Lock()
 stop_flag = False
@@ -223,14 +185,17 @@ def udp_receiver():
     while not stop_flag:
         try:
             data, _ = udp_sock.recvfrom(1024)
-            if len(data) != 161 or data[0] != PKT_AUDIO:
+            # Espera A2 (163 bytes)
+            if len(data) != 163 or data[0] != PKT_AUDIO_V2:
                 continue
             ts_pc = int.from_bytes(data[1:9], 'little')
             bands = np.frombuffer(data[9:159], dtype=np.uint8)
             beat = data[159]
             trans = data[160]
+            dyn_floor = data[161]
+            kick_intensity = data[162]
             with latest_lock:
-                latest_packet = (PKT_AUDIO, bands, beat, trans, ts_pc)
+                latest_packet = (bands.copy(), beat, trans, ts_pc, dyn_floor, kick_intensity)
             rx_count += 1
             now = time.time()
             if now - _last_status > 1.0:
@@ -239,27 +204,26 @@ def udp_receiver():
         except Exception:
             time.sleep(0.001)
 
-# Status
-def print_status(effect_name, ctx, metrics):
+def print_status(effect_name, ctx):
     now = time.time()
-    global _last_status
+    global _last_status, latency_ms_ema
     if now - _last_status < 0.25:
         return
     curr = ctx.current_a_ema
     poww = ctx.power_w_ema
     cap = ctx.last_cap_scale
     lat = f"{latency_ms_ema:.1f}ms" if latency_ms_ema else "?"
-    status = f"{effect_name} | {curr:.2f}A {poww:.1f}W cap:{cap:.2f} lat:{lat}"
+    status = f"{effect_name}  {curr:.2f}A {poww:.1f}W cap:{cap:.2f} lat:{lat}"
     print(f"\r{status:<70}", end="", flush=True)
     _last_status = now
 
-# Apply palette
 def apply_new_colorset():
     global base_hue_offset, hue_seed, base_saturation, current_palette, current_palette_name, last_palette_h0
     pal_data = get_next_palette()
     if pal_data:
         current_palette, current_palette_name, last_palette_h0 = pal_data
     else:
+        import random
         strategy = random.choice(STRATEGIES)
         h0 = random.random()
         current_palette = build_palette_from_strategy(h0, strategy, num_colors=5)
@@ -269,9 +233,8 @@ def apply_new_colorset():
     hue_seed = random.randint(0, 255)
     base_saturation = random.randint(190, 230)
 
-# Main
 def main():
-    global current_effect, last_effect_change, stop_flag, dynamic_floor
+    global current_effect, last_effect_change, stop_flag, latency_ms_ema
 
     threading.Thread(target=timesync_tcp_server, daemon=True).start()
     threading.Thread(target=udp_receiver, daemon=True).start()
@@ -285,31 +248,30 @@ def main():
     )
     ctx.metrics = None
 
-    last_bands = np.zeros(EXPECTED_BANDS, dtype=np.float32)
+    last_bands = np.zeros(EXPECTED_BANDS, dtype=np.uint8)
     last_beat = 0
-    eq_cached = np.zeros(EXPECTED_BANDS, dtype=np.uint8)
-    eq_valid = False
 
     SIGNAL_HOLD = 0.5
     signal_active_until = 0.0
     prev_active = False
     already_off = False
-    bands_changed = False
 
     IDLE_TIMEOUT = 2.0
     last_rx_ts = time.time()
+
     FRAME_DT = 1/75
     next_frame = time.time()
+    RENDER_ON_PACKET = True
 
     apply_new_colorset()
 
     try:
         while True:
             now = time.time()
+
             # troca por tecla
             global pending_key_change
             if pending_key_change is not None:
-                prev_idx = current_effect
                 if pending_key_change == 'next':
                     current_effect = (current_effect + 1) % len(effects)
                 else:
@@ -318,7 +280,7 @@ def main():
                 apply_new_colorset()
                 last_effect_change = now
 
-            # idle
+            # idle (sem RX recente)
             if (now - last_rx_ts) > IDLE_TIMEOUT:
                 if not already_off:
                     pixels.fill((0,0,0)); pixels.show()
@@ -334,40 +296,12 @@ def main():
                 if latest_packet is not None:
                     pkt = latest_packet
                     latest_packet = None
-                    last_rx_ts = now
             if pkt is not None:
-                _type, bands, beat_flag, transition_flag, ts_pc_ns = pkt
-                bands_arr = np.asarray(bands, dtype=np.float32)
-                avg_raw = float(np.mean(bands_arr))
-                if transition_flag == 1 and avg_raw < 0.5:
-                    signal_active_until = 0.0
-                    last_bands[:] = 0.0
-                    last_beat = 0
-                    bands_changed = True
-                else:
-                    if avg_raw > 2.0:
-                        signal_active_until = now + SIGNAL_HOLD
-                    # attack/release por banda (release mais rápido)
-                    if 'ar_prev' not in globals():
-                        globals()['ar_prev'] = np.zeros(EXPECTED_BANDS, dtype=np.float32)
-                    prev = globals()['ar_prev']
-                    attack, release = 0.88, 0.45
-                    alpha = np.where(bands_arr > prev, attack, release).astype(np.float32)
-                    smoothed = (alpha * bands_arr + (1.0 - alpha) * prev).astype(np.float32)
-                    globals()['ar_prev'] = smoothed
-                    bands_changed = not np.allclose(smoothed, last_bands, atol=1e-3)
-                    last_bands[:] = smoothed
-                    last_beat = int(beat_flag)
+                bands_u8, beat_flag, transition_flag, ts_pc_ns, dyn_floor, kick_intensity = pkt
+                last_rx_ts = now
 
-                # troca de efeito
-                time_up = (now - last_effect_change) > effect_max_interval
-                if transition_flag or time_up:
-                    current_effect = (current_effect + 1) % len(effects)
-                    apply_new_colorset()
-                    last_effect_change = now
-
-                # latência
-                global latency_ms_ema, time_sync_ready, time_offset_ns
+                # latência (um caminho)
+                global time_sync_ready, time_offset_ns
                 if time_sync_ready and ts_pc_ns is not None:
                     now_ns = time.monotonic_ns()
                     one_way_ns = now_ns - (ts_pc_ns + time_offset_ns)
@@ -375,60 +309,44 @@ def main():
                         lat_ms = one_way_ns / 1e6
                         latency_ms_ema = lat_ms if latency_ms_ema is None else 0.85*latency_ms_ema + 0.15*lat_ms
 
-            active = (now < signal_active_until)
-            active_rising = (not prev_active) and active
-
-            if active:
-                if active_rising or bands_changed or not eq_valid:
-                    eq_cached = equalize_bands(last_bands.astype(np.uint8))
-                    compute_dynamic_floor(eq_cached, True)
-                    ctx.dynamic_floor = dynamic_floor
-                    eq_valid = True
+                avg_raw = float(np.mean(bands_u8))
+                if transition_flag == 1 and avg_raw < 0.5:
+                    signal_active_until = 0.0
+                    last_bands[:] = 0
+                    last_beat = 0
                 else:
-                    pass
-            else:
-                if eq_valid:
-                    eq_cached[:] = 0
-                    compute_dynamic_floor(eq_cached, False)
-                    ctx.dynamic_floor = dynamic_floor
-                    eq_valid = False
+                    if avg_raw > 2.0:
+                        signal_active_until = now + SIGNAL_HOLD
+                    last_bands[:] = bands_u8
+                    last_beat = int(beat_flag)
 
-            b = eq_cached.copy()
+                # Dynamic floor vindo do PC
+                ctx.dynamic_floor = int(dyn_floor)
 
-            # KICK BOOST REATIVO (CORRIGIDO: multiplicativo + só nos graves)
-            if eq_valid:
-                if 'kick_ema' not in globals():
-                    globals()['kick_ema'] = 0.0
-                    globals()['kick_prev'] = 0.0
-                    globals()['boost_decay'] = 0.0
+                # troca de efeito por tempo/transition
+                time_up = (now - last_effect_change) > effect_max_interval
+                if transition_flag == 1 or time_up:
+                    current_effect = (current_effect + 1) % len(effects)
+                    apply_new_colorset()
+                    last_effect_change = now
 
-                low_end = max(10, EXPECTED_BANDS // 10)
-                low_cached = float(np.mean(b[:low_end]))
-                kick_raw = max(0.0, low_cached - globals()['kick_prev'])
-                globals()['kickUnion_prev'] = low_cached
+                active = (now < signal_active_until)
 
-                globals()['kick_ema'] = 0.6 * globals()['kick_ema'] + 0.4 * low_cached
-                onset = max(0.0, low_cached - globals()['kick_ema'])
+                b = last_bands.copy()
+                # (Opcional) usar kick_intensity para efeitos que queiram reforço visual
 
-                kick_intensity = onset * 2.2
-                if last_beat == 1:
-                    kick_intensity += 60
+                # Render
+                name, func = effects[current_effect]
+                func(b if active else np.zeros_like(b), last_beat if active else 0, active)
+                already_off = False
 
-                if kick_intensity > 0:
-                    boost_factor = 1.0 + (kick_intensity / 255.0) * 1.2  # max ~1.8x
-                    b[:low_end] = np.clip(b[:low_end].astype(np.float32) * boost_factor, 0, 255).astype(np.uint8)
-                    globals()['boost_decay'] = kick_intensity
-                else:
-                    globals()['boost_decay'] *= 0.85
+                print_status(name, ctx)
 
-            # Render
-            name, func = effects[current_effect]
-            func(b if active else np.zeros_like(b), last_beat if active else 0, active)
-            already_off = False
-            prev_active = active
-            bands_changed = False
+                if RENDER_ON_PACKET:
+                    next_frame = time.time()
+                    continue
 
-            print_status(name, ctx, None)
+            # pacing quando não tem pacote novo
             next_frame += FRAME_DT
             sl = next_frame - time.time()
             if sl > 0: time.sleep(sl)
