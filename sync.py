@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # sync.py — Raspberry Pi 3B renderer (compatível com A2 e A1)
 # • Aceita PKT_AUDIO_V2 (0xA2, 163 bytes) e legado PKT_AUDIO (0xA1, 161 bytes).
-# • Bands já vêm equalizadas do PC. Render "on packet" para máxima reatividade.
+# • As bandas já vêm equalizadas do PC. Render "on packet" para máxima reatividade.
 
 import socket, time, board, neopixel, random, threading, sys, select, tty, termios, os
 import numpy as np
 from collections import deque
 from fxcore import FXContext
-from effects import build_effects
+from effects import build_effects  # <- agora passamos ctx ao construir
 
 PKT_AUDIO_V2 = 0xA2  # [A2][8 ts_pc][150 bands][beat][trans][dyn_floor][kick] => 163 bytes
 PKT_AUDIO    = 0xA1  # [A1][8 ts_pc][150 bands][beat][trans]                   => 161 bytes
@@ -81,12 +81,7 @@ def timesync_tcp_server():
         except Exception:
             time.sleep(0.05)
 
-# Efeitos e paleta
-effects = build_effects()
-current_effect = 0
-last_effect_change = time.time()
-effect_max_interval = 300  # 5 min
-
+# Paleta (igual ao anterior)
 STRATEGIES = ["complementar", "analoga", "triade", "tetrade", "split"]
 COMPLEMENT_DELTA = 0.06
 
@@ -261,19 +256,27 @@ def apply_new_colorset():
     base_saturation = random.randint(190, 230)
 
 def main():
-    global current_effect, last_effect_change, stop_flag, latency_ms_ema
+    global stop_flag, latency_ms_ema
 
+    # Threads auxiliares
     threading.Thread(target=timesync_tcp_server, daemon=True).start()
     threading.Thread(target=udp_receiver, daemon=True).start()
     threading.Thread(target=palette_worker, daemon=True).start()
     threading.Thread(target=key_listener, daemon=True).start()
 
+    # Contexto e efeitos (AGORA o ctx existe antes de build_effects)
     ctx = FXContext(
         pixels, LED_COUNT,
         base_hue_offset, hue_seed, base_saturation,
         current_budget_a=18.0, ma_per_channel=20.0, idle_ma_per_led=1.0
     )
     ctx.metrics = None
+    effects = build_effects(ctx)  # <-- correção: passa o ctx requerido
+
+    # Estado local do main
+    current_effect = 0
+    last_effect_change = time.time()
+    effect_max_interval = 300  # 5 min
 
     last_bands = np.zeros(EXPECTED_BANDS, dtype=np.uint8)
     last_beat = 0
@@ -388,4 +391,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# EOF
+    
