@@ -380,31 +380,34 @@ def main():
 
                 # Render: efeitos ou fallback
                 try:
-                    if not BYPASS_EFFECTS:
-                        name, func = effects[current_effect]
-                        func(b if active else np.zeros_like(b), last_beat if active else 0, active)
-                    else:
-                        # Fallback ultra-simples: 150 bandas -> 300 LEDs (2 por banda), em cinza.
-                        vals = np.repeat(b.astype(np.uint8), 2)
-                        if vals.size < LED_COUNT:
-                            # Se por algum motivo faltar, completa com zeros
-                            vals = np.pad(vals, (0, LED_COUNT - vals.size), 'constant')
-                        else:
-                            vals = vals[:LED_COUNT]
-                        rgb = np.stack([vals, vals, vals], axis=-1)  # tons de cinza
-                        ctx.to_pixels_and_show(rgb)
-                        name = "Fallback Gray (simple)"
-                except Exception as e:
-                    # Mesmo fallback no except, sem chamadas sofisticadas
-                    vals = np.repeat(b.astype(np.uint8), 2)
-                    if vals.size < LED_COUNT:
-                        vals = np.pad(vals, (0, LED_COUNT - vals.size), 'constant')
-                    else:
-                        vals = vals[:LED_COUNT]
-                    rgb = np.stack([vals, vals, vals], axis=-1)
-                    ctx.to_pixels_and_show(rgb)
-                    name = f"Fallback Gray (simple, err:{e.__class__.__name__})"
+                    # Mapear LED -> banda (150 bandas em 300 LEDs = ~2 LEDs por banda)
+                    led_idx = np.arange(LED_COUNT, dtype=np.int32)
+                    band_idx = (led_idx * EXPECTED_BANDS) // LED_COUNT
+                    vals = b[band_idx].astype(np.uint8)  # 0..255 por LED
 
+                    # Aumentar contraste (gamma)
+                    v = ((vals.astype(np.float32) / 255.0) ** 1.6) * 255.0
+                    v = np.clip(v, 0, 255).astype(np.uint8)
+
+                    # 🔧 FIX AQUI: faça h ser int16 (não uint8), para evitar Overflow no (h % 256)
+                    h = ((led_idx * 256) // LED_COUNT).astype(np.int16)
+                    s = np.full(LED_COUNT, 255, dtype=np.uint8)
+
+                    rgb = ctx.hsv_to_rgb_bytes_vec(h, s, v)
+                    ctx.to_pixels_and_show(rgb)
+                    name = "Fallback Spectrum (HSV)"
+                except Exception as e:
+                    led_idx = np.arange(LED_COUNT, dtype=np.int32)
+                    band_idx = (led_idx * EXPECTED_BANDS) // LED_COUNT
+                    vals = b[band_idx].astype(np.uint8)
+                    v = ((vals.astype(np.float32) / 255.0) ** 1.6) * 255.0
+                    v = np.clip(v, 0, 255).astype(np.uint8)
+                    # 🔧 FIX AQUI TAMBÉM:
+                    h = ((led_idx * 256) // LED_COUNT).astype(np.int16)
+                    s = np.full(LED_COUNT, 255, dtype=np.uint8)
+                    rgb = ctx.hsv_to_rgb_bytes_vec(h, s, v)
+                    ctx.to_pixels_and_show(rgb)
+                    name = f"Fallback Spectrum (HSV, err:{e.__class__.__name__})"
                 already_off = False
 
                 # Status + debug mínimo
