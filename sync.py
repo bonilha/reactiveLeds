@@ -14,7 +14,9 @@ from effects import build_effects
 PKT_AUDIO_V2 = 0xA2
 PKT_AUDIO    = 0xA1
 PKT_CFG      = 0xB0  # [B0][ver u8][num_bands u16][fps u16][hold_ms u16][vis_fps u16]
-LEN_A2 = 163; LEN_A1 = 161; LEN_CFG = 10
+LEN_A2_MIN = 13   # 1 hdr + 8 ts + 0 bands + 4 flags = 13 bytes
+LEN_A1_MIN = 11   # 1 hdr + 8 ts + 0 bands + 2 flags = 11 bytes
+LEN_CFG    = 10
 
 UDP_PORT = 5005
 TCP_TIME_PORT = 5006
@@ -22,9 +24,9 @@ TCP_TIME_PORT = 5006
 # ---------- LEDs ----------
 LED_COUNT = 300
 LED_PIN = board.D18
-ORDER = neopixel.GRB    # sua fita é GRB
+ORDER = neopixel.GRB
 BRIGHTNESS = 0.8
-LED_IS_RGBW = False     # WS2812B (RGB). Se fosse SK6812, seria True.
+LED_IS_RGBW = False
 
 pixels = (neopixel.NeoPixel(LED_PIN, LED_COUNT, brightness=BRIGHTNESS, auto_write=False,
                             pixel_order=neopixel.GRBW, bpp=4)
@@ -32,9 +34,9 @@ pixels = (neopixel.NeoPixel(LED_PIN, LED_COUNT, brightness=BRIGHTNESS, auto_writ
           neopixel.NeoPixel(LED_PIN, LED_COUNT, brightness=BRIGHTNESS, auto_write=False, pixel_order=ORDER))
 
 # ---------- Flags ----------
-BYPASS_EFFECTS   = False   # << efeitos habilitados
-DEBUG_STATS      = False   # (mantém False para não quebrar a “linha única”)
-ENABLE_SMOKE_TEST= False   # smoke test já passou
+BYPASS_EFFECTS   = False   # efeitos habilitados
+DEBUG_STATS      = False   # manter False para não poluir a linha única
+ENABLE_SMOKE_TEST= False
 
 # ---------- UDP ----------
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -45,18 +47,14 @@ except Exception: pass
 udp_sock.bind(("0.0.0.0", UDP_PORT))
 udp_sock.setblocking(True)
 
-# ---------- Estado base (atualizados via B0) ----------
+# ---------- Estado base (atualizados via B0 / A2) ----------
 EXPECTED_BANDS = 150
 CFG_FPS        = 75
 SIGNAL_HOLD_MS = 500
 CFG_VIS_FPS    = 45
 
 # Contadores / métricas
-rx_count = 0
-drop_len = 0
-drop_hdr = 0
-
-# Time sync
+rx_count = drop_len = drop_hdr = 0
 time_offset_ns = 0
 time_sync_ready = False
 latency_ms_ema = None
@@ -106,7 +104,7 @@ def timesync_tcp_server():
         except Exception:
             time.sleep(0.05)
 
-# ---------- Paleta / cores (como antes) ----------
+# ---------- Paleta / cores ----------
 STRATEGIES = ["complementar","analoga","triade","tetrade","split"]
 COMPLEMENT_DELTA = 0.06
 def clamp01(x): return x % 1.0
@@ -195,8 +193,7 @@ def key_listener():
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
 
-# ---------- UDP Receiver + CFG (sem prints periódicos) ----------
-
+# ---------- UDP Receiver + CFG (dinâmico) ----------
 def udp_receiver():
     global latest_packet, rx_count, drop_hdr, drop_len
     global EXPECTED_BANDS, CFG_FPS, SIGNAL_HOLD_MS, CFG_VIS_FPS
@@ -211,36 +208,34 @@ def udp_receiver():
 
             hdr = data[0]
 
-            # -------- A2: [A2][8 ts][nb bands][beat][trans][dyn][kick]  (13+nb bytes) --------
-            if hdr == PKT_AUDIO_V2 and n >= 13:
-                nb = n - 13
+            # --- A2: 1+8+nb+4 (13+nb) ---
+            if hdr == PKT_AUDIO_V2 and n >= LEN_A2_MIN:
+                nb = n - LEN_A2_MIN
                 if nb <= 0:
                     drop_len += 1
                     continue
-                ts_pc = int.from_bytes(data[1:9], 'little')
+                ts_pc = int.from_bytes(data[1:9],'little')
                 bands = np.frombuffer(memoryview(data)[9:9+nb], dtype=np.uint8)
                 beat  = data[9+nb]
                 trans = data[10+nb]
                 dyn_floor = data[11+nb]
                 kick_intensity = data[12+nb]
 
-                # Se mudou a quantidade de bandas, atualiza EXPECTED_BANDS
                 if EXPECTED_BANDS != nb:
                     EXPECTED_BANDS = int(nb)
 
                 with latest_lock:
-                    # .copy() para desacoplar do buffer de rede
                     latest_packet = (bands.copy(), beat, trans, ts_pc, dyn_floor, kick_intensity)
                 rx_count += 1
                 continue
 
-            # -------- A1 (legado): [A1][8 ts][nb bands][beat][trans]  (11+nb bytes) --------
-            if hdr == PKT_AUDIO and n >= 11:
-                nb = n - 11
+            # --- A1: 1+8+nb+2 (11+nb) ---
+            if hdr == PKT_AUDIO and n >= LEN_A1_MIN:
+                nb = n - LEN_A1_MIN
                 if nb <= 0:
                     drop_len += 1
                     continue
-                ts_pc = int.from_bytes(data[1:9], 'little')
+                ts_pc = int.from_bytes(data[1:9],'little')
                 bands = np.frombuffer(memoryview(data)[9:9+nb], dtype=np.uint8)
                 beat  = data[9+nb]
                 trans = data[10+nb]
@@ -253,8 +248,8 @@ def udp_receiver():
                 rx_count += 1
                 continue
 
-            # -------- B0 (config): [B0][ver][nb u16][fps u16][hold u16][vis u16] (10 bytes) --------
-            if hdr == PKT_CFG and n == 10:
+            # --- B0: config ---
+            if hdr == PKT_CFG and n == LEN_CFG:
                 ver = data[1]
                 nb  = data[2] | (data[3] << 8)
                 fps = data[4] | (data[5] << 8)
@@ -264,10 +259,9 @@ def udp_receiver():
                 if fps > 0: CFG_FPS        = int(fps)
                 if hold>=0: SIGNAL_HOLD_MS = int(hold)
                 if vis > 0: CFG_VIS_FPS    = int(vis)
-                # sem prints aqui — a linha unificada refletirá as mudanças
                 continue
 
-            # -------- Desconhecido / tamanho inválido --------
+            # Desconhecido
             if hdr in (PKT_AUDIO, PKT_AUDIO_V2, PKT_CFG):
                 drop_len += 1
             else:
@@ -278,7 +272,6 @@ def udp_receiver():
 
 # ---------- Linha unificada ----------
 def unified_status_line(effect_name, ctx, active, bands, fps, vis_fps):
-    """Monta a linha única de status."""
     curr = ctx.current_a_ema if ctx.current_a_ema is not None else 0.0
     poww = ctx.power_w_ema  if ctx.power_w_ema  is not None else 0.0
     cap  = ctx.last_cap_scale if ctx.last_cap_scale is not None else 1.0
@@ -335,7 +328,7 @@ def main():
     next_frame = time.time()
     last_render_ts = 0.0
 
-    # Smoothing visual do fallback (mantido, mas só usado no fallback)
+    # Smoothing visual do fallback (só usado no fallback)
     VIS_SMOOTH_ATTACK  = 1.0
     VIS_SMOOTH_RELEASE = 0.60
     vis_prev_v = np.zeros(LED_COUNT, dtype=np.float32)
@@ -399,10 +392,19 @@ def main():
                 avg_raw = float(np.mean(bands_u8))
                 if transition_flag == 1 and avg_raw < 0.5:
                     signal_active_until = 0.0
-                    last_bands[:] = 0; last_beat = 0
+                    # (re)zera o buffer no tamanho atual das bandas
+                    if last_bands.size != bands_u8.size:
+                        last_bands = np.zeros(bands_u8.size, dtype=np.uint8)
+                    else:
+                        last_bands[:] = 0
+                    last_beat = 0
                 else:
                     signal_active_until = now + SIGNAL_HOLD
-                    last_bands[:] = bands_u8; last_beat = int(beat_flag)
+                    # 🔧 FIX: realoca se o tamanho mudou (e então copia)
+                    if last_bands.size != bands_u8.size:
+                        last_bands = np.zeros(bands_u8.size, dtype=np.uint8)
+                    last_bands[:] = bands_u8
+                    last_beat = int(beat_flag)
 
                 ctx.dynamic_floor = int(dyn_floor)
 
@@ -416,24 +418,21 @@ def main():
                 active = (now < signal_active_until)
                 b = last_bands.copy()
 
-                # Decimator de render: respeita vis_fps (suaviza visual sem perder RX)
+                # Decimator de render (vis_fps)
                 if (now - last_render_ts) >= RENDER_DT:
                     last_render_ts = now
-                    # --- Render: efeitos reais ou fallback ---
                     try:
                         if not BYPASS_EFFECTS:
                             name, func = effects[current_effect]
-                            # Efeitos padrão: (bands_u8, beat, active)
                             func(b if active else np.zeros_like(b),
                                  last_beat if active else 0,
                                  active)
                         else:
-                            # Fallback HSV (debug/diagnóstico)
+                            # Fallback HSV (debug)
                             led_idx = np.arange(LED_COUNT, dtype=np.int32)
-                            band_idx = (led_idx * EXPECTED_BANDS) // LED_COUNT
+                            band_idx = (led_idx * b.size) // LED_COUNT  # usa tamanho real de b
                             vals = b[band_idx].astype(np.uint8)
                             v = ((vals.astype(np.float32)/255.0)**1.6) * 255.0
-                            # smoothing visual do fallback
                             alpha = np.where(v > vis_prev_v, VIS_SMOOTH_ATTACK, VIS_SMOOTH_RELEASE).astype(np.float32)
                             vis_prev_v = alpha*v + (1.0-alpha)*vis_prev_v
                             v = np.clip(vis_prev_v, 0, 255).astype(np.uint8)
@@ -443,23 +442,17 @@ def main():
                             ctx.to_pixels_and_show(rgb)
                         name = effects[current_effect][0] if not BYPASS_EFFECTS else "Fallback HSV"
                     except Exception as e:
-                        # Segurança: fallback gray simples
                         vals = np.repeat(b.astype(np.uint8), 2)
                         if vals.size < LED_COUNT: vals = np.pad(vals, (0, LED_COUNT-vals.size), 'constant')
                         else: vals = vals[:LED_COUNT]
                         rgb = np.stack([vals, vals, vals], axis=-1)
                         ctx.to_pixels_and_show(rgb)
                         name = f"Fallback Gray ({e.__class__.__name__})"
-
                 else:
-                    # Sem render neste instante
                     name = effects[current_effect][0] if not BYPASS_EFFECTS else "Fallback HSV"
 
-                already_off = False
-                # ---------- Linha única ----------
-                unified_status_line(name, ctx, active, EXPECTED_BANDS, CFG_FPS, CFG_VIS_FPS)
-
-                # Render-on-packet: já atualizamos a linha; volta ao topo
+                # Linha única
+                unified_status_line(name, ctx, active, b.size, CFG_FPS, CFG_VIS_FPS)
                 continue
 
             # Pacing quando não chega pacote novo
