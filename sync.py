@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# sync.py — Raspberry Pi 3B renderer
-# • Recebe PKT_AUDIO_V2 (0xA2) com bandas já equalizadas (uint8), beat, transition, dynamic_floor e kick_intensity
-# • Sem equalização/EMAs pesadas no Pi; render "on packet" para máxima reatividade
+# sync.py — Raspberry Pi 3B renderer (compatível com A2 e A1)
+# • Aceita PKT_AUDIO_V2 (0xA2, 163 bytes) e legado PKT_AUDIO (0xA1, 161 bytes).
+# • Bands já vêm equalizadas do PC. Render "on packet" para máxima reatividade.
 
 import socket, time, board, neopixel, random, threading, sys, select, tty, termios, os
 import numpy as np
@@ -9,7 +9,11 @@ from collections import deque
 from fxcore import FXContext
 from effects import build_effects
 
-PKT_AUDIO_V2 = 0xA2
+PKT_AUDIO_V2 = 0xA2  # [A2][8 ts_pc][150 bands][beat][trans][dyn_floor][kick] => 163 bytes
+PKT_AUDIO    = 0xA1  # [A1][8 ts_pc][150 bands][beat][trans]                   => 161 bytes
+LEN_A2 = 163
+LEN_A1 = 161
+
 UDP_PORT = 5005
 TCP_TIME_PORT = 5006
 
@@ -23,6 +27,7 @@ pixels = neopixel.NeoPixel(LED_PIN, LED_COUNT, brightness=BRIGHTNESS, auto_write
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 22)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 except Exception:
     pass
 udp_sock.bind(("0.0.0.0", UDP_PORT))
@@ -30,6 +35,8 @@ udp_sock.setblocking(True)
 
 EXPECTED_BANDS = 150
 rx_count = 0
+drop_len = 0
+drop_hdr = 0
 _last_status = 0.0
 
 # Time sync
@@ -86,7 +93,7 @@ COMPLEMENT_DELTA = 0.06
 def clamp01(x): return x % 1.0
 
 def build_palette_from_strategy(h0, strategy, num_colors=5):
-    import colorsys, random
+    import colorsys
     def hsv_to_rgb_bytes(h, s, v):
         r, g, b = colorsys.hsv_to_rgb(h, s, v)
         return (int(r*255), int(g*255), int(b*255))
@@ -138,7 +145,6 @@ palette_queue = deque(maxlen=PALETTE_BUFFER_MAX)
 palette_thread_stop = threading.Event()
 
 def palette_worker():
-    import random
     while not palette_thread_stop.is_set():
         try:
             if len(palette_queue) < PALETTE_BUFFER_MAX:
@@ -175,32 +181,54 @@ def key_listener():
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
-# UDP receiver (novo protocolo)
+# UDP receiver compatível (A2 e A1) + métricas de drop
 latest_packet = None
 latest_lock = threading.Lock()
 stop_flag = False
 
 def udp_receiver():
-    global latest_packet, rx_count, _last_status
+    global latest_packet, rx_count, drop_hdr, drop_len, _last_status
+    print(f"[INFO] UDP receiver ligado em 0.0.0.0:{UDP_PORT} (aceita A2-163 e A1-161).")
     while not stop_flag:
         try:
-            data, _ = udp_sock.recvfrom(1024)
-            # Espera A2 (163 bytes)
-            if len(data) != 163 or data[0] != PKT_AUDIO_V2:
+            data, _ = udp_sock.recvfrom(2048)
+            n = len(data)
+            if n < 1:
+                drop_len += 1
                 continue
-            ts_pc = int.from_bytes(data[1:9], 'little')
-            bands = np.frombuffer(data[9:159], dtype=np.uint8)
-            beat = data[159]
-            trans = data[160]
-            dyn_floor = data[161]
-            kick_intensity = data[162]
+
+            hdr = data[0]
+            if hdr == PKT_AUDIO_V2 and n == LEN_A2:
+                ts_pc = int.from_bytes(data[1:9], 'little')
+                bands = np.frombuffer(data[9:159], dtype=np.uint8)
+                beat  = data[159]
+                trans = data[160]
+                dyn_floor = data[161]
+                kick_intensity = data[162]
+            elif hdr == PKT_AUDIO    and n == LEN_A1:
+                ts_pc = int.from_bytes(data[1:9], 'little')
+                bands = np.frombuffer(data[9:159], dtype=np.uint8)
+                beat  = data[159]
+                trans = data[160]
+                dyn_floor = 0
+                kick_intensity = 0
+            else:
+                # Drop por tamanho ou header
+                if hdr in (PKT_AUDIO, PKT_AUDIO_V2):
+                    drop_len += 1
+                else:
+                    drop_hdr += 1
+                continue
+
             with latest_lock:
                 latest_packet = (bands.copy(), beat, trans, ts_pc, dyn_floor, kick_intensity)
             rx_count += 1
+
             now = time.time()
             if now - _last_status > 1.0:
-                print(f"\rRX: {rx_count} packets", end="", flush=True)
+                print(f"\rRX: {rx_count}  drops(len):{drop_len}  drops(hdr):{drop_hdr}", end="", flush=True)
                 _last_status = now
+
         except Exception:
             time.sleep(0.001)
 
@@ -223,7 +251,6 @@ def apply_new_colorset():
     if pal_data:
         current_palette, current_palette_name, last_palette_h0 = pal_data
     else:
-        import random
         strategy = random.choice(STRATEGIES)
         h0 = random.random()
         current_palette = build_palette_from_strategy(h0, strategy, num_colors=5)
@@ -253,7 +280,6 @@ def main():
 
     SIGNAL_HOLD = 0.5
     signal_active_until = 0.0
-    prev_active = False
     already_off = False
 
     IDLE_TIMEOUT = 2.0
@@ -269,7 +295,7 @@ def main():
         while True:
             now = time.time()
 
-            # troca por tecla
+            # Teclas
             global pending_key_change
             if pending_key_change is not None:
                 if pending_key_change == 'next':
@@ -320,7 +346,7 @@ def main():
                     last_bands[:] = bands_u8
                     last_beat = int(beat_flag)
 
-                # Dynamic floor vindo do PC
+                # Dynamic floor vindo do PC (ou 0 no legado A1)
                 ctx.dynamic_floor = int(dyn_floor)
 
                 # troca de efeito por tempo/transition
@@ -362,4 +388,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+# EOF

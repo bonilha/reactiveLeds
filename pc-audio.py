@@ -16,75 +16,58 @@ import threading
 import argparse
 from typing import Optional, Union
 
-# ------------------------------- Configs -------------------------------
-RASPBERRY_IP = "192.168.66.71"
+# ------------------------------- Constantes padrão -------------------------------
+DEFAULT_RASPBERRY_IP = "192.168.66.71"
 UDP_PORT = 5005
 TCP_TIME_PORT = 5006
 
 NUM_BANDS = 150
-BLOCK_SIZE = 512              # resolução temporal (~11.6 ms @ 44.1 kHz)
+DEFAULT_BLOCK_SIZE = 512       # ~11.6 ms @44.1 kHz
 FMIN = 20.0
 FMAX = 16000.0
 
-# Espectro bruto -> EMA (use 1.0 para "sem EMA" no espectro base)
-RAW_BANDS_EMA_ALPHA = 1.0
+# Equalização e normalização
+DEFAULT_EQ_TARGET = 64.0
+DEFAULT_EQ_ALPHA = 0.35
+DEFAULT_TILT_MIN, DEFAULT_TILT_MAX = 0.9, 1.8
+DEFAULT_NORM_PEAK_EMA = 0.40
+DEFAULT_RAW_EMA = 1.0          # 1.0 => sem suavização no espectro base
 
-# Equalização por banda (sem custo no Pi): alvo e alpha do "analisador" por banda
-EQ_TARGET = 64.0
-EQ_ALPHA = 0.35               # resposta da equalização (ganho adaptativo)
-TILT_MIN, TILT_MAX = 0.9, 1.8 # curva de realce de graves / atenuação de agudos
-NORM_PEAK_EMA_ALPHA = 0.40    # normalização reativa: 0.30–0.50 recomendados
-
-# Smoothing leve (opcional) após equalização — use 1.0 para desligado
-POST_EQ_SMOOTH_ATTACK = 1.0   # 0.90–0.98 dá um leve "colar" na subida
-POST_EQ_SMOOTH_RELEASE = 1.0  # 0.70–0.90 cola na queda; 1.0 desliga
+# Pós-EQ (opcional)
+DEFAULT_POST_ATTACK = 1.0       # 0.90–0.98 cola subida; 1.0 desliga
+DEFAULT_POST_RELEASE = 1.0      # 0.70–0.90 cola queda;   1.0 desliga
 
 # Beat/Kick
 ENERGY_BUFFER_SIZE = 10
-BEAT_THRESHOLD_STD = 1.20     # múltiplos do desvio-padrão no buffer
+BEAT_THRESHOLD_STD = 1.20
 BEAT_HEIGHT_MIN = 0.08
 
-# Envio
-MAX_FPS = 75
-MIN_SEND_INTERVAL = 1.0 / MAX_FPS
+# TX / FPS
+DEFAULT_MAX_FPS = 75
 
-# Time-sync (estrito)
+# Time-sync
 REQUIRE_TIME_SYNC = True
-RESYNC_INTERVAL_SEC = 60.0
+DEFAULT_RESYNC_INTERVAL_SEC = 60.0
 RESYNC_RETRY_INTERVAL = 2.0
 TIME_SYNC_SAMPLES = 12
 
 # Protocolo
 PKT_AUDIO_V2 = 0xA2  # [A2][8 ts_pc][150 bands][beat][trans][dyn_floor][kick] => 163 bytes
 
-# UDP socket
-udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-try:
-    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
-except Exception:
-    pass
 
-# Estado global de status
-tx_count = 0
-_last_status = 0.0
-_time_sync_ok = False
-_stop_resync = threading.Event()
-
-
-def print_status(tag_extra: str = "", debug_line: str = ""):
+# ------------------------------- Utilitários -------------------------------
+def print_status(ctx, tag_extra: str = "", debug_line: str = ""):
     """Status de TX + sync (+ opcional debug em linha única)."""
-    global _last_status, _time_sync_ok, tx_count
     now = time.time()
-    if (now - _last_status) > 0.25:
-        tag = "SYNC✓" if _time_sync_ok else "WAITING SYNC"
+    if (now - ctx.last_status) > 0.25:
+        tag = "SYNC✓" if ctx.time_sync_ok else "WAITING SYNC"
         extra = f" {tag_extra}" if tag_extra else ""
         dbg = f" {debug_line}" if debug_line else ""
-        sys.stdout.write(f"\rTX: {tx_count} {tag}{extra}{dbg}")
+        sys.stdout.write(f"\rTX: {ctx.tx_count} {tag}{extra}{dbg}")
         sys.stdout.flush()
-        _last_status = now
+        ctx.last_status = now
 
 
-# ------------------------ Dispositivos (auto) --------------------------
 def resolve_device_index(name_or_index: Optional[Union[str, int]]) -> Optional[int]:
     if name_or_index is None:
         return None
@@ -108,8 +91,7 @@ def auto_candidate_outputs():
     default_out = sd.default.device[1]
     if isinstance(default_out, int) and default_out >= 0:
         cands.append(default_out)
-    keywords = ["speaker", "alto-falante", "headphone", "fone", "realtek", "echo",
-                "dot", "hdmi", "display audio"]
+    keywords = ["speaker", "alto-falante", "headphone", "fone", "realtek", "echo", "dot", "hdmi", "display audio"]
     for i, d in enumerate(devs):
         if d.get("max_output_channels", 0) > 0 and any(k in d["name"].lower() for k in keywords):
             if i not in cands:
@@ -148,30 +130,30 @@ def choose_candidates(override: Optional[Union[str, int]] = None):
     if isinstance(default_in, int) and default_in >= 0:
         d = devs[default_in]
         return [(default_in, None, f"Default INPUT: idx={default_in} '{d['name']}'")]
-    return [(None, None, "PortAudio default (fallback)")]
+    return [(None, None, "PortAudio default (fallback)")]  # último recurso
 
 
-def open_with_probe(dev_idx, extra, callback):
+def open_with_probe(dev_idx, extra, callback, block_size):
     attempts = [(48000, 2), (48000, 1), (44100, 2), (44100, 1)]
     last_err = None
     for sr_try, ch_try in attempts:
         try:
             s = sd.InputStream(channels=ch_try, samplerate=sr_try, dtype="float32",
-                               blocksize=BLOCK_SIZE, device=dev_idx,
+                               blocksize=block_size, device=dev_idx,
                                callback=callback, extra_settings=extra)
             return s, int(s.samplerate), ch_try, f"(opened sr={int(s.samplerate)} ch={ch_try})"
         except Exception as e:
             last_err = e
     try:
         s = sd.InputStream(channels=2, samplerate=44100, dtype="float32",
-                           blocksize=BLOCK_SIZE, device=None, callback=callback)
+                           blocksize=block_size, device=None, callback=callback)
         return s, int(s.samplerate), 2, "(fallback default INPUT sr=44100 ch=2)"
     except Exception as e:
         last_err = e
     raise last_err if last_err else RuntimeError("Falha ao abrir InputStream.")
 
 
-# ----------------------------- Time Sync -------------------------------
+# ------------------------------- Time Sync (cliente) -------------------------------
 def _recv_exact(sock, n):
     buf = b''
     while len(buf) < n:
@@ -182,17 +164,15 @@ def _recv_exact(sock, n):
     return buf
 
 
-def time_sync_over_tcp(samples=TIME_SYNC_SAMPLES, timeout=0.6):
+def time_sync_over_tcp(ctx, samples=TIME_SYNC_SAMPLES, timeout=0.6):
     """
     Cliente TCP do time-sync:
-    envia 'TS1'+t0_pc(8) N vezes e recebe 'TS2'+t0_pc+tr_pi(8) (ambos unsigned).
-    escolhe offset do menor RTT; envia 'TS3'+offset(8 signed=True); espera eco 'TS3'+offset(8).
-    Atualiza _time_sync_ok e retorna True/False.
+    envia 'TS1'+t0_pc(8) N vezes e recebe 'TS2'+t0_pc+tr_pi(8).
+    Escolhe offset do menor RTT; envia 'TS3'+offset; espera eco.
     """
-    global _time_sync_ok
     results = []
     try:
-        with socket.create_connection((RASPBERRY_IP, TCP_TIME_PORT), timeout=1.8) as s:
+        with socket.create_connection((ctx.rpi_ip, TCP_TIME_PORT), timeout=1.8) as s:
             s.settimeout(timeout)
             for _ in range(samples):
                 t0 = time.monotonic_ns()
@@ -201,49 +181,48 @@ def time_sync_over_tcp(samples=TIME_SYNC_SAMPLES, timeout=0.6):
                 if data[:3] != b"TS2":
                     continue
                 echo_t0 = int.from_bytes(data[3:11], 'little')
-                tr_pi = int.from_bytes(data[11:19], 'little')
+                tr_pi  = int.from_bytes(data[11:19], 'little')
                 if echo_t0 != t0:
                     continue
                 t1 = time.monotonic_ns()
                 rtt = t1 - t0
-                mid = t0 + rtt // 2
+                mid = t0 + rtt//2
                 offset = tr_pi - mid  # pode ser NEGATIVO
                 results.append((rtt, offset))
             if not results:
-                _time_sync_ok = False
+                ctx.time_sync_ok = False
                 print("\n[WARN] Time sync TCP falhou (sem amostras válidas).")
                 return False
             rtt_min, offset_best = sorted(results, key=lambda x: x[0])[0]
             s.sendall(b"TS3" + int(offset_best).to_bytes(8, 'little', signed=True))
             ack = _recv_exact(s, 3 + 8)
             ok = (ack[:3] == b"TS3" and int.from_bytes(ack[3:11], 'little', signed=True) == int(offset_best))
-            _time_sync_ok = bool(ok)
+            ctx.time_sync_ok = bool(ok)
             print(f"\n[INFO] Time sync TCP: RTT_min={rtt_min/1e6:.2f} ms, offset={offset_best/1e6:.3f} ms, ack={'OK' if ok else 'NOK'}")
-            return _time_sync_ok
+            return ctx.time_sync_ok
     except Exception as e:
-        _time_sync_ok = False
+        ctx.time_sync_ok = False
         print(f"\n[WARN] Time sync TCP erro: {e}")
         return False
 
 
-def resync_worker(resync_interval):
-    """Re-sync: se não sincronizado, tenta a cada 2 s; se OK, refaz a cada resync_interval."""
-    while not _stop_resync.is_set():
-        if _time_sync_ok:
-            if _stop_resync.wait(resync_interval):
+def resync_worker(ctx, resync_interval):
+    while not ctx.stop_resync.is_set():
+        if ctx.time_sync_ok:
+            if ctx.stop_resync.wait(resync_interval):
                 break
         else:
-            if _stop_resync.wait(RESYNC_RETRY_INTERVAL):
+            if ctx.stop_resync.wait(RESYNC_RETRY_INTERVAL):
                 break
-        time_sync_over_tcp()
+        time_sync_over_tcp(ctx)
 
 
-# ----------------------------- FFT/Bandas ------------------------------
+# ------------------------------- FFT / Bandas -------------------------------
 def make_bands_indices(nfft, sr, num_bands, fmin, fmax_limit):
     """Retorna arrays vetorizados de inícios/fins por banda (inclusive-exclusivo)."""
-    freqs = np.fft.rfftfreq(nfft, 1.0 / sr)
-    fmax = min(fmax_limit, sr / 2.0)
-    edges = np.geomspace(fmin, fmax, num_bands + 1)
+    freqs = np.fft.rfftfreq(nfft, 1.0/sr)
+    fmax = min(fmax_limit, sr/2.0)
+    edges = np.geomspace(fmin, fmax, num_bands+1)
     edge_idx = np.searchsorted(freqs, edges, side="left").astype(np.int32)
     a_idx = edge_idx[:-1]
     b_idx = edge_idx[1:]
@@ -254,43 +233,35 @@ def make_bands_indices(nfft, sr, num_bands, fmin, fmax_limit):
 def make_compute_bands(sr, block_size, band_starts, band_ends,
                        raw_ema_alpha, peak_ema_alpha):
     """
-    Pipeline base (leve): janela -> rfft -> mag -> médias por banda -> log1p -> normalização via EMA do pico
+    Pipeline base (leve): janela -> rfft -> mag -> médias por banda -> log1p -> normalização via EMA do pico.
     Retorna valores (0..1) já normalizados (sem equalização por banda).
     """
     window = np.hanning(block_size).astype(np.float32)
-    ema_bands = np.zeros(len(band_starts), dtype=np.float32)  # para RAW_BANDS_EMA_ALPHA<1.0
-    peak_ema = 1.0  # evita div/0
+    ema_bands = np.zeros(len(band_starts), dtype=np.float32)
+    peak_ema = 1.0
 
     def compute(block):
         nonlocal ema_bands, peak_ema
         x = block * window
         fft_mag = np.abs(np.fft.rfft(x, n=block_size)).astype(np.float32)
-
-        # médias por banda via prefix-sum
         cs = np.concatenate(([0.0], np.cumsum(fft_mag, dtype=np.float32)))
         sums = cs[band_ends] - cs[band_starts]
         lens = (band_ends - band_starts).astype(np.float32)
         means = sums / np.maximum(lens, 1.0)
-
         vals = np.log1p(means)  # compressão
         cur_max = float(np.max(vals)) if vals.size else 1.0
         peak_ema = (1.0 - peak_ema_alpha) * peak_ema + peak_ema_alpha * max(cur_max, 1e-6)
         norm = max(peak_ema, 1e-6)
         vals = (vals / norm).clip(0.0, 1.0)
-
-        # EMA bruta opcional
-        if raw_ema_alpha < 1.0:
-            ema_bands = raw_ema_alpha * vals + (1.0 - raw_ema_alpha) * ema_bands
-            return ema_bands
-        else:
-            return vals
-
+        # EMA base (se desejado)
+        ema_bands = raw_ema_alpha * vals + (1.0 - raw_ema_alpha) * ema_bands
+        return ema_bands  # 0..1
     return compute
 
 
-# ----------------------------- Estado compartilhado --------------------
+# ------------------------------- Contexto de execução -------------------------------
 class Shared:
-    def __init__(self, n_bands):
+    def __init__(self, n_bands: int):
         self.bands_eq_u8 = np.zeros(n_bands, dtype=np.uint8)
         self.beat = 0
         self.kick_intensity = 0
@@ -298,57 +269,67 @@ class Shared:
         self.rms = 0.0
         self.avg_ema = 0.0
         self.rms_ema = 0.0
-        self.last_update = 0.0
         self.block_max = 0.0
+        self.last_update = 0.0
 
-shared = Shared(NUM_BANDS)
+
+class Ctx:
+    def __init__(self, rpi_ip: str, max_fps: int):
+        self.rpi_ip = rpi_ip
+        self.max_fps = max_fps
+        self.min_send_interval = 1.0 / max_fps
+        self.tx_count = 0
+        self.last_status = 0.0
+        self.time_sync_ok = False
+        self.stop_resync = threading.Event()
+        # sockets
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+        except Exception:
+            pass
 
 
-# ----------------------------- Main -----------------------------------
+# ------------------------------- Main -------------------------------
 def main():
-    global tx_count, RESYNC_INTERVAL_SEC
-
     parser = argparse.ArgumentParser()
-    parser.add_argument("--debug", action="store_true", help="Imprime RMS/AVG/estado do gate periodicamente.")
-    parser.add_argument("--device", type=str, default=None, help="Nome/índice do dispositivo de captura.")
-    parser.add_argument("--silence-bands", type=float, default=3.0, help="Limiar de média de bandas para silêncio.")
-    parser.add_argument("--silence-rms", type=float, default=1e-5, help="Limiar de RMS para silêncio.")
+    parser.add_argument("--device", type=str, default=None, help="Índice/nome do dispositivo de captura.")
+    parser.add_argument("--ip", type=str, default=DEFAULT_RASPBERRY_IP, help="IP do Raspberry Pi.")
+    parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
+    parser.add_argument("--max-fps", type=int, default=DEFAULT_MAX_FPS)
+    # Equalização/normalização
+    parser.add_argument("--eq-target", type=float, default=DEFAULT_EQ_TARGET)
+    parser.add_argument("--eq-alpha", type=float, default=DEFAULT_EQ_ALPHA)
+    parser.add_argument("--tilt-min", type=float, default=DEFAULT_TILT_MIN)
+    parser.add_argument("--tilt-max", type=float, default=DEFAULT_TILT_MAX)
+    parser.add_argument("--norm-peak-ema", type=float, default=DEFAULT_NORM_PEAK_EMA)
+    parser.add_argument("--raw-ema", type=float, default=DEFAULT_RAW_EMA)
+    # Pós-EQ
+    parser.add_argument("--post-attack", type=float, default=DEFAULT_POST_ATTACK)
+    parser.add_argument("--post-release", type=float, default=DEFAULT_POST_RELEASE)
+    # Gate de silêncio
+    parser.add_argument("--silence-bands", type=float, default=3.0)
+    parser.add_argument("--silence-rms", type=float, default=1e-5)
     parser.add_argument("--silence-duration", type=float, default=0.8)
     parser.add_argument("--resume-factor", type=float, default=2.0)
     parser.add_argument("--resume-stable", type=float, default=0.4)
-    parser.add_argument("--resync", type=float, default=RESYNC_INTERVAL_SEC)
-    parser.add_argument("--norm-peak-ema", type=float, default=NORM_PEAK_EMA_ALPHA, help="Alpha EMA do pico para normalização espectral.")
-    parser.add_argument("--eq-alpha", type=float, default=EQ_ALPHA, help="Alpha do analisador da equalização por banda.")
-    parser.add_argument("--raw-ema", type=float, default=RAW_BANDS_EMA_ALPHA, help="Alpha da EMA bruta do espectro (1.0 = off).")
-    parser.add_argument("--max-fps", type=int, default=MAX_FPS)
+    # Resync
+    parser.add_argument("--resync", type=float, default=DEFAULT_RESYNC_INTERVAL_SEC)
+    # Debug
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    # Atualiza configs de runtime
-    global NORM_PEAK_EMA_ALPHA
-    NORM_PEAK_EMA_ALPHA = float(args.norm_peak_ema)
-    eq_alpha = float(args.eq_alpha)
-    raw_ema = float(args.raw_ema)
-    max_fps = int(args.max_fps)
-    send_interval = 1.0 / max_fps if max_fps > 0 else MIN_SEND_INTERVAL
+    # Contexto
+    ctx = Ctx(args.ip, args.max_fps)
+    shared = Shared(NUM_BANDS)
 
-    SILENCE_THRESHOLD = args.silence_bands
-    AMP_SILENCE_THRESHOLD = args.silence_rms
-    SILENCE_DURATION = args.silence_duration
-    RESUME_FACTOR = args.resume_factor
-    RESUME_STABLE_TIME = args.resume_stable
-    RESYNC_INTERVAL_SEC = float(args.resync)
-
+    # Time sync
     print("[INFO] Iniciando time-sync TCP (porta 5006)...")
-    time_sync_over_tcp()
-    t_sync = threading.Thread(target=resync_worker, args=(RESYNC_INTERVAL_SEC,), daemon=True); t_sync.start()
+    time_sync_over_tcp(ctx)
+    t_sync = threading.Thread(target=resync_worker, args=(ctx, float(args.resync)), daemon=True)
+    t_sync.start()
 
-    # Beat: buffer circular
-    energy_buf = np.zeros(ENERGY_BUFFER_SIZE, dtype=np.float32)
-    energy_idx = 0
-    energy_count = 0
-    last_energy = 0.0
-
-    # Gate de silêncio
+    # Estado do gate / tx pacing
     active = False
     silence_since = None
     resume_since = None
@@ -356,13 +337,23 @@ def main():
     last_debug = 0.0
 
     # Equalização (estado)
-    tilt_curve = np.exp(np.linspace(np.log(TILT_MAX), np.log(TILT_MIN), NUM_BANDS)).astype(np.float32)
-    band_ema = np.ones(NUM_BANDS, dtype=np.float32) * (EQ_TARGET / 2.0)
+    tilt_curve = np.exp(np.linspace(np.log(args.tilt_max), np.log(args.tilt_min), NUM_BANDS)).astype(np.float32)
+    band_ema = np.ones(NUM_BANDS, dtype=np.float32) * (args.eq_target / 2.0)
     post_eq_prev = np.zeros(NUM_BANDS, dtype=np.float32)
 
+    # Beat: buffer circular
+    energy_buf = np.zeros(ENERGY_BUFFER_SIZE, dtype=np.float32)
+    energy_idx = 0
+    energy_count = 0
+    last_energy = 0.0
+
+    # Construção do pipeline de bandas (normalizado 0..1)
+    compute_bands = None
+    raw_ema_alpha = float(args.raw_ema)
+    peak_ema_alpha = float(args.norm_peak_ema)
+
+    # Envio de pacote
     def send_packet(bands_u8: np.ndarray, beat_flag: int, transition_flag: int, dyn_floor: int, kick_intensity: int):
-        """Envia um pacote A2 (loop principal controla cadência e gating)."""
-        global tx_count
         ts_ns = time.monotonic_ns()
         payload = (
             bytes([PKT_AUDIO_V2]) +
@@ -370,12 +361,10 @@ def main():
             bands_u8.tobytes() +
             bytes([beat_flag & 0xFF, transition_flag & 0xFF, dyn_floor & 0xFF, kick_intensity & 0xFF])
         )
-        udp_sock.sendto(payload, (RASPBERRY_IP, UDP_PORT))
-        tx_count += 1
+        ctx.udp_sock.sendto(payload, (ctx.rpi_ip, UDP_PORT))
+        ctx.tx_count += 1
 
     # Callback de áudio (atualiza métricas e bands prontas)
-    compute_bands = None
-
     def audio_cb(indata, frames, time_info, status):
         nonlocal energy_idx, energy_count, last_energy, band_ema, post_eq_prev
         if status:
@@ -383,24 +372,25 @@ def main():
 
         # Mono mix
         block = indata.mean(axis=1) if indata.ndim > 1 else indata
-        if len(block) < BLOCK_SIZE:
-            block = np.pad(block, (0, BLOCK_SIZE - len(block)), "constant")
+        if len(block) < args.block_size:
+            block = np.pad(block, (0, args.block_size - len(block)), "constant")
         if compute_bands is None:
             return
 
         # Base (0..1) normalizada por pico EMA
-        base_vals = compute_bands(block[:BLOCK_SIZE])  # float 0..1
+        base_vals = compute_bands(block[:args.block_size])  # float 0..1
         base_vals255 = (base_vals * 255.0).astype(np.float32)
 
         # Equalização: ganho adaptativo por banda + tilt
+        eq_alpha = float(args.eq_alpha)
         band_ema = (1.0 - eq_alpha) * band_ema + eq_alpha * base_vals255
-        gain = EQ_TARGET / np.maximum(band_ema, 1.0)
+        gain = args.eq_target / np.maximum(band_ema, 1.0)
         eq = base_vals255 * gain * tilt_curve  # float
         eq = np.clip(eq, 0.0, 255.0).astype(np.float32)
 
         # Pós-EQ smoothing (opcional)
-        if POST_EQ_SMOOTH_ATTACK < 1.0 or POST_EQ_SMOOTH_RELEASE < 1.0:
-            alpha = np.where(eq > post_eq_prev, POST_EQ_SMOOTH_ATTACK, POST_EQ_SMOOTH_RELEASE).astype(np.float32)
+        if args.post_attack < 1.0 or args.post_release < 1.0:
+            alpha = np.where(eq > post_eq_prev, args.post_attack, args.post_release).astype(np.float32)
             eq = alpha * eq + (1.0 - alpha) * post_eq_prev
             post_eq_prev = eq
 
@@ -447,7 +437,7 @@ def main():
     sr_eff = 44100
     for dev_idx, extra, desc in cands:
         try:
-            stream, sr_eff, ch_eff, open_desc = open_with_probe(dev_idx, extra, audio_cb)
+            stream, sr_eff, ch_eff, open_desc = open_with_probe(dev_idx, extra, audio_cb, args.block_size)
             sys.stdout.write(f"\n[INFO] Capturando de: {desc} {open_desc}\n")
             break
         except Exception as e:
@@ -458,15 +448,15 @@ def main():
         sys.exit(1)
 
     # Preparar bandas com SR efetivo (vetorizado)
-    a_idx, b_idx = make_bands_indices(BLOCK_SIZE, sr_eff, NUM_BANDS, FMIN, FMAX)
-    compute_bands = make_compute_bands(sr_eff, BLOCK_SIZE, a_idx, b_idx, raw_ema, NORM_PEAK_EMA_ALPHA)
+    a_idx, b_idx = make_bands_indices(args.block_size, sr_eff, NUM_BANDS, FMIN, FMAX)
+    compute_bands = make_compute_bands(sr_eff, args.block_size, a_idx, b_idx, raw_ema_alpha, peak_ema_alpha)
 
     stream.start()
     try:
         while True:
             # Sem time-sync: nenhum TX
-            if REQUIRE_TIME_SYNC and (not _time_sync_ok):
-                print_status(" (paused)")
+            if REQUIRE_TIME_SYNC and (not ctx.time_sync_ok):
+                print_status(ctx, " (paused)")
                 time.sleep(0.05)
                 continue
 
@@ -481,8 +471,8 @@ def main():
             now = time.time()
 
             # Gate de silêncio (usando EMA de AVG e RMS)
-            is_quiet = (avg_ema < SILENCE_THRESHOLD) and (rms_ema < AMP_SILENCE_THRESHOLD)
-            resume_threshold = SILENCE_THRESHOLD * RESUME_FACTOR
+            is_quiet = (avg_ema < args.silence_bands) and (rms_ema < args.silence_rms)
+            resume_threshold = args.silence_bands * args.resume_factor
 
             dbg = ""
             if args.debug and (now - last_debug) > 0.25:
@@ -493,12 +483,11 @@ def main():
                 if is_quiet:
                     if silence_since is None:
                         silence_since = now
-                    elif (now - silence_since) >= SILENCE_DURATION:
+                    elif (now - silence_since) >= args.silence_duration:
                         # Borda de queda: envia 1 pacote zerado com transition e PAUSA
                         zero = np.zeros(NUM_BANDS, dtype=np.uint8)
-                        dyn_floor = 0
-                        send_packet(zero, 0, 1, dyn_floor, 0)
-                        print_status(" (to silence)", dbg)
+                        send_packet(zero, 0, 1, 0, 0)
+                        print_status(ctx, " (to silence)", dbg)
                         active = False
                         silence_since = None
                         resume_since = None
@@ -508,15 +497,15 @@ def main():
                     silence_since = None
             else:
                 # Inativo → verifica retomada sustentada
-                if (avg_ema > resume_threshold) or (rms_ema > AMP_SILENCE_THRESHOLD * 3.0):
+                if (avg_ema > resume_threshold) or (rms_ema > args.silence_rms * 3.0):
                     if resume_since is None:
                         resume_since = now
-                    elif (now - resume_since) >= RESUME_STABLE_TIME:
+                    elif (now - resume_since) >= args.resume_stable:
                         # Borda de subida: 1º pacote com transition=1 e retoma TX
                         mean_val = float(np.mean(bands_now))
                         dyn_floor = int(min(12, mean_val * 0.012)) if mean_val > 90 else 0
                         send_packet(bands_now, beat, 1, dyn_floor, kick_intensity)
-                        print_status(" (from silence)", dbg)
+                        print_status(ctx, " (from silence)", dbg)
                         active = True
                         resume_since = None
                         last_tick = now
@@ -527,12 +516,12 @@ def main():
 
             # Se não está ativo, não transmite nada
             if not active:
-                print_status(" (idle)", dbg)
+                print_status(ctx, " (idle)", dbg)
                 time.sleep(0.05)
                 continue
 
             # TX ativo: respeita FPS
-            if (now - last_tick) < send_interval:
+            if (now - last_tick) < ctx.min_send_interval:
                 time.sleep(0.001)
                 continue
             last_tick = now
@@ -542,12 +531,12 @@ def main():
             dyn_floor = int(min(12, mean_val * 0.012)) if mean_val > 90 else 0
 
             send_packet(bands_now, beat, 0, dyn_floor, kick_intensity)
-            print_status("", dbg)
+            print_status(ctx, "", dbg)
 
     except KeyboardInterrupt:
         pass
     finally:
-        _stop_resync.set()
+        ctx.stop_resync.set()
         try:
             stream.stop(); stream.close()
         except Exception:
