@@ -42,7 +42,7 @@ else:
     )
 
 # ---- Debug & bypass helpers ----
-BYPASS_EFFECTS = True   # mantemos ativo por enquanto para validar o caminho cores->driver
+BYPASS_EFFECTS = False   # mantemos ativo por enquanto para validar o caminho cores->driver
 DEBUG_STATS = True
 ENABLE_SMOKE_TEST = True  # roda um teste R/G/B/Branco/Preto na inicialização
 
