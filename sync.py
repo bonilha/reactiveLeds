@@ -95,15 +95,21 @@ HSV_LUT_FLAT = None  # shape: (256*256, 3) — index = h*256 + v
 
 def _build_hv_lut_flat(s_fixed: int = 255):
     """
-    Constrói uma LUT 256x256 (h,v) para RGB (uint8) com saturação fixa.
-    Resultado é achatado para (65536, 3) com index = h*256 + v.
+    Constrói LUT 256x256 (h,v) -> RGB (uint8) com saturação fixa.
+    Importante: gerar vetores 1D do MESMO tamanho (65536) para a função
+    hsv_to_rgb_bytes_vec, que espera arrays vetoriais shape-compatíveis.
     """
-    # h: (256,1), v: (1,256) — broadcasting para (256,256)
-    h = np.arange(256, dtype=np.uint8)[:, None]
-    v = np.arange(256, dtype=np.uint8)[None, :]
-    s = np.full((256, 256), int(s_fixed), dtype=np.uint8)
-    rgb = FXContext.hsv_to_rgb_bytes_vec(h, s, v)  # (256,256,3) -> uint8
-    return rgb.reshape(256 * 256, 3)
+    h_vals = np.arange(256, dtype=np.uint8)
+    v_vals = np.arange(256, dtype=np.uint8)
+    # grade (256,256)
+    hh, vv = np.meshgrid(h_vals, v_vals, indexing='ij')
+    # achata para 1D (65536,)
+    h = hh.reshape(-1)
+    v = vv.reshape(-1)
+    s = np.full_like(h, s_fixed, dtype=np.uint8)
+    # converte — retorna (65536, 3)
+    rgb_flat = FXContext.hsv_to_rgb_bytes_vec(h, s, v)
+    return rgb_flat  # já flat
 
 # Inicializa LUT uma única vez
 HSV_LUT_FLAT = _build_hv_lut_flat(255)
@@ -508,15 +514,6 @@ def main():
             unified_status_line(name, ctx, active, b.size, CFG_FPS, CFG_VIS_FPS, current_palette_name)
             continue
 
-            # Pacing quando não chega pacote novo
-            # (na prática, só chega aqui em condições raras)
-            # unified_status_line(effects[current_effect][0] if not BYPASS_EFFECTS else "Fallback HSV (LUT)",
-            #                     ctx, (now < signal_active_until), EXPECTED_BANDS, CFG_FPS, CFG_VIS_FPS, current_palette_name)
-            # next_frame += FRAME_DT
-            # sl = next_frame - time.time()
-            # if sl > 0: time.sleep(sl)
-            # else: next_frame = time.time()
-
     except KeyboardInterrupt:
         pass
     finally:
@@ -527,4 +524,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
     
