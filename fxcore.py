@@ -91,7 +91,7 @@ class FXContext:
     def _precompute_segment_starts_ends(n_bands, n_leds):
         i = np.arange(n_leds, dtype=np.int32)
         starts = (i * n_bands) // n_leds
-        ends = ((i + 1) * n_bands) // n_l eds
+        ends = ((i + 1) * n_bands) // n_leds
         ends = np.maximum(ends, starts + 1)
         return starts, ends
 
@@ -234,4 +234,3 @@ class FXContext:
             # Fallback compatível: usa lista e deixa a lib cuidar do brilho
             self.pixels[:] = arr_to_send.tolist()
             self.pixels.show()
-            
