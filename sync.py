@@ -7,7 +7,7 @@ import socket, time, board, neopixel, random, threading, sys, select, tty, termi
 import numpy as np
 from collections import deque
 from fxcore import FXContext
-from effects import build_effects  # <- agora passamos ctx ao construir
+from effects import build_effects  # build_effects(ctx)
 
 PKT_AUDIO_V2 = 0xA2  # [A2][8 ts_pc][150 bands][beat][trans][dyn_floor][kick] => 163 bytes
 PKT_AUDIO    = 0xA1  # [A1][8 ts_pc][150 bands][beat][trans]                   => 161 bytes
@@ -22,6 +22,12 @@ LED_PIN = board.D18
 ORDER = neopixel.GRB
 BRIGHTNESS = 0.7
 pixels = neopixel.NeoPixel(LED_PIN, LED_COUNT, brightness=BRIGHTNESS, auto_write=False, pixel_order=ORDER)
+
+# ---- Debug & bypass helpers ----
+# Se True, ignora o módulo de efeitos e renderiza um fallback em escala de cinza
+BYPASS_EFFECTS = False
+# Loga estatísticas simples 1x/seg
+DEBUG_STATS = True
 
 # Sockets
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -81,7 +87,7 @@ def timesync_tcp_server():
         except Exception:
             time.sleep(0.05)
 
-# Paleta (igual ao anterior)
+# Paleta
 STRATEGIES = ["complementar", "analoga", "triade", "tetrade", "split"]
 COMPLEMENT_DELTA = 0.06
 
@@ -200,7 +206,7 @@ def udp_receiver():
                 trans = data[160]
                 dyn_floor = data[161]
                 kick_intensity = data[162]
-            elif hdr == PKT_AUDIO    and n == LEN_A1:
+            elif hdr == PKT_AUDIO and n == LEN_A1:
                 ts_pc = int.from_bytes(data[1:9], 'little')
                 bands = np.frombuffer(data[9:159], dtype=np.uint8)
                 beat  = data[159]
@@ -256,6 +262,8 @@ def apply_new_colorset():
     base_saturation = random.randint(190, 230)
 
 def main():
+    # latest_packet é atualizado pela thread udp_receiver e lido/limpo aqui:
+    # precisa ser global para evitar UnboundLocalError ao reatribuir.
     global stop_flag, latency_ms_ema, latest_packet
 
     # Threads auxiliares
@@ -264,14 +272,14 @@ def main():
     threading.Thread(target=palette_worker, daemon=True).start()
     threading.Thread(target=key_listener, daemon=True).start()
 
-    # Contexto e efeitos (AGORA o ctx existe antes de build_effects)
+    # Contexto e efeitos (ctx antes; efeitos recebem ctx)
     ctx = FXContext(
         pixels, LED_COUNT,
         base_hue_offset, hue_seed, base_saturation,
         current_budget_a=18.0, ma_per_channel=20.0, idle_ma_per_led=1.0
     )
     ctx.metrics = None
-    effects = build_effects(ctx)  # <-- correção: passa o ctx requerido
+    effects = build_effects(ctx)
 
     # Estado local do main
     current_effect = 0
@@ -284,6 +292,7 @@ def main():
     SIGNAL_HOLD = 0.5
     signal_active_until = 0.0
     already_off = False
+    last_dbg = 0.0
 
     IDLE_TIMEOUT = 2.0
     last_rx_ts = time.time()
@@ -338,14 +347,20 @@ def main():
                         lat_ms = one_way_ns / 1e6
                         latency_ms_ema = lat_ms if latency_ms_ema is None else 0.85*latency_ms_ema + 0.15*lat_ms
 
+                # Estatísticas simples para debug
                 avg_raw = float(np.mean(bands_u8))
+                min_raw = int(bands_u8.min()) if bands_u8.size else 0
+                max_raw = int(bands_u8.max()) if bands_u8.size else 0
+
+                # Gating alinhado ao PC:
+                # • transition=1 com bandas zeradas => desativa
+                # • qualquer pacote "normal" => sustenta ativo por SIGNAL_HOLD
                 if transition_flag == 1 and avg_raw < 0.5:
                     signal_active_until = 0.0
                     last_bands[:] = 0
                     last_beat = 0
                 else:
-                    if avg_raw > 2.0:
-                        signal_active_until = now + SIGNAL_HOLD
+                    signal_active_until = now + SIGNAL_HOLD
                     last_bands[:] = bands_u8
                     last_beat = int(beat_flag)
 
@@ -362,14 +377,40 @@ def main():
                 active = (now < signal_active_until)
 
                 b = last_bands.copy()
-                # (Opcional) usar kick_intensity em efeitos que queiram reforço visual
 
-                # Render
-                name, func = effects[current_effect]
-                func(b if active else np.zeros_like(b), last_beat if active else 0, active)
+                # Render: efeitos ou fallback
+                try:
+                    if not BYPASS_EFFECTS:
+                        name, func = effects[current_effect]
+                        func(b if active else np.zeros_like(b), last_beat if active else 0, active)
+                    else:
+                        # Fallback simples: mapeia as 150 bandas em 300 LEDs em tons de cinza
+                        vals = ctx.segment_mean_from_cumsum(
+                            b.astype(np.float32),
+                            ctx.SEG_STARTS_FULL, ctx.SEG_ENDS_FULL
+                        ).clip(0, 255).astype(np.uint8)
+                        rgb = np.stack([vals, vals, vals], axis=-1)
+                        ctx.to_pixels_and_show(rgb)
+                        name = "Fallback Gray"
+                except Exception as e:
+                    # Em caso de erro no efeito, cai no fallback para garantir luz
+                    vals = ctx.segment_mean_from_cumsum(
+                        b.astype(np.float32),
+                        ctx.SEG_STARTS_FULL, ctx.SEG_ENDS_FULL
+                    ).clip(0, 255).astype(np.uint8)
+                    rgb = np.stack([vals, vals, vals], axis=-1)
+                    ctx.to_pixels_and_show(rgb)
+                    name = f"Fallback Gray (err:{e.__class__.__name__})"
+
                 already_off = False
 
+                # Status + debug mínimo
                 print_status(name, ctx)
+                if DEBUG_STATS and (now - last_dbg) > 1.0:
+                    sys.stdout.write(
+                        f"\n[DBG] avg:{avg_raw:5.1f} min:{min_raw:3d} max:{max_raw:3d} active:{'Y' if active else 'N'}\n"
+                    )
+                    last_dbg = now
 
                 if RENDER_ON_PACKET:
                     next_frame = time.time()
@@ -391,3 +432,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# EOF   
