@@ -196,49 +196,82 @@ def key_listener():
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
 
 # ---------- UDP Receiver + CFG (sem prints periódicos) ----------
+
 def udp_receiver():
     global latest_packet, rx_count, drop_hdr, drop_len
-    print(f"[INFO] UDP receiver ligado em 0.0.0.0:{UDP_PORT} (aceita A2-163, A1-161 e B0-10).")
+    global EXPECTED_BANDS, CFG_FPS, SIGNAL_HOLD_MS, CFG_VIS_FPS
+    print(f"[INFO] UDP receiver ligado em 0.0.0.0:{UDP_PORT} (aceita A2/A1 com bands variáveis e B0).")
     while not stop_flag:
         try:
-            data, _ = udp_sock.recvfrom(2048)
+            data, _ = udp_sock.recvfrom(4096)
             n = len(data)
-            if n < 1: 
+            if n < 1:
                 drop_len += 1
                 continue
 
             hdr = data[0]
-            if hdr == PKT_AUDIO_V2 and n == LEN_A2:
-                ts_pc = int.from_bytes(data[1:9],'little')
-                bands = np.frombuffer(data[9:159], dtype=np.uint8)
-                beat  = data[159]; trans = data[160]
-                dyn_floor = data[161]; kick_intensity = data[162]
+
+            # -------- A2: [A2][8 ts][nb bands][beat][trans][dyn][kick]  (13+nb bytes) --------
+            if hdr == PKT_AUDIO_V2 and n >= 13:
+                nb = n - 13
+                if nb <= 0:
+                    drop_len += 1
+                    continue
+                ts_pc = int.from_bytes(data[1:9], 'little')
+                bands = np.frombuffer(memoryview(data)[9:9+nb], dtype=np.uint8)
+                beat  = data[9+nb]
+                trans = data[10+nb]
+                dyn_floor = data[11+nb]
+                kick_intensity = data[12+nb]
+
+                # Se mudou a quantidade de bandas, atualiza EXPECTED_BANDS
+                if EXPECTED_BANDS != nb:
+                    EXPECTED_BANDS = int(nb)
+
                 with latest_lock:
+                    # .copy() para desacoplar do buffer de rede
                     latest_packet = (bands.copy(), beat, trans, ts_pc, dyn_floor, kick_intensity)
                 rx_count += 1
+                continue
 
-            elif hdr == PKT_AUDIO and n == LEN_A1:
-                ts_pc = int.from_bytes(data[1:9],'little')
-                bands = np.frombuffer(data[9:159], dtype=np.uint8)
-                beat  = data[159]; trans = data[160]
+            # -------- A1 (legado): [A1][8 ts][nb bands][beat][trans]  (11+nb bytes) --------
+            if hdr == PKT_AUDIO and n >= 11:
+                nb = n - 11
+                if nb <= 0:
+                    drop_len += 1
+                    continue
+                ts_pc = int.from_bytes(data[1:9], 'little')
+                bands = np.frombuffer(memoryview(data)[9:9+nb], dtype=np.uint8)
+                beat  = data[9+nb]
+                trans = data[10+nb]
+
+                if EXPECTED_BANDS != nb:
+                    EXPECTED_BANDS = int(nb)
+
                 with latest_lock:
                     latest_packet = (bands.copy(), beat, trans, ts_pc, 0, 0)
                 rx_count += 1
+                continue
 
-            elif hdr == PKT_CFG and n == LEN_CFG:
+            # -------- B0 (config): [B0][ver][nb u16][fps u16][hold u16][vis u16] (10 bytes) --------
+            if hdr == PKT_CFG and n == 10:
                 ver = data[1]
                 nb  = data[2] | (data[3] << 8)
                 fps = data[4] | (data[5] << 8)
                 hold= data[6] | (data[7] << 8)
                 vis = data[8] | (data[9] << 8)
-                if nb  > 0:  globals()['EXPECTED_BANDS'] = int(nb)
-                if fps > 0:  globals()['CFG_FPS']        = int(fps)
-                if hold>= 0: globals()['SIGNAL_HOLD_MS'] = int(hold)
-                if vis > 0:  globals()['CFG_VIS_FPS']    = int(vis)
-                # Sem prints aqui — status aparecerá na linha unificada
+                if nb  > 0: EXPECTED_BANDS = int(nb)
+                if fps > 0: CFG_FPS        = int(fps)
+                if hold>=0: SIGNAL_HOLD_MS = int(hold)
+                if vis > 0: CFG_VIS_FPS    = int(vis)
+                # sem prints aqui — a linha unificada refletirá as mudanças
+                continue
+
+            # -------- Desconhecido / tamanho inválido --------
+            if hdr in (PKT_AUDIO, PKT_AUDIO_V2, PKT_CFG):
+                drop_len += 1
             else:
-                if hdr in (PKT_AUDIO, PKT_AUDIO_V2, PKT_CFG): drop_len += 1
-                else: drop_hdr += 1
+                drop_hdr += 1
 
         except Exception:
             time.sleep(0.001)
