@@ -3,7 +3,7 @@ from .basics import (
     effect_line_spectrum,
     effect_mirror_spectrum,
     effect_rainbow_wave,
-    effect_vu_meter,
+    effect_energy_comets,
 )
 from .dynamics import (
     effect_peak_hold_columns,
@@ -32,7 +32,7 @@ def build_effects(ctx):
         ("Line Spectrum (HSV)",         _wrap(ctx, effect_line_spectrum)),
         ("Mirror Spectrum (HSV)",       _wrap(ctx, effect_mirror_spectrum)),
         ("Rainbow Wave (HSV)",          _wrap(ctx, effect_rainbow_wave)),
-        ("VU Meter (HSV)",              _wrap(ctx, effect_vu_meter)),
+        ("Energy Comets",              _wrap(ctx, effect_energy_comets)),
         ("Peak Hold Columns (HSV)",     _wrap(ctx, effect_peak_hold_columns)),
         ("Full Strip Pulse (Palette)",  _wrap(ctx, effect_full_strip_pulse)),
         ("Waterfall (Palette)",         _wrap(ctx, effect_waterfall)),
