@@ -49,11 +49,9 @@ class FXContext:
     @property
     def current_a_ema(self):
         return self._current_a_ema
-
     @property
     def power_w_ema(self):
         return self._power_w_ema
-
     @property
     def last_cap_scale(self):
         return self._last_cap_scale
@@ -85,12 +83,10 @@ class FXContext:
     def hsv_to_rgb_bytes_vec(h, s, v):
         """
         Conversão HSV vetorizada robusta.
-
         Aceita:
         - h: uint8 (0..255) OU float (0..1) -> internamente normalizado para 0..1
         - s: uint8 (0..255)
         - v: uint8 (0..255)
-
         Retorna: np.uint8[*,3] em formato RGB.
         """
         # --- Normalizar H para 0..1 com segurança ---
@@ -178,22 +174,21 @@ class FXContext:
         arr = arr.reshape(self.LED_COUNT, 3).astype(np.uint8)
 
         # Consumo de cor (antes do cap)
-        sum_rgb = float(np.sum(arr, dtype=np.uint64))
-        i_color_mA = (self.WS2812B_MA_PER_CHANNEL / 255.0) * sum_rgb
+        sum_rgb_unscaled = float(np.sum(arr, dtype=np.uint64))
+        i_color_mA_unscaled = (self.WS2812B_MA_PER_CHANNEL / 255.0) * sum_rgb_unscaled
         i_idle_mA = self.WS2812B_IDLE_MA_PER_LED * float(self.LED_COUNT)
         i_budget_mA = self.CURRENT_BUDGET_A * 1000.0
 
         # Power-cap
         scale = 1.0
-        if i_color_mA > 0.0 and (i_color_mA + i_idle_mA) > i_budget_mA:
-            scale = max(0.0, (i_budget_mA - i_idle_mA) / i_color_mA)
+        if i_color_mA_unscaled > 0.0 and (i_color_mA_unscaled + i_idle_mA) > i_budget_mA:
+            scale = max(0.0, (i_budget_mA - i_idle_mA) / i_color_mA_unscaled)
         self._last_cap_scale = float(scale)
         if scale < 0.999:
             arr = np.clip(arr.astype(np.float32) * scale, 0, 255).astype(np.uint8)
 
-        # Recalcula consumo pós-cap
-        sum_rgb = float(np.sum(arr, dtype=np.uint64))
-        i_color_mA = (self.WS2812B_MA_PER_CHANNEL / 255.0) * sum_rgb
+        # Consumo pós-cap (sem novo sum: reutiliza unscaled * scale)
+        i_color_mA = i_color_mA_unscaled * scale
         i_total_A = (i_color_mA + i_idle_mA) / 1000.0
         p_total_W = 5.0 * i_total_A
 
@@ -212,13 +207,14 @@ class FXContext:
             except Exception:
                 pass
 
-        # ----- Suporte RGBW -----
+        # ---- Suporte RGBW ----
         bpp = getattr(self.pixels, "bpp", 3)
         if bpp == 4:
             arr_to_send = self._rgb_to_rgbw(arr)
         else:
             arr_to_send = arr
 
-        # envia
+        # Envia (manter caminho compatível com a lib neopixel)
+        # Observação: o caminho seguro e compatível continua usando lista.
         self.pixels[:] = arr_to_send.tolist()
         self.pixels.show()
