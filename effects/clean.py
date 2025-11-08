@@ -154,45 +154,6 @@ def effect_centroid_comet(ctx, bands_u8, beat_flag, active):
     rgb = ctx.hsv_to_rgb_bytes_vec(hue_arr, sat, v)
     ctx.to_pixels_and_show(rgb)
 
-# ---- Beat Outward Burst ----
-_burst_left = None
-_burst_right = None
-_burst_buf = None
-def effect_beat_outward_burst(ctx, bands_u8, beat_flag, active):
-    global _burst_left, _burst_right, _burst_buf
-    if _burst_buf is None or _burst_buf.shape[0] != ctx.LED_COUNT:
-        _burst_buf = np.zeros(ctx.LED_COUNT, dtype=np.float32)
-        _burst_left = ctx.CENTER
-        _burst_right = ctx.CENTER
-    n = len(bands_u8)
-    low_n = max(8, n // 8) if n > 0 else 8
-    low_mean = float(np.mean(np.asarray(bands_u8[:low_n], dtype=np.float32))) if n > 0 else 0.0
-    if beat_flag and active:
-        amp = ctx.amplify_quad(np.array([int(low_mean)], dtype=np.uint16))[0]
-        peak = np.clip(float(amp) * 1.2, 80, 255)
-        k = 4
-        kdist = np.abs(ctx.I_ALL - ctx.CENTER)
-        kshape = np.clip((k - kdist), 0, k).astype(np.float32) / float(k)
-        _burst_buf += kshape * peak
-        _burst_left = ctx.CENTER - 1
-        _burst_right = ctx.CENTER
-    if active:
-        _burst_left = max(0, _burst_left - 2)
-        _burst_right = min(ctx.LED_COUNT - 1, _burst_right + 2)
-    tri_w = 3
-    ldist = np.abs(ctx.I_ALL - _burst_left)
-    rdist = np.abs(ctx.I_ALL - _burst_right)
-    ltri = np.clip((tri_w - ldist), 0, tri_w).astype(np.float32) / float(tri_w)
-    rtri = np.clip((tri_w - rdist), 0, tri_w).astype(np.float32) / float(tri_w)
-    decay = 0.86 if active else 0.78
-    _burst_buf = _burst_buf * decay + (ltri + rtri) * 200.0
-    v = np.clip(_burst_buf, 0, 255).astype(np.uint8)
-    v = ctx.apply_floor_vec(v, active, None)
-    hue = (ctx.base_hue_offset + (ctx.I_ALL >> 2) + (ctx.hue_seed & 0x1F)) % 256
-    sat = np.full(ctx.LED_COUNT, ctx.base_saturation, dtype=np.uint8)
-    rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
-    ctx.to_pixels_and_show(rgb)
-
 # ---- Quantized Sections ----
 _QS_SECTIONS = 10
 _QS_LEVELS = 8
