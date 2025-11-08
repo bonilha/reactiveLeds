@@ -401,7 +401,9 @@ def effect_peak_dots_expanded(ctx, bands_u8, beat_flag, active):
     rgb = np.clip(rgb, 0, 255).astype(np.uint8)
     ctx.to_pixels_and_show(rgb)
 
-# ==== CENTROID COMET EXPANDED — COMETA REATIVO COM TRAIL LONGO ====
+
+
+# ==== CENTROID COMET EXPANDED — CORRIGIDO (sem NameError) ====
 _comet_state = {
     "pos_ema": 0.0,
     "vel_ema": 0.0,
@@ -411,11 +413,9 @@ _comet_state = {
 
 def effect_centroid_comet_expanded(ctx, bands_u8, beat_flag, active):
     """
-    Cometa que segue o centroide do espectro.
-    - Posição: centro de massa das bandas
-    - Trail: gaussiano longo, expansivo
-    - Beat: pulso + expansão
-    - Power-aware
+    Cometa que segue o centroide do espectro com trail expansivo.
+    - CORRIGIDO: NameError em WS281B_IDLE_MA_PER_LED
+    - Reativo, cobre toda a fita, power-aware
     """
     global _comet_state
     import numpy as np
@@ -439,29 +439,32 @@ def effect_centroid_comet_expanded(ctx, bands_u8, beat_flag, active):
     energy = np.clip(energy, 0.0, 1.0)
 
     # --- Centroide (posição do cometa) ---
-    weights = x / max(1.0, np.sum(x) + 1e-6)
-    band_positions = np.arange(n, dtype=np.float32)
-    centroid_band = float(np.sum(weights * band_positions))
-    target_pos = (centroid_band / max(1, n - 1)) * (L - 1)
+    total = float(np.sum(x))
+    if total <= 0:
+        target_pos = float(L // 2)
+    else:
+        weights = x / total
+        band_positions = np.arange(n, dtype=np.float32)
+        centroid_band = float(np.sum(weights * band_positions))
+        target_pos = (centroid_band / max(1, n - 1)) * (L - 1)
 
-    # EMA suave para posição (evita jitter)
+    # EMA suave para posição
     st["pos_ema"] = 0.6 * st["pos_ema"] + 0.4 * target_pos
     pos = float(np.clip(st["pos_ema"], 0.0, L - 1))
 
-    # --- Velocidade (para trail dinâmico) ---
-    vel = abs(target_pos - pos) * 10.0  # px por frame
+    # --- Velocidade (para trail) ---
+    vel = abs(target_pos - pos) * 10.0
     st["vel_ema"] = 0.7 * st["vel_ema"] + 0.3 * vel
 
     # --- Beat punch ---
     beat_punch = 1.0 if beat_flag else 0.0
     if beat_punch > 0:
-        st["vel_ema"] *= 1.5  # expansão no beat
+        st["vel_ema"] *= 1.5
 
     # --- Trail gaussiano expansivo ---
     trail = st["trail_buf"]
     idxs = ctx.I_ALL.astype(np.float32)
 
-    # Sigma dinâmico: maior com energia e velocidade
     sigma_base = 8.0 + 20.0 * energy
     sigma_vel = 2.0 + 8.0 * (st["vel_ema"] / 100.0)
     sigma = sigma_base + sigma_vel
@@ -471,7 +474,6 @@ def effect_centroid_comet_expanded(ctx, bands_u8, beat_flag, active):
     dist = np.abs(idxs - pos)
     glow = np.exp(-0.5 * (dist / max(1.0, sigma))**2)
 
-    # Brilho do cometa
     comet_val = 180.0 + 75.0 * energy
     if beat_punch > 0:
         comet_val = min(255.0, comet_val * 1.6)
@@ -479,10 +481,10 @@ def effect_centroid_comet_expanded(ctx, bands_u8, beat_flag, active):
     trail[:] = glow * comet_val
     trail = np.clip(trail, 0.0, 255.0)
 
-    # --- Power cap ---
+    # --- POWER CAP CORRIGIDO ---
     sum_v = float(np.sum(trail))
     i_color_mA = (ctx.WS2812B_MA_PER_CHANNEL / 255.0) * sum_v * 3
-    i_idle_mA = ctx.WS281B_IDLE_MA_PER_LED * L
+    i_idle_mA = ctx.WS2812B_IDLE_MA_PER_LED * L  # <<< CORRIGIDO
     i_budget_mA = ctx.CURRENT_BUDGET_A * 1000.0
 
     scale = 1.0
@@ -492,10 +494,12 @@ def effect_centroid_comet_expanded(ctx, bands_u8, beat_flag, active):
     v = np.clip(trail * scale, 0, 255).astype(np.uint8)
     v = ctx.apply_floor_vec(v, active, None)
 
-    # --- Cor: varia com posição (graves = quente, agudos = frio) ---
+    # --- Cor: varia com posição ---
     hue_center = (ctx.base_hue_offset + ctx.hue_seed) % 256
-    hue = (hue_center + (dist.astype(np.int32) * 60) // int(sigma)) % 256
+    hue = (hue_center + (dist.astype(np.int32) * 60) // max(1, int(sigma))) % 256
     sat = np.full(L, max(200, ctx.base_saturation), dtype=np.uint8)
 
     rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
-    ctx.to_pixels_and_show(rgb)    
+    ctx.to_pixels_and_show(rgb)
+
+# ==== FIM DO ARQUIVO effects/clean.py ====
