@@ -566,4 +566,104 @@ def effect_beat_outward_burst(ctx, bands_u8, beat_flag, active):
 
     ctx.to_pixels_and_show(rgb)
 
+
+# ==== BASS IMPACT WAVE — REATIVO, SÓ NO BEAT, CENTRO APAGADO ====
+_impact_state = {
+    "radius": 0.0,
+    "active": False,
+    "last_t": 0.0
+}
+
+def effect_bass_impact_wave(ctx, bands_u8, beat_flag, active):
+    """
+    ONDA DE IMPACTO SÓ NO BEAT.
+    - Centro apagado entre beats
+    - Varre a fita em 0.25s
+    - Usa paleta do ambiente
+    - Reatividade 100%
+    """
+    global _impact_state
+    import numpy as np, time
+
+    st = _impact_state
+    L = ctx.LED_COUNT
+    now = time.time()
+
+    # --- Reset no beat ---
+    if beat_flag:
+        st["radius"] = 0.0
+        st["active"] = True
+        st["last_t"] = now
+
+    if not st["active"]:
+        ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.uint8))
+        return
+
+    # --- Atualiza raio ---
+    dt = min(0.05, now - st["last_t"])
+    st["last_t"] = now
+
+    # Velocidade brutal
+    speed = 1600.0
+    st["radius"] += speed * dt
+
+    # Desativa após cobrir a fita
+    if st["radius"] > L:
+        st["active"] = False
+        ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.float8))
+        return
+
+    # --- Onda: anel fino + halo ---
+    d = np.abs(ctx.I_ALL.astype(np.float32) - ctx.CENTER)
+    radius = st["radius"]
+
+    # Anel principal
+    ring_width = 30.0
+    ring = np.where(np.abs(d - radius) < ring_width, 1.0, 0.0)
+
+    # Halo suave
+    sigma = 20.0
+    halo = np.exp(-0.5 * ((d - radius) / sigma)**2) * 0.5
+
+    # Intensidade
+    intensity = (ring + halo) * 255.0
+    v_raw = np.clip(intensity, 0, 255)
+
+    # --- POWER CAP ---
+    sum_v = float(np.sum(v_raw))
+    i_color_mA = (ctx.WS2812B_MA_PER_CHANNEL / 255.0) * sum_v * 3
+    i_idle_mA = ctx.WS2812B_IDLE_MA_PER_LED * L
+    i_budget_mA = ctx.CURRENT_BUDGET_A * 1000.0
+
+    scale = 1.0
+    if i_color_mA > 0 and (i_color_mA + i_idle_mA) > i_budget_mA:
+        scale = max(0.0, (i_budget_mA - i_idle_mA) / i_color_mA)
+
+    v = np.clip(v_raw * scale, 0, 255).astype(np.uint8)
+    v = ctx.apply_floor_vec(v, active, None)
+
+    # --- CORES: PALETA + FLASH BRANCO NO CENTRO ---
+    pal = getattr(ctx, "current_palette", None)
+    if isinstance(pal, (list, tuple)) and len(pal) >= 2:
+        pal_arr = np.asarray(pal, dtype=np.uint8)
+        m = pal_arr.shape[0]
+        idx = int(radius * 0.1) % m
+        color = pal_arr[idx].astype(np.float32)
+
+        # Branco no centro, cor no anel
+        white_mask = (d < 20)
+        colored = color * (v.astype(np.float32) / 255.0)[:, None]
+        white = np.full_like(colored, 255.0)
+        rgb_float = np.where(white_mask[:, None], white, colored)
+        rgb = np.clip(rgb_float, 0, 255).astype(np.uint8)
+    else:
+        hue = (ctx.base_hue_offset + int(radius * 0.5)) % 256
+        sat = np.full(L, 255, dtype=np.uint8)
+        rgb = ctx.hsv_to_rgb_bytes_vec(
+            np.full(L, hue, dtype=np.uint8),
+            sat, v
+        )
+
+    ctx.to_pixels_and_show(rgb)
+
 # ==== FIM DO ARQUIVO effects/clean.py ====

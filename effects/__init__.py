@@ -21,7 +21,7 @@ from .clean import (
     effect_quantized_sections,
     effect_bass_pulse_core,
     effect_peak_dots_expanded,
-    effect_beat_outward_burst,
+    effect_bass_impact_wave,
 )
 from .fire import (
     effect_clean_fire_edge_v3,
@@ -47,7 +47,7 @@ def build_effects(ctx):
         ("Bass Pulse Core (NEW)", _wrap(ctx, effect_bass_pulse_core)),
         ("Peak Dots",          _wrap(ctx, effect_peak_dots_expanded,)),
         ("Centroid Comet (Clean)",      _wrap(ctx, effect_centroid_comet_expanded)),
-        ("Beat Outward Burst",          _wrap(ctx, effect_beat_outward_burst)),
+        ("Beat Impact Wave",          _wrap(ctx, effect_bass_impact_wave)),
         ("Quantized Sections",          _wrap(ctx, effect_quantized_sections)),
         ("Clean Fire – Edge Forge v3",  _wrap(ctx, effect_clean_fire_edge_v3)),
         ("Clean Fire – Center Vent v3", _wrap(ctx, effect_clean_fire_center_v3)),
