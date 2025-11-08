@@ -472,57 +472,66 @@ _burst_state = {
     "wave_buf": None
 }
 
+# ==== BEAT OUTWARD BURST — BRUTAL, RÁPIDO, EXPLOSIVO ====
+_burst_state = {
+    "radius": 0.0,
+    "last_beat": 0.0,
+    "flash": 0.0
+}
+
 def effect_beat_outward_burst(ctx, bands_u8, beat_flag, active):
     """
-    Explosão radial no beat com ondas suaves e paleta dinâmica.
-    - Usa ctx.current_palette se existir
-    - Reativo ao grave (velocidade, brilho)
-    - Power-aware
+    EXPLOSÃO NUCLEAR NO BEAT.
+    - Onda de choque varre a fita em <0.3s
+    - Cores da paleta + flash branco
+    - Brilho máximo, power-aware
     """
     global _burst_state
     import numpy as np, time
 
     st = _burst_state
     L = ctx.LED_COUNT
-    if st["wave_buf"] is None or st["wave_buf"].shape[0] != L:
-        st["wave_buf"] = np.zeros(L, dtype=np.float32)
+    now = time.time()
 
     # --- Energia dos graves ---
     n = len(bands_u8)
     low_n = max(8, n // 8)
-    low = np.asarray(bands_u8[:low_n], dtype=np.float32)
-    low_mean = float(np.mean(low))
+    low_mean = float(np.mean(np.asarray(bands_u8[:low_n], dtype=np.float32))) / 255.0
 
-    st["energy_ema"] = 0.7 * st["energy_ema"] + 0.3 * low_mean
-    energy01 = np.clip(st["energy_ema"] / 255.0, 0.0, 1.0)
-
-    # --- Velocidade da onda (EMA) ---
-    target_speed = 60.0 + 180.0 * energy01
-    st["speed_ema"] = 0.8 * st["speed_ema"] + 0.2 * target_speed
-
-    # --- Beat trigger ---
+    # --- BEAT TRIGGER ---
     if beat_flag:
-        st["phase"] = 0.0  # reinicia onda
-        st["speed_ema"] *= 1.4  # boost no beat
+        st["radius"] = 0.0
+        st["flash"] = 1.0
+        st["last_beat"] = now
 
-    # --- Atualiza fase ---
-    dt = min(0.05, time.time() - getattr(st, "last_t", time.time()))
-    st["last_t"] = time.time()
-    st["phase"] += st["speed_ema"] * dt
-    if st["phase"] > L * 1.5:
-        st["phase"] = L * 1.5  # mantém brilho residual
+    # --- Flash decay (curto) ---
+    if st["flash"] > 0:
+        st["flash"] *= 0.7
+        if st["flash"] < 0.01:
+            st["flash"] = 0.0
 
-    # --- Onda gaussiana expansiva ---
+    # --- Velocidade explosiva ---
+    speed = 800.0 + 600.0 * low_mean  # 800 a 1400 px/s
+    dt = min(0.05, now - getattr(st, "last_t", now))
+    st["last_t"] = now
+    st["radius"] += speed * dt
+
+    # --- Onda: quadrada + gaussiana ---
     d = np.abs(ctx.I_ALL.astype(np.float32) - ctx.CENTER)
-    radius = st["phase"]
-    sigma = max(8.0, radius * 0.25)
-    intensity = np.exp(-0.5 * ((d - radius) / max(1.0, sigma))**2)
-    intensity *= (180.0 + 75.0 * energy01)
-    if beat_flag:
-        intensity *= 1.5
+    radius = st["radius"]
 
-    v_raw = intensity
-    v_raw = np.clip(v_raw, 0.0, 255.0)
+    # Onda principal (quadrada)
+    ring = np.where(np.abs(d - radius) < (20 + 40 * low_mean), 1.0, 0.0)
+
+    # Halo gaussiano
+    sigma = 15 + 30 * low_mean
+    halo = np.exp(-0.5 * ((d - radius) / max(1.0, sigma))**2)
+
+    # Intensidade
+    intensity = (ring * 1.0 + halo * 0.6) * (200 + 55 * low_mean)
+    intensity *= (1.0 + st["flash"] * 2.0)  # FLASH BRANCO NO BEAT
+
+    v_raw = np.clip(intensity, 0, 255)
 
     # --- POWER CAP ---
     sum_v = float(np.sum(v_raw))
@@ -537,29 +546,23 @@ def effect_beat_outward_burst(ctx, bands_u8, beat_flag, active):
     v = np.clip(v_raw * scale, 0, 255).astype(np.uint8)
     v = ctx.apply_floor_vec(v, active, None)
 
-    # --- PALETA DINÂMICA ---
+    # --- CORES: PALETA + FLASH BRANCO ---
     pal = getattr(ctx, "current_palette", None)
     if isinstance(pal, (list, tuple)) and len(pal) >= 2:
         pal_arr = np.asarray(pal, dtype=np.uint8)
         m = pal_arr.shape[0]
-        t = time.time()
-        phase = (t * 0.3 + radius * 0.001) % m
-        idx0 = int(phase) % m
-        idx1 = (idx0 + 1) % m
-        frac = phase - int(phase)
-        c0 = pal_arr[idx0].astype(np.float32)
-        c1 = pal_arr[idx1].astype(np.float32)
-        base_rgb = c0 * (1.0 - frac) + c1 * frac
+        idx = int((radius * 0.05) % m)
+        base_rgb = pal_arr[idx % m].astype(np.float32)
         colored = base_rgb * (v.astype(np.float32) / 255.0)[:, None]
-        gray = v.astype(np.float32)[:, None]
-        s = ctx.base_saturation / 255.0
-        rgb_out = gray * (1.0 - s) + colored * s
-        rgb = np.clip(rgb_out, 0, 255).astype(np.uint8)
+        white = v.astype(np.float32)[:, None]
+        rgb = np.clip(colored + white * st["flash"], 0, 255).astype(np.uint8)
     else:
-        # Fallback HSV
-        hue = (ctx.base_hue_offset + (d.astype(np.int32) * 80) // L + int(radius)) % 256
-        sat = np.full(L, max(190, ctx.base_saturation), dtype=np.uint8)
-        rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
+        hue = (ctx.base_hue_offset + int(radius * 0.5)) % 256
+        sat = np.full(L, 255, dtype=np.uint8)
+        rgb = ctx.hsv_to_rgb_bytes_vec(
+            np.full(L, hue, dtype=np.uint8),
+            sat, v
+        )
 
     ctx.to_pixels_and_show(rgb)
 
