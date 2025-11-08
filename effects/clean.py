@@ -216,3 +216,83 @@ def effect_quantized_sections(ctx, bands_u8, beat_flag, active):
     sat = np.full(ctx.LED_COUNT, max(80, ctx.base_saturation - 20), dtype=np.uint8)
     rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v.astype(np.uint8))
     ctx.to_pixels_and_show(rgb)
+
+# ==== BASS PULSE CORE — NOVO EFEITO REATIVO ====
+_pulse_env = 0.0
+_pulse_trans = 0.0
+_ripple_buf = None
+_beat_punch = 0.0
+
+def effect_bass_pulse_core(ctx, bands_u8, beat_flag, active):
+    """
+    Núcleo pulsante + ondas radiais.
+    - Centro: reatividade imediata ao grave
+    - Ondas: expansão suave até as pontas
+    - Power-aware, sem saturação
+    """
+    global _pulse_env, _pulse_trans, _ripple_buf, _beat_punch
+    import numpy as np
+
+    L = ctx.LED_COUNT
+    if _ripple_buf is None or _ripple_buf.shape[0] != L:
+        _ripple_buf = np.zeros(L, dtype=np.float32)
+
+    # === 1. ENERGIA DOS GRAVES (rápida) ===
+    n = len(bands_u8)
+    low_n = max(8, n // 8)
+    low = np.asarray(bands_u8[:low_n], dtype=np.float32)
+    low_mean = float(np.mean(low))
+
+    # EMA rápida + transiente
+    _pulse_env = 0.55 * _pulse_env + 0.45 * low_mean
+    _pulse_trans = max(0.0, low_mean - _pulse_env) * 1.4  # ataque forte
+
+    # Beat punch (curto)
+    _beat_punch = 1.0 if beat_flag else _beat_punch * 0.75
+
+    # === 2. VALOR DO CENTRO (máximo reativo) ===
+    center_val = _pulse_env * 0.8 + _pulse_trans * 1.2 + _beat_punch * 180
+    center_val = np.clip(center_val, 0.0, 255.0)
+
+    # === 3. ONDAS RADIAIS (3 camadas) ===
+    d = np.abs(ctx.I_ALL.astype(np.float32) - ctx.CENTER)
+
+    # Core: triângulo largo, escala com center_val
+    core_w = ctx.CENTER * 0.4 * (1.0 + 0.6 * (center_val / 255.0))
+    core = np.clip(1.0 - d / max(1.0, core_w), 0.0, 1.0) * center_val
+
+    # Halo: gaussiano, expande com energia
+    sigma = max(8.0, ctx.CENTER * 0.35 * (center_val / 255.0))
+    halo = np.exp(-0.5 * (d / max(1.0, sigma))**2) * (center_val * 0.7)
+
+    # Ripple: onda em movimento (decay lento)
+    speed = 1.8 + 3.0 * (center_val / 255.0)
+    phase = ctx.I_ALL * 0.05
+    ripple = np.sin(phase - (center_val / 50.0)) * 30.0
+    ripple = np.clip(ripple, 0.0, 80.0) * (center_val / 255.0)
+
+    # === 4. COMPOSIÇÃO BRUTA ===
+    v_raw = core + halo + ripple
+    v_raw = np.clip(v_raw, 0.0, 255.0)
+
+    # === 5. POWER CAP INTERNO (respeita orçamento) ===
+    sum_v = float(np.sum(v_raw))
+    i_color_mA = (ctx.WS2812B_MA_PER_CHANNEL / 255.0) * sum_v * 3
+    i_idle_mA = ctx.WS2812B_IDLE_MA_PER_LED * L
+    i_budget_mA = ctx.CURRENT_BUDGET_A * 1000.0
+
+    scale = 1.0
+    if i_color_mA > 0 and (i_color_mA + i_idle_mA) > i_budget_mA:
+        scale = max(0.0, (i_budget_mA - i_idle_mA) / i_color_mA)
+
+    v = np.clip(v_raw * scale, 0, 255).astype(np.uint8)
+    v = ctx.apply_floor_vec(v, active, None)
+
+    # === 6. CORES DINÂMICAS ===
+    hue_center = (ctx.base_hue_offset + ctx.hue_seed) % 256
+    hue_outer = (hue_center + 80) % 256
+    hue = (hue_center + (d.astype(np.int32) * 80) // ctx.CENTER) % 256
+    sat = np.full(L, max(190, ctx.base_saturation), dtype=np.uint8)
+
+    rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
+    ctx.to_pixels_and_show(rgb)
