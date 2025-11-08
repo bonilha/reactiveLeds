@@ -71,45 +71,49 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
         led_pos = np.arange(ctx.LED_COUNT, dtype=np.float32)
         v_row = np.interp(led_pos, band_pos, arr)
 
-    # Boost beat e amplificação
+    # BOOST AGRESSIVO para reatividade forte
+    # Amplificação base muito maior
+    v_row = v_row * 2.0  # Dobra ganho base
+    
+    # Beat flag com boost massivo (samba tem muitos beats!)
     if beat_flag:
-        v_row *= 1.3
-    v_row = np.clip(v_row * 1.2, 0, 255).astype(np.uint16)
+        v_row *= 1.8  # Era 1.3, agora 1.8
+    
+    # Clip antes do quad para evitar saturação
+    v_row = np.clip(v_row, 0, 255).astype(np.uint16)
+    
+    # Amplify quad para resposta não-linear (graves explodem)
     v_row = ctx.amplify_quad(v_row)
+    
+    # BOOST ADICIONAL pós-quad para frequências baixas (graves do samba)
+    low_boost = np.linspace(1.4, 1.0, ctx.LED_COUNT)  # 40% boost na esquerda (graves)
+    v_row = np.clip(v_row.astype(np.float32) * low_boost, 0, 255).astype(np.uint16)
 
-    # Hue por posição: baixa freq (esquerda) = vermelho, alta freq (direita) = azul
-    hue_base = (np.arange(ctx.LED_COUNT, dtype=np.float32) / ctx.LED_COUNT) * 180
+    # Hue por posição: baixa freq (esquerda) = vermelho/laranja, alta freq (direita) = azul/ciano
+    hue_base = (np.arange(ctx.LED_COUNT, dtype=np.float32) / ctx.LED_COUNT) * 200  # Mais range
     hue_row = (ctx.base_hue_offset + hue_base.astype(np.int32) + (ctx.hue_seed >> 2)) % 256
+    
+    # Beat shift no hue para pulsar cores
+    if beat_flag:
+        hue_row = (hue_row + 20) % 256
+    
     hue_row = hue_row.astype(np.uint8)
 
-    # Saturação alta para cores vibrantes
-    sat_row = np.full(ctx.LED_COUNT, 220 if active else 160, dtype=np.uint8)
+    # Saturação MÁXIMA para cores vibrantes e marcadas
+    sat_row = np.full(ctx.LED_COUNT, 245 if active else 180, dtype=np.uint8)
 
     # Converte para RGB
     new_row = ctx.hsv_to_rgb_bytes_vec(hue_row, sat_row, v_row.astype(np.uint8))
 
-    # Shift down: move tudo uma linha para baixo, nova linha no topo
-    _water[1:] = _water[:-1]  # Move tudo para baixo
-    _water[0] = new_row[0]    # Coloca nova linha no topo (apenas primeiro LED como demo)
+    # Decay RÁPIDO para resposta instantânea (não acumula demais)
+    _water = (_water.astype(np.float32) * 0.75).astype(np.uint8)  # Era 0.96, agora 0.75 = decay MUITO mais rápido
     
-    # OU para waterfall completo, use toda a nova linha no topo:
-    # _water[1:] = _water[:-1]
-    # _water[0] = new_row  # Mas isso precisa de _water como (LED_COUNT,LED_COUNT,3) para histórico completo
-    
-    # Para efeito waterfall real, na verdade precisamos trocar a abordagem:
-    # Cada LED mostra uma posição temporal diferente
-    # Vou corrigir completamente:
-    
-    # Decay para criar rastro
-    _water = (_water.astype(np.float32) * (0.96 if active else 0.85)).astype(np.uint8)
-    
-    # Adiciona nova linha (blending aditivo para efeito cascata)
-    _water = np.maximum(_water, new_row)
+    # Adiciona nova linha com ADIÇÃO (não maximum) para picos explosivos
+    _water = np.clip(_water.astype(np.uint16) + new_row.astype(np.uint16), 0, 255).astype(np.uint8)
 
     # Aplica floor e renderiza
-    _water_capped = ctx.apply_floor_vec(_water.astype(np.uint16), active, None).astype(np.uint8)
-    ctx.to_pixels_and_show(_water_capped)
-
+    _water_out = ctx.apply_floor_vec(_water.astype(np.uint16), active, None).astype(np.uint8)
+    ctx.to_pixels_and_show(_water_out)
 
 # Bass Ripple Pulse v2 (anel gaussiano)
 class _Ripple:
