@@ -33,18 +33,73 @@ def effect_peak_hold_columns(ctx, bands_u8, beat_flag, active):
 
 
 def effect_full_strip_pulse(ctx, bands_u8, beat_flag, active):
-    # Soma grave simples
+    """
+    Full Strip Pulse — colorido
+    - Se ctx.current_palette existir: usa a paleta (interpolação ao longo da fita + animação no tempo).
+    - Senão: fallback para HSV com sweep de hue (temporal + espacial).
+    Mantém a lógica de V (pulse de graves) do efeito original.
+    """
+    import numpy as np, time
+
+    # ---- 1) Nível de pulse pelo grave (igual ao original) ----
     n = len(bands_u8)
-    limit = min(8, n)
-    raw = int(np.sum(np.asarray(bands_u8[:limit], dtype=np.uint32)) // max(1, limit))
+    limit = min(8, n) if n > 0 else 1
+    raw = int(np.sum(np.asarray(bands_u8[:limit], dtype=np.uint32)) // max(1, limit)) if n > 0 else 0
     lvl = ctx.amplify_quad(np.array([raw], dtype=np.uint16))[0]
     if beat_flag:
-        lvl = int(lvl * 1.4)
+        lvl = int(min(255, lvl * 1.35))  # leve boost no beat
+
     v = np.full(ctx.LED_COUNT, min(255, lvl), dtype=np.uint8)
-    v = ctx.apply_floor_vec(v, active, None)
-    hue = (ctx.base_hue_offset + (ctx.I_ALL >> 4) + (ctx.hue_seed >> 2)) % 256
+    v = ctx.apply_floor_vec(v, active, None)  # aplica piso dinâmico
+
+    # ---- 2) Caminho A: usar paleta (se houver) ----
+    pal = getattr(ctx, "current_palette", None)
+    if isinstance(pal, (list, tuple)) and len(pal) >= 2:
+        pal_arr = np.asarray(pal, dtype=np.uint8)
+        m = pal_arr.shape[0]
+
+        # anima a paleta ao longo do strip (movimento suave no tempo)
+        t = time.time()
+        base_phase = (t * 0.10) * m               # ~0.10 ciclos/seg
+        if beat_flag:
+            base_phase += 0.35 * m               # pequeno salto no beat
+
+        pos = ((ctx.I_ALL.astype(np.float32) / max(1.0, float(ctx.LED_COUNT))) * m + base_phase) % m
+        idx0 = np.floor(pos).astype(np.int32)
+        idx1 = (idx0 + 1) % m
+        frac = (pos - np.floor(pos)).astype(np.float32)[:, None]
+
+        c0 = pal_arr[idx0].astype(np.float32)
+        c1 = pal_arr[idx1].astype(np.float32)
+        base_rgb = c0 * (1.0 - frac) + c1 * frac   # 0..255 float32
+
+        # escala pelo pulse (V) e mistura com "cinza" conforme saturação
+        sat_base = int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255))
+        s = sat_base / 255.0
+        v_fac = (v.astype(np.float32) / 255.0)[:, None]
+
+        # cor "pura" pela paleta escalada por V
+        colored = base_rgb * v_fac
+        # cinza correspondente ao V (mesmo V em RGB)
+        gray = (v.astype(np.float32))[:, None]
+        # mistura para respeitar saturação base
+        out = gray * (1.0 - s) + colored * s
+
+        rgb = np.clip(out, 0, 255).astype(np.uint8)
+        ctx.to_pixels_and_show(rgb)
+        return
+
+    # ---- 3) Caminho B (fallback): HSV com sweep de hue ----
+    # Sweep temporal + gradiente espacial para evitar "monocromia"
+    t = time.time()
+    h_time = int((t * 40.0) % 256)  # velocidade do sweep de hue
+    h_spatial = ((ctx.I_ALL.astype(np.int32) * 256) // max(1, ctx.LED_COUNT))  # 0..255 ao longo do strip
+    hue = (ctx.base_hue_offset + (ctx.hue_seed >> 2) + h_time + h_spatial) % 256
+    if beat_flag:
+        hue = (hue + 16) % 256
+
     sat = np.full(ctx.LED_COUNT, ctx.base_saturation, dtype=np.uint8)
-    rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
+    rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v.astype(np.uint8))
     ctx.to_pixels_and_show(rgb)
 
 
@@ -156,7 +211,7 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
     # ===== 4) Floor dinâmico + render =====
     _water_out = ctx.apply_floor_vec(_water.astype(np.uint16), active, None).astype(np.uint8)
     ctx.to_pixels_and_show(_water_out)
-    
+
 # Bass Ripple Pulse v2 (anel gaussiano)
 class _Ripple:
     __slots__ = ("r", "v", "spd", "thick", "hue_shift")
