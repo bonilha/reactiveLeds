@@ -20,50 +20,55 @@ def effect_spectral_blade(ctx, bands_u8, beat_flag, active):
 _bass_radius_ema = 0.0
 _beat_flash = 0.0
 
+# -- Bass Center Bloom (corrigido) --
+_bass_radius_ema = 0.0
+_beat_flash = 0.0
+
 def effect_bass_center_bloom(ctx, bands_u8, beat_flag, active):
-    import numpy as np
     global _bass_radius_ema, _beat_flash
 
+    # flash curto no beat
     if beat_flag:
         _beat_flash = 1.0
     else:
         _beat_flash *= 0.85
 
-    # --- guarda contra n == 0 ---
     n = len(bands_u8)
     if n == 0:
-        # apenas apaga suavemente o buffer (mantendo a estética)
-        dist = np.abs(ctx.I_ALL - ctx.CENTER)
-        core = np.clip((0 - dist * 3), 0, 255).astype(np.uint16)
-        v = ctx.amplify_quad(core)
-        v = ctx.apply_floor_vec(v, active, None)
-        hue = (ctx.base_hue_offset + (v >> 3) + (ctx.hue_seed >> 2)) % 256
-        sat = np.full(ctx.LED_COUNT, max(64, ctx.base_saturation - 40), dtype=np.uint8)
-        rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v.astype(np.uint8))
+        # Sem dados: apenas fade leve (mantém visual estável e evita exceções)
+        rgb = np.zeros((ctx.LED_COUNT, 3), dtype=np.uint8)
         ctx.to_pixels_and_show(rgb)
         return
 
-    # ... (resto da função original daqui pra frente, inalterado) ...
-    global _bass_radius_ema, _beat_flash
-    if beat_flag: _beat_flash = 1.0
-    else: _beat_flash *= 0.85
-
-    n = len(bands_u8)
+    # energia de graves -> raio alvo (0 .. ~CENTER)
     low_n = max(8, n // 8)
     low_mean = float(np.mean(np.asarray(bands_u8[:low_n], dtype=np.float32)))
     target_radius = int((low_mean / 255.0) * (ctx.CENTER * 0.9))
-    _bass_radius_ema = 0.8 * _bass_radius_ema + 0.2 * target_radius
+
+    # suavização do raio para não "pular"
+    _bass_radius_ema = 0.80 * _bass_radius_ema + 0.20 * target_radius
     radius = max(0, min(int(_bass_radius_ema), ctx.CENTER))
 
+    # perfil radial (maior no centro, decaindo para as bordas)
     dist = np.abs(ctx.I_ALL - ctx.CENTER)
     core = np.clip((radius * 2 - dist * 3), 0, 255).astype(np.uint16)
+
+    # curva de brilho + piso dinâmico
     v = ctx.amplify_quad(core)
     v = ctx.apply_floor_vec(v, active, None)
+    v = np.clip(v.astype(np.float32) * (1.0 + 0.35 * _beat_flash), 0, 255).astype(np.uint8)
+
+    # cor: varia levemente com v e com as seeds
     hue = (ctx.base_hue_offset + (v >> 3) + (ctx.hue_seed >> 2)) % 256
     sat = np.full(ctx.LED_COUNT, max(64, ctx.base_saturation - 40), dtype=np.uint8)
-    v = np.clip(v.astype(np.float32) * (1.0 + 0.35 * _beat_flash), 0, 255).astype(np.uint8)
+
     rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
     ctx.to_pixels_and_show(rgb)
+
+# Alias para compatibilidade com registradores que esperam "effect_bass_center"
+def effect_bass_center(ctx, bands_u8, beat_flag, active):
+    return effect_bass_center_bloom(ctx, bands_u8, beat_flag, active)
+
 
 # ---- Peak Dots ----
 _peak_levels = None
