@@ -26,95 +26,66 @@ def effect_spectral_blade(ctx, bands_u8, beat_flag, active):
     rgb[ctx.CENTER + ctx.I_LEFT] = left_rgb
     ctx.to_pixels_and_show(rgb)
 
-# -- Bass Center Bloom (POWER-AWARE + ULTRA REATIVO) --
+# ---- Bass Center Bloom (SIMPLE, REATIVO, POWER-AWARE) ----
 _bass_radius_ema = 0.0
 _beat_flash = 0.0
-_env_ema = 0.0
 
 def effect_bass_center_bloom(ctx, bands_u8, beat_flag, active):
     """
-    Bloom central REATIVO com RESPEITO TOTAL ao power budget.
-    - Usa o mesmo modelo de corrente do FXContext
-    - Cap aplicado ANTES da composição → evita saturação
-    - Mantém punch, center, bloom expansivo
+    Centro forte + expansão radial + reatividade imediata.
+    - Baseado na versão antiga (funcional)
+    - Com power cap interno
+    - Bloom cobre 2/3+ da fita
     """
-    import numpy as np
+    global _bass_radius_ema, _beat_flash
 
-    global _bass_radius_ema, _beat_flash, _env_ema
+    # ----- Beat Flash (curto e forte) -----
+    _beat_flash = 1.0 if beat_flag else _beat_flash * 0.82
 
-    # ----- GUARDAS -----
+    # ----- Energia dos graves -----
     n = len(bands_u8)
-    L = ctx.LED_COUNT
-    if n == 0 or L <= 0:
-        ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.uint8))
-        return
-
-    # ----- ENERGIA (EMA rápida + transiente forte) -----
     low_n = max(8, n // 8)
-    low = np.asarray(bands_u8[:low_n], dtype=np.float32)
-    low_mean = float(np.mean(low))
-    
-    _env_ema = 0.6 * _env_ema + 0.4 * low_mean
-    env01 = np.clip(_env_ema / 255.0, 0.0, 1.0)
-    trans = np.clip((low_mean - _env_ema) / 255.0, 0.0, 1.0) * 1.3
+    low_mean = float(np.mean(np.asarray(bands_u8[:low_n], dtype=np.float32)))
 
-    # Beat flash (curto e forte)
-    _beat_flash = 1.0 if beat_flag else _beat_flash * 0.78
+    # ----- Raio dinâmico (rápido, cobre até 90% do centro) -----
+    target_radius = (low_mean / 255.0) * (ctx.CENTER * 0.95)
+    _bass_radius_ema = 0.7 * _bass_radius_ema + 0.3 * target_radius
+    radius = max(1.0, _bass_radius_ema)
 
-    # ----- RAIO (rápido e expansivo) -----
-    target_radius = (low_mean / 255.0) * (ctx.CENTER * 1.15)
-    _bass_radius_ema = 0.68 * _bass_radius_ema + 0.32 * target_radius
-    radius = np.clip(_bass_radius_ema, 0.0, ctx.CENTER)
+    # ----- Perfil radial: triângulo largo + suavização -----
+    dist = np.abs(ctx.I_ALL.astype(np.float32) - ctx.CENTER)
+    # Triângulo largo: cai lentamente até o raio
+    core = np.clip((radius * 2.2 - dist * 1.8), 0.0, 255.0)  # Ajuste: mais largo, mais suave
+    # Adiciona halo gaussiano leve para glow
+    sigma = radius * 0.6
+    halo = np.exp(-0.5 * (dist / max(1.0, sigma))**2) * 80.0
 
-    # ----- PERFIS ESPACIAIS -----
-    d = np.abs(ctx.I_ALL.astype(np.float32) - ctx.CENTER)
-
-    # Core forte (triângulo largo)
-    body = np.clip(1.0 - d / max(1.0, radius * 1.25), 0.0, 1.0)
-
-    # Halo largo (gaussiano)
-    sigma = max(6.0, radius * 0.5)
-    halo = np.exp(-0.5 * (d / max(1e-3, sigma))**2)
-
-    # Bed suave (cosseno)
-    cos_val = np.cos(np.clip((d / ctx.CENTER) * (np.pi * 0.5), 0.0, np.pi * 0.5))
-    wide = np.maximum(cos_val, 0.0) ** 1.0
-
-    # ----- GANHO BASE (sem cap ainda) -----
-    amp = 75 + 230 * env01 + 260 * trans
-    if beat_flag:
-        amp *= 1.35
-    amp = np.clip(amp, 0.0, 255.0)
-
-    # Composição bruta
-    v_raw = amp * (0.7 * body + 0.3 * halo) + (15 + 75 * env01) * wide + (8 + 20 * env01) + _beat_flash * 180
-    v_raw = np.clip(v_raw, 0, 255)
+    v_raw = core + halo
+    v_raw *= (1.0 + 0.45 * _beat_flash)  # Boost forte no beat
 
     # =========================================================
-    # APLICAR POWER CAP ANTES DO RGB → RESPEITA ORÇAMENTO
+    # POWER CAP INTERNO (respeita orçamento ANTES do RGB)
     # =========================================================
-    # Estimar corrente com v_raw (todos canais iguais = pior caso)
     sum_v = float(np.sum(v_raw))
-    i_color_mA = (ctx.WS2812B_MA_PER_CHANNEL / 255.0) * sum_v * 3  # 3 canais
-    i_idle_mA = ctx.WS2812B_IDLE_MA_PER_LED * L
+    i_color_mA = (ctx.WS2812B_MA_PER_CHANNEL / 255.0) * sum_v * 3
+    i_idle_mA = ctx.WS2812B_IDLE_MA_PER_LED * ctx.LED_COUNT
     i_budget_mA = ctx.CURRENT_BUDGET_A * 1000.0
 
     scale = 1.0
     if i_color_mA > 0 and (i_color_mA + i_idle_mA) > i_budget_mA:
-        scale = max(0.0, (i_budget_mA - i_idle_mA) / i_color_mA)
+        scale = (i_budget_mA - i_idle_mA) / i_color_mA
+        scale = max(0.0, scale)
 
-    v = np.clip(v_raw.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+    v = np.clip(v_raw * scale, 0, 255).astype(np.uint8)
     v = ctx.apply_floor_vec(v, active, None)
 
-    # ----- CORES (HSV com variação suave) -----
-    hue = (ctx.base_hue_offset + (d.astype(np.int32) >> 1) + (ctx.hue_seed >> 2)) % 256
-    sat = np.full(L, max(180, ctx.base_saturation), dtype=np.uint8)
-    rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
+    # ----- Cores: Hue varia com distância (graves = quente, bordas = frio) -----
+    hue = (ctx.base_hue_offset + (dist.astype(np.int32) >> 2) + (ctx.hue_seed >> 2)) % 256
+    sat = np.full(ctx.LED_COUNT, max(170, ctx.base_saturation), dtype=np.uint8)
 
-    # ----- ENVIO COM CAP JÁ RESPEITADO -----
+    rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
     ctx.to_pixels_and_show(rgb)
 
-    
 # Alias para compatibilidade
 def effect_bass_center(ctx, bands_u8, beat_flag, active):
     return effect_bass_center_bloom(ctx, bands_u8, beat_flag, active)
