@@ -66,49 +66,44 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
     if n < 2:
         v_row = np.full(ctx.LED_COUNT, arr[0] if n else 0, dtype=np.float32)
     else:
-        # Posições das bandas (logspace para mais resolução em low freq)
         band_pos = np.linspace(0, ctx.LED_COUNT - 1, n)
         led_pos = np.arange(ctx.LED_COUNT, dtype=np.float32)
         v_row = np.interp(led_pos, band_pos, arr)
 
     # BOOST AGRESSIVO para reatividade forte
-    # Amplificação base muito maior
-    v_row = v_row * 2.0  # Dobra ganho base
+    v_row = v_row * 2.0
     
-    # Beat flag com boost massivo (samba tem muitos beats!)
     if beat_flag:
-        v_row *= 1.8  # Era 1.3, agora 1.8
+        v_row *= 1.8
     
-    # Clip antes do quad para evitar saturação
     v_row = np.clip(v_row, 0, 255).astype(np.uint16)
-    
-    # Amplify quad para resposta não-linear (graves explodem)
     v_row = ctx.amplify_quad(v_row)
     
-    # BOOST ADICIONAL pós-quad para frequências baixas (graves do samba)
-    low_boost = np.linspace(1.4, 1.0, ctx.LED_COUNT)  # 40% boost na esquerda (graves)
+    # BOOST ADICIONAL pós-quad para frequências baixas
+    low_boost = np.linspace(1.4, 1.0, ctx.LED_COUNT)
     v_row = np.clip(v_row.astype(np.float32) * low_boost, 0, 255).astype(np.uint16)
 
-    # Hue por posição: baixa freq (esquerda) = vermelho/laranja, alta freq (direita) = azul/ciano
-    hue_base = (np.arange(ctx.LED_COUNT, dtype=np.float32) / ctx.LED_COUNT) * 200  # Mais range
-    hue_row = (ctx.base_hue_offset + hue_base.astype(np.int32) + (ctx.hue_seed >> 2)) % 256
+    # HUE RESPEITANDO A PALETA: usa base_hue_offset como cor principal
+    # Variação suave por posição (spread de ±30 graus ao redor da cor base)
+    led_offset = (np.arange(ctx.LED_COUNT, dtype=np.float32) / ctx.LED_COUNT) * 60 - 30  # -30 a +30
+    hue_row = (ctx.base_hue_offset + led_offset.astype(np.int32) + (ctx.hue_seed >> 3)) % 256
     
-    # Beat shift no hue para pulsar cores
+    # Beat shift no hue para pulsar
     if beat_flag:
-        hue_row = (hue_row + 20) % 256
+        hue_row = (hue_row + 15) % 256
     
     hue_row = hue_row.astype(np.uint8)
 
-    # Saturação MÁXIMA para cores vibrantes e marcadas
-    sat_row = np.full(ctx.LED_COUNT, 245 if active else 180, dtype=np.uint8)
+    # Saturação da paleta (ctx.base_saturation muda com a paleta)
+    sat_row = np.clip(ctx.base_saturation + 20, 0, 255).astype(np.uint8)  # +20 para vibrância
 
     # Converte para RGB
     new_row = ctx.hsv_to_rgb_bytes_vec(hue_row, sat_row, v_row.astype(np.uint8))
 
-    # Decay RÁPIDO para resposta instantânea (não acumula demais)
-    _water = (_water.astype(np.float32) * 0.75).astype(np.uint8)  # Era 0.96, agora 0.75 = decay MUITO mais rápido
+    # Decay RÁPIDO
+    _water = (_water.astype(np.float32) * 0.75).astype(np.uint8)
     
-    # Adiciona nova linha com ADIÇÃO (não maximum) para picos explosivos
+    # Adiciona nova linha
     _water = np.clip(_water.astype(np.uint16) + new_row.astype(np.uint16), 0, 255).astype(np.uint8)
 
     # Aplica floor e renderiza
