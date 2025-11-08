@@ -114,8 +114,7 @@ def effect_bass_center_bloom(ctx, bands_u8, beat_flag, active):
     # ----- ENVIO COM CAP JÁ RESPEITADO -----
     ctx.to_pixels_and_show(rgb)
 
-
-
+    
 # Alias para compatibilidade
 def effect_bass_center(ctx, bands_u8, beat_flag, active):
     return effect_bass_center_bloom(ctx, bands_u8, beat_flag, active)
