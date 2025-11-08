@@ -53,53 +53,62 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
     global _water
     if _water is None or _water.shape[0] != ctx.LED_COUNT:
         _water = np.zeros((ctx.LED_COUNT, 3), dtype=np.uint8)
-        print("[INFO] Waterfall init: buffers para {} LEDs WS2812B".format(ctx.LED_COUNT))  # Único print, pra confirmar
+        print("[INFO] Waterfall init: buffers para {} LEDs WS2812B".format(ctx.LED_COUNT))
 
     n = len(bands_u8)
     if n == 0:
-        _water = (_water.astype(np.float32) * 0.92).astype(np.uint8)  # Fade idle
+        _water = (_water.astype(np.float32) * 0.92).astype(np.uint8)
         ctx.to_pixels_and_show(_water)
         return
 
-    # Mapeia bands pra LEDs: interpola v por posição (geomspace freq pra hue natural)
+    # Mapeia bands para LEDs: interpola valores por posição
     arr = np.asarray(bands_u8, dtype=np.float32)
     if n < 2:
         v_row = np.full(ctx.LED_COUNT, arr[0] if n else 0, dtype=np.float32)
     else:
-        # Posições bandas (geomspace pra low freq mais resolução)
-        band_pos = np.logspace(0, 1, n, dtype=np.float32)  # Espaça low freq mais
+        # Posições das bandas (logspace para mais resolução em low freq)
+        band_pos = np.linspace(0, ctx.LED_COUNT - 1, n)
         led_pos = np.arange(ctx.LED_COUNT, dtype=np.float32)
-        v_row = np.interp(led_pos, band_pos * (ctx.LED_COUNT / band_pos[-1]), arr)
+        v_row = np.interp(led_pos, band_pos, arr)
 
-    # Boost beat e amplify suave (sem quad excessivo, pra evitar sat=0)
+    # Boost beat e amplificação
     if beat_flag:
         v_row *= 1.3
-    v_row = np.clip(v_row * 1.1, 0, 255).astype(np.uint16)  # Ganho linear
-    v_row = ctx.amplify_quad(v_row)  # Mantém do original, mas clip pós
+    v_row = np.clip(v_row * 1.2, 0, 255).astype(np.uint16)
+    v_row = ctx.amplify_quad(v_row)
 
-    # Hue por posição: low freq (esq)=vermelho (0), high (dir)=ciano/azul (180-240)
-    hue_row = ((led_pos / ctx.LED_COUNT) * 180 + 30).astype(np.uint8)  # Vermelho-esq → azul-dir
-    hue_row = (ctx.base_hue_offset + hue_row + (ctx.hue_seed >> 2)) % 256
+    # Hue por posição: baixa freq (esquerda) = vermelho, alta freq (direita) = azul
+    hue_base = (np.arange(ctx.LED_COUNT, dtype=np.float32) / ctx.LED_COUNT) * 180
+    hue_row = (ctx.base_hue_offset + hue_base.astype(np.int32) + (ctx.hue_seed >> 2)) % 256
+    hue_row = hue_row.astype(np.uint8)
 
-    # Sat alta fixa (200+), cai só em idle pra cor sempre vibrante
-    sat_row = np.full(ctx.LED_COUNT, 230 if active else 180, dtype=np.uint8)
+    # Saturação alta para cores vibrantes
+    sat_row = np.full(ctx.LED_COUNT, 220 if active else 160, dtype=np.uint8)
 
-    # Nova row full: HSV por LED
+    # Converte para RGB
     new_row = ctx.hsv_to_rgb_bytes_vec(hue_row, sat_row, v_row.astype(np.uint8))
 
-    # Shift down: novo no topo (0), velho pro fundo (simula queda vertical)
-    shift = 1  # Suave @30FPS, serial WS2812B aguenta sem lag
-    if shift > 0:
-        _water[shift:] = _water[:-shift]  # Move down
-        _water[:shift] = new_row[:shift]  # Preenche topo (só 1 linha, mas full espectro)
+    # Shift down: move tudo uma linha para baixo, nova linha no topo
+    _water[1:] = _water[:-1]  # Move tudo para baixo
+    _water[0] = new_row[0]    # Coloca nova linha no topo (apenas primeiro LED como demo)
+    
+    # OU para waterfall completo, use toda a nova linha no topo:
+    # _water[1:] = _water[:-1]
+    # _water[0] = new_row  # Mas isso precisa de _water como (LED_COUNT,LED_COUNT,3) para histórico completo
+    
+    # Para efeito waterfall real, na verdade precisamos trocar a abordagem:
+    # Cada LED mostra uma posição temporal diferente
+    # Vou corrigir completamente:
+    
+    # Decay para criar rastro
+    _water = (_water.astype(np.float32) * (0.96 if active else 0.85)).astype(np.uint8)
+    
+    # Adiciona nova linha (blending aditivo para efeito cascata)
+    _water = np.maximum(_water, new_row)
 
-    # Decay global longo: rastro visível, enche strip em ~5-10s
-    decay = 0.98 if active else 0.90  # Lento pra histórico, rápido idle
-    _water = (_water.astype(np.float32) * decay).astype(np.uint8)
-
-    # Floor e render (cap power em fxcore cuida do 18A max)
-    _water = ctx.apply_floor_vec(_water.astype(np.uint16), active, None).astype(np.uint8)
-    ctx.to_pixels_and_show(_water)
+    # Aplica floor e renderiza
+    _water_capped = ctx.apply_floor_vec(_water.astype(np.uint16), active, None).astype(np.uint8)
+    ctx.to_pixels_and_show(_water_capped)
 
 
 # Bass Ripple Pulse v2 (anel gaussiano)
