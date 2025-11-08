@@ -49,71 +49,58 @@ def effect_full_strip_pulse(ctx, bands_u8, beat_flag, active):
 # Waterfall clássico reativo: espectro full mapeado por LED, shift down com decay longo (enche strip)
 _water = None
 
+# effects/dynamics.py
+import numpy as np
+
+_water = None
+
 def effect_waterfall(ctx, bands_u8, beat_flag, active):
     global _water
     if _water is None or _water.shape[0] != ctx.LED_COUNT:
         _water = np.zeros((ctx.LED_COUNT, 3), dtype=np.uint8)
-        print("[INFO] Waterfall init: buffers para {} LEDs WS2812B".format(ctx.LED_COUNT))
 
     n = len(bands_u8)
     if n == 0:
-        _water = (_water.astype(np.float32) * 0.92).astype(np.uint8)
+        _water = np.clip(_water.astype(np.float32) * 0.92, 0, 255).astype(np.uint8)
         ctx.to_pixels_and_show(_water)
         return
 
-    # Mapeia bands para LEDs: interpola valores por posição
+    # --- Mapeamento espectral ---
     arr = np.asarray(bands_u8, dtype=np.float32)
-    if n < 2:
-        v_row = np.full(ctx.LED_COUNT, arr[0] if n else 0, dtype=np.float32)
+    if n >= 2:
+        # Logspace pra graves terem mais espaço
+        band_pos = np.geomspace(1, n, n)
+        led_pos = np.arange(ctx.LED_COUNT)
+        pos_norm = band_pos * (ctx.LED_COUNT / band_pos[-1])
+        v_row = np.interp(led_pos, pos_norm, arr)
     else:
-        # Posições das bandas (logspace para mais resolução em low freq)
-        band_pos = np.linspace(0, ctx.LED_COUNT - 1, n)
-        led_pos = np.arange(ctx.LED_COUNT, dtype=np.float32)
-        v_row = np.interp(led_pos, band_pos, arr)
+        v_row = np.full(ctx.LED_COUNT, arr[0] if n else 0, dtype=np.float32)
 
-    # BOOST AGRESSIVO para reatividade forte
-    # Amplificação base muito maior
-    v_row = v_row * 2.0  # Dobra ganho base
-    
-    # Beat flag com boost massivo (samba tem muitos beats!)
+    # --- Amplificação ---
+    v_row = np.clip(v_row * 1.1, 0, 255)
     if beat_flag:
-        v_row *= 1.8  # Era 1.3, agora 1.8
-    
-    # Clip antes do quad para evitar saturação
-    v_row = np.clip(v_row, 0, 255).astype(np.uint16)
-    
-    # Amplify quad para resposta não-linear (graves explodem)
-    v_row = ctx.amplify_quad(v_row)
-    
-    # BOOST ADICIONAL pós-quad para frequências baixas (graves do samba)
-    low_boost = np.linspace(1.4, 1.0, ctx.LED_COUNT)  # 40% boost na esquerda (graves)
-    v_row = np.clip(v_row.astype(np.float32) * low_boost, 0, 255).astype(np.uint16)
+        v_row *= 1.3
+    v_row = ctx.amplify_quad(v_row.astype(np.uint16))
 
-    # Hue por posição: baixa freq (esquerda) = vermelho/laranja, alta freq (direita) = azul/ciano
-    hue_base = (np.arange(ctx.LED_COUNT, dtype=np.float32) / ctx.LED_COUNT) * 200  # Mais range
-    hue_row = (ctx.base_hue_offset + hue_base.astype(np.int32) + (ctx.hue_seed >> 2)) % 256
-    
-    # Beat shift no hue para pulsar cores
-    if beat_flag:
-        hue_row = (hue_row + 20) % 256
-    
-    hue_row = hue_row.astype(np.uint8)
+    # --- Cores ---
+    hue_row = (30 + (led_pos / ctx.LED_COUNT) * 200).astype(np.uint8)
+    hue_row = (ctx.base_hue_offset + hue_row + (ctx.hue_seed >> 2)) % 256
+    sat_row = np.full(ctx.LED_COUNT, 230 if active else 180, dtype=np.uint8)
 
-    # Saturação MÁXIMA para cores vibrantes e marcadas
-    sat_row = np.full(ctx.LED_COUNT, 245 if active else 180, dtype=np.uint8)
-
-    # Converte para RGB
     new_row = ctx.hsv_to_rgb_bytes_vec(hue_row, sat_row, v_row.astype(np.uint8))
 
-    # Decay RÁPIDO para resposta instantânea (não acumula demais)
-    _water = (_water.astype(np.float32) * 0.75).astype(np.uint8)  # Era 0.96, agora 0.75 = decay MUITO mais rápido
-    
-    # Adiciona nova linha com ADIÇÃO (não maximum) para picos explosivos
-    _water = np.clip(_water.astype(np.uint16) + new_row.astype(np.uint16), 0, 255).astype(np.uint8)
+    # --- Shift + Decay ---
+    _water[1:] = _water[:-1]
+    _water[0] = new_row[0]  # Topo = nova linha
+    if beat_flag:
+        _water[:3] = np.clip(_water[:3].astype(np.int16) + 60, 0, 255).astype(np.uint8)
 
-    # Aplica floor e renderiza
-    _water_out = ctx.apply_floor_vec(_water.astype(np.uint16), active, None).astype(np.uint8)
-    ctx.to_pixels_and_show(_water_out)
+    decay = 0.985 if active else 0.92
+    _water = np.clip(_water.astype(np.float32) * decay, 0, 255).astype(np.uint8)
+
+    # --- Render seguro ---
+    ctx.to_pixels_and_show(np.ascontiguousarray(_water))
+
 
 # Bass Ripple Pulse v2 (anel gaussiano)
 class _Ripple:
