@@ -7,11 +7,12 @@ from fxcore import FXContext
 from effects import build_effects
 
 PKT_AUDIO_V2 = 0xA2
-PKT_AUDIO    = 0xA1
-PKT_CFG      = 0xB0
+PKT_AUDIO = 0xA1
+PKT_CFG = 0xB0
+
 LEN_A2_MIN = 13
 LEN_A1_MIN = 11
-LEN_CFG    = 10
+LEN_CFG = 10
 
 UDP_PORT = 5005
 TCP_TIME_PORT = 5006
@@ -57,9 +58,9 @@ latest_packet = None
 latest_lock = threading.Lock()
 stop_flag = False
 
-# -------- Caches / LUTs ----------
+# ---------- Caches / LUTs ----------
 LED_IDX = np.arange(LED_COUNT, dtype=np.int32)
-H_FIXED = ((LED_IDX * 256) // LED_COUNT).astype(np.uint16)   # 0..255 em uint16
+H_FIXED = ((LED_IDX * 256) // LED_COUNT).astype(np.uint16)  # 0..255 em uint16
 S_FIXED = np.full(LED_COUNT, 255, dtype=np.uint8)
 
 # Gamma LUT (1.6)
@@ -75,6 +76,8 @@ _last_status_ts = 0.0
 
 # LUT (H,V)->RGB achatada (65536 x 3)
 HSV_LUT_FLAT = None
+
+
 def _build_hv_lut_flat(s_fixed: int = 255):
     h_vals = np.arange(256, dtype=np.uint8)
     v_vals = np.arange(256, dtype=np.uint8)
@@ -85,18 +88,21 @@ def _build_hv_lut_flat(s_fixed: int = 255):
     rgb_flat = FXContext.hsv_to_rgb_bytes_vec(h, s, v)
     return rgb_flat
 
+
 HSV_LUT_FLAT = _build_hv_lut_flat(255)
 
 # Índice base para LUT (H<<8) em uint16 (economiza casts por frame)
 H_IDX_BASE_U16 = (H_FIXED << 8).astype(np.uint16)
 
 # Buffers pré-alocados para o fallback (evitam alocação por frame)
-_vals_buf   = np.empty(LED_COUNT, dtype=np.uint8)   # bandas mapeadas para LEDs
-_v_buf      = np.empty(LED_COUNT, dtype=np.uint8)   # gamma(v)
-_idx_buf_u16= np.empty(LED_COUNT, dtype=np.uint16)  # h*256 + v
+_vals_buf = np.empty(LED_COUNT, dtype=np.uint8)   # bandas mapeadas para LEDs
+_v_buf = np.empty(LED_COUNT, dtype=np.uint8)      # gamma(v)
+_idx_buf_u16 = np.empty(LED_COUNT, dtype=np.uint16)  # h*256 + v
 
 # Cache de zeros por tamanho (evita np.zeros_like a cada frame)
 _ZERO_CACHE = {}
+
+
 def _zeros_of(n):
     arr = _ZERO_CACHE.get(n)
     if arr is None:
@@ -104,14 +110,17 @@ def _zeros_of(n):
         _ZERO_CACHE[n] = arr
     return arr
 
+
 # ---------- Utils ----------
 def _recv_exact(conn, n):
     buf = b''
     while len(buf) < n:
         ch = conn.recv(n - len(buf))
-        if not ch: raise ConnectionError("TCP encerrado")
+        if not ch:
+            raise ConnectionError("TCP encerrado")
         buf += ch
     return buf
+
 
 def timesync_tcp_server():
     global time_offset_ns, time_sync_ready
@@ -128,62 +137,80 @@ def timesync_tcp_server():
                     if hdr == b"TS1":
                         t0 = _recv_exact(conn, 8)
                         tr = time.monotonic_ns()
-                        conn.sendall(b"TS2" + t0 + tr.to_bytes(8,'little'))
+                        conn.sendall(b"TS2" + t0 + tr.to_bytes(8, 'little'))
                     elif hdr == b"TS3":
                         off = _recv_exact(conn, 8)
-                        time_offset_ns = int.from_bytes(off,'little',signed=True)
+                        time_offset_ns = int.from_bytes(off, 'little', signed=True)
                         time_sync_ready = True
-                        conn.sendall(b"TS3" + int(time_offset_ns).to_bytes(8,'little',signed=True))
+                        conn.sendall(b"TS3" + int(time_offset_ns).to_bytes(8, 'little', signed=True))
                         break
                     else:
                         break
         except Exception:
             time.sleep(0.05)
 
+
 # ---------- Paleta / cores ----------
-STRATEGIES = ["complementar","analoga","triade","tetrade","split"]
+STRATEGIES = ["complementar", "analoga", "triade", "tetrade", "split"]
 COMPLEMENT_DELTA = 0.06
+
+
 def clamp01(x): return x % 1.0
+
 
 def build_palette_from_strategy(h0, strategy, num_colors=5):
     import colorsys
+
     def hsv_to_rgb_bytes(h, s, v):
-        r,g,b = colorsys.hsv_to_rgb(h,s,v); return (int(r*255), int(g*255), int(b*255))
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        return (int(r * 255), int(g * 255), int(b * 255))
+
     if strategy == "complementar":
-        hA=h0%1.0; hB=(h0+0.5)%1.0; d=COMPLEMENT_DELTA
-        hues=[hA,(hA+d)%1.0,(hA-d)%1.0,hB,(hB+d)%1.0,(hB-d)%1.0]
-        s_choices=[0.60,0.70,0.80,0.85]; v_choices=[0.70,0.80,0.90,1.00]
-        pal=[]
-        while len(pal)<num_colors:
-            h=random.choice(hues)
-            if len(pal)==0: s,v=0.75,0.95
-            elif len(pal)==1: s,v=0.65,0.75
-            else: s=random.choice(s_choices); v=random.choice(v_choices)
-            pal.append(hsv_to_rgb_bytes(h,s,v))
+        hA = h0 % 1.0; hB = (h0 + 0.5) % 1.0; d = COMPLEMENT_DELTA
+        hues = [hA, (hA + d) % 1.0, (hA - d) % 1.0, hB, (hB + d) % 1.0, (hB - d) % 1.0]
+        s_choices = [0.60, 0.70, 0.80, 0.85]; v_choices = [0.70, 0.80, 0.90, 1.00]
+        pal = []
+        while len(pal) < num_colors:
+            h = random.choice(hues)
+            if len(pal) == 0:
+                s, v = 0.75, 0.95
+            elif len(pal) == 1:
+                s, v = 0.65, 0.75
+            else:
+                s = random.choice(s_choices); v = random.choice(v_choices)
+            pal.append(hsv_to_rgb_bytes(h, s, v))
         return pal
     elif strategy == "analoga":
-        step=0.10; hues=[clamp01(h0+k*step) for k in (-2,-1,0,1,2)]
+        step = 0.10
+        hues = [clamp01(h0 + k * step) for k in (-2, -1, 0, 1, 2)]
     elif strategy == "triade":
-        hues=[h0, clamp01(h0+1/3), clamp01(h0+2/3)]
+        hues = [h0, clamp01(h0 + 1 / 3), clamp01(h0 + 2 / 3)]
     elif strategy == "tetrade":
-        hues=[h0, clamp01(h0+0.25), clamp01(h0+0.5), clamp01(h0+0.75)]
+        hues = [h0, clamp01(h0 + 0.25), clamp01(h0 + 0.5), clamp01(h0 + 0.75)]
     else:
-        off=1/6; hues=[h0, clamp01(h0+0.5-off), clamp01(h0+0.5+off)]
-    pal=[]
-    while len(pal)<num_colors:
-        h=random.choice(hues); s=random.uniform(0.55,0.85); v=random.uniform(0.70,1.00)
-        pal.append(hsv_to_rgb_bytes(h,s,v))
+        off = 1 / 6
+        hues = [h0, clamp01(h0 + 0.5 - off), clamp01(h0 + 0.5 + off)]
+    pal = []
+    while len(pal) < num_colors:
+        h = random.choice(hues)
+        s = random.uniform(0.55, 0.85)
+        v = random.uniform(0.70, 1.00)
+        pal.append(hsv_to_rgb_bytes(h, s, v))
     return pal
 
-base_hue_offset = random.randint(0,255)
-hue_seed = random.randint(0,255)
+
+base_hue_offset = random.randint(0, 255)
+hue_seed = random.randint(0, 255)
 base_saturation = 210
-current_palette = [(255,255,255)]*5
+
+current_palette = [(255, 255, 255)] * 5
 current_palette_name = "analoga"
 last_palette_h0 = 0.0
+
 PALETTE_BUFFER_MAX = 8
 palette_queue = deque(maxlen=PALETTE_BUFFER_MAX)
 palette_thread_stop = threading.Event()
+
 
 def palette_worker():
     while not palette_thread_stop.is_set():
@@ -197,9 +224,12 @@ def palette_worker():
         except Exception:
             time.sleep(0.05)
 
+
 def get_next_palette():
-    if palette_queue: return palette_queue.popleft()
+    if palette_queue:
+        return palette_queue.popleft()
     return None
+
 
 def apply_new_colorset():
     global base_hue_offset, hue_seed, base_saturation, current_palette, current_palette_name, last_palette_h0
@@ -210,9 +240,17 @@ def apply_new_colorset():
         strategy = random.choice(STRATEGIES); h0 = random.random()
         current_palette = build_palette_from_strategy(h0, strategy, num_colors=5)
         current_palette_name = strategy; last_palette_h0 = h0
-    base_hue_offset = random.randint(0,255)
-    hue_seed = random.randint(0,255)
-    base_saturation = random.randint(190,230)
+    base_hue_offset = random.randint(0, 255)
+    hue_seed = random.randint(0, 255)
+    base_saturation = random.randint(190, 230)
+
+
+# --- NOVO: empurra as seeds atuais para o contexto usado pelos efeitos ---
+def push_palette_to_ctx(ctx: FXContext):
+    ctx.base_hue_offset = int(base_hue_offset)
+    ctx.hue_seed = int(hue_seed)
+    ctx.base_saturation = int(base_saturation)
+
 
 # ---------- Teclado (não-busy) ----------
 def key_listener():
@@ -223,11 +261,15 @@ def key_listener():
         while True:
             if select.select([sys.stdin], [], [], 0.05)[0]:
                 k = sys.stdin.read(1)
-                if k == 'n': pending_key_change = 'next'
-                elif k == 'p': pending_key_change = 'prev'
-                elif k == 'q': os._exit(0)
+                if k == 'n':
+                    pending_key_change = 'next'
+                elif k == 'p':
+                    pending_key_change = 'prev'
+                elif k == 'q':
+                    os._exit(0)
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+
 
 # ---------- UDP Receiver + CFG ----------
 def udp_receiver():
@@ -247,12 +289,12 @@ def udp_receiver():
                 if nb <= 0:
                     drop_len += 1
                     continue
-                ts_pc = int.from_bytes(data[1:9],'little')
-                bands = np.frombuffer(memoryview(data)[9:9+nb], dtype=np.uint8)
-                beat = data[9+nb]
-                trans = data[10+nb]
-                dyn_floor = data[11+nb]
-                kick_intensity = data[12+nb]
+                ts_pc = int.from_bytes(data[1:9], 'little')
+                bands = np.frombuffer(memoryview(data)[9:9 + nb], dtype=np.uint8)
+                beat = data[9 + nb]
+                trans = data[10 + nb]
+                dyn_floor = data[11 + nb]
+                kick_intensity = data[12 + nb]
                 if EXPECTED_BANDS != nb:
                     EXPECTED_BANDS = int(nb)
                 with latest_lock:
@@ -264,10 +306,10 @@ def udp_receiver():
                 if nb <= 0:
                     drop_len += 1
                     continue
-                ts_pc = int.from_bytes(data[1:9],'little')
-                bands = np.frombuffer(memoryview(data)[9:9+nb], dtype=np.uint8)
-                beat = data[9+nb]
-                trans = data[10+nb]
+                ts_pc = int.from_bytes(data[1:9], 'little')
+                bands = np.frombuffer(memoryview(data)[9:9 + nb], dtype=np.uint8)
+                beat = data[9 + nb]
+                trans = data[10 + nb]
                 if EXPECTED_BANDS != nb:
                     EXPECTED_BANDS = int(nb)
                 with latest_lock:
@@ -276,13 +318,17 @@ def udp_receiver():
                 continue
             if hdr == PKT_CFG and n == LEN_CFG:
                 ver = data[1]
-                nb = data[2] | (data[3] << 8)
-                fps = data[4] | (data[5] << 8)
-                hold= data[6] | (data[7] << 8)
-                vis = data[8] | (data[9] << 8)
+                nb = data[2] \
+                     (data[3] << 8)
+                fps = data[4] \
+                      (data[5] << 8)
+                hold = data[6] \
+                       (data[7] << 8)
+                vis = data[8] \
+                      (data[9] << 8)
                 if nb > 0: EXPECTED_BANDS = int(nb)
                 if fps > 0: CFG_FPS = int(fps)
-                if hold>=0: SIGNAL_HOLD_MS = int(hold)
+                if hold >= 0: SIGNAL_HOLD_MS = int(hold)
                 if vis > 0: CFG_VIS_FPS = int(vis)
                 continue
             if hdr in (PKT_AUDIO, PKT_AUDIO_V2, PKT_CFG):
@@ -291,6 +337,7 @@ def udp_receiver():
                 drop_hdr += 1
         except Exception:
             time.sleep(0.001)
+
 
 # ---------- Status ----------
 def unified_status_line(effect_name, ctx, active, bands, fps, vis_fps, pal_name):
@@ -312,13 +359,15 @@ def unified_status_line(effect_name, ctx, active, bands, fps, vis_fps, pal_name)
     sys.stdout.write("\r" + line.ljust(140))
     sys.stdout.flush()
 
+
 # ---------- Smoke ----------
 def hardware_smoke_test(ctx, seconds=0.6):
     print(f"[INFO] NeoPixel bpp={getattr(pixels,'bpp','n/a')} order={ORDER} is_rgbw={LED_IS_RGBW}")
-    colors=[(255,0,0),(0,255,0),(0,0,255),(255,255,255),(0,0,0)]
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255), (0, 0, 0)]
     for rgb in colors:
-        arr = np.tile(np.array(rgb, dtype=np.uint8), (LED_COUNT,1))
+        arr = np.tile(np.array(rgb, dtype=np.uint8), (LED_COUNT, 1))
         ctx.to_pixels_and_show(arr); time.sleep(seconds)
+
 
 # ---------- Main ----------
 def main():
@@ -332,7 +381,11 @@ def main():
     ctx = FXContext(pixels, LED_COUNT, base_hue_offset, hue_seed, base_saturation,
                     current_budget_a=18.0, ma_per_channel=20.0, idle_ma_per_led=1.0)
     ctx.metrics = None
+
     effects = build_effects(ctx)
+
+    # Garante que o ctx reflita as seeds iniciais (opcional, por consistência)
+    push_palette_to_ctx(ctx)
 
     if ENABLE_SMOKE_TEST:
         hardware_smoke_test(ctx, seconds=0.6)
@@ -350,6 +403,7 @@ def main():
 
     signal_active_until = 0.0
     already_off = False
+
     last_rx_ts = time.time()
     next_frame = time.time()
     last_render_ts = 0.0
@@ -357,13 +411,13 @@ def main():
     try:
         while True:
             now = time.time()
-
             desired_frame_dt = 1.0 / max(1, CFG_FPS)
             desired_hold = SIGNAL_HOLD_MS / 1000.0
             desired_render_dt = 1.0 / max(1, CFG_VIS_FPS)
+
             if abs(desired_frame_dt - FRAME_DT) > 1e-6: FRAME_DT = desired_frame_dt
             if abs(desired_hold - SIGNAL_HOLD) > 1e-6: SIGNAL_HOLD = desired_hold
-            if abs(desired_render_dt- RENDER_DT) > 1e-6: RENDER_DT = desired_render_dt
+            if abs(desired_render_dt - RENDER_DT) > 1e-6: RENDER_DT = desired_render_dt
 
             global pending_key_change
             if pending_key_change is not None:
@@ -372,12 +426,14 @@ def main():
                 else:
                     current_effect = (current_effect - 1) % len(effects)
                 pending_key_change = None
+
                 apply_new_colorset()
+                push_palette_to_ctx(ctx)  # <<<<<<<<<<<<<<<<<<<<<< novo
                 last_effect_change = now
 
             if (now - last_rx_ts) > 2.0:
                 if not already_off:
-                    pixels.fill((0,0,0)); pixels.show()
+                    pixels.fill((0, 0, 0)); pixels.show()
                     already_off = True
                 unified_status_line("Idle", ctx, False, EXPECTED_BANDS, CFG_FPS, CFG_VIS_FPS, current_palette_name)
                 next_frame += FRAME_DT
@@ -402,7 +458,7 @@ def main():
                     one_way_ns = now_ns - (ts_pc_ns + time_offset_ns)
                     if -5_000_000 <= one_way_ns <= 5_000_000_000:
                         lat_ms = one_way_ns / 1e6
-                        latency_ms_ema = lat_ms if latency_ms_ema is None else 0.85*latency_ms_ema + 0.15*lat_ms
+                        latency_ms_ema = lat_ms if latency_ms_ema is None else 0.85 * latency_ms_ema + 0.15 * lat_ms
 
                 avg_raw = float(np.mean(bands_u8))
                 if transition_flag == 1 and avg_raw < 0.5:
@@ -418,12 +474,14 @@ def main():
                         last_bands = np.zeros(bands_u8.size, dtype=np.uint8)
                     last_bands[:] = bands_u8
                     last_beat = int(beat_flag)
+
                 ctx.dynamic_floor = int(dyn_floor)
 
                 time_up = (now - last_effect_change) > effect_max_interval
                 if transition_flag == 1 or time_up:
                     current_effect = (current_effect + 1) % len(effects)
                     apply_new_colorset()
+                    push_palette_to_ctx(ctx)  # <<<<<<<<<<<<<<<<<<<<<< novo
                     last_effect_change = now
 
             active = (now < signal_active_until)
@@ -454,8 +512,10 @@ def main():
                 except Exception as e:
                     # fallback cinza (raro): evite alocações desnecessárias
                     vals = np.repeat(b, 2)
-                    if vals.size < LED_COUNT: vals = np.pad(vals, (0, LED_COUNT-vals.size), 'constant')
-                    else: vals = vals[:LED_COUNT]
+                    if vals.size < LED_COUNT:
+                        vals = np.pad(vals, (0, LED_COUNT - vals.size), 'constant')
+                    else:
+                        vals = vals[:LED_COUNT]
                     rgb = np.stack([vals, vals, vals], axis=-1)
                     ctx.to_pixels_and_show(rgb)
                     name = f"Fallback Gray ({e.__class__.__name__})"
@@ -470,8 +530,10 @@ def main():
     finally:
         stop_flag = True
         palette_thread_stop.set()
-        pixels.fill((0,0,0)); pixels.show()
+        pixels.fill((0, 0, 0)); pixels.show()
         sys.stdout.write("\n"); sys.stdout.flush()
+
 
 if __name__ == "__main__":
     main()
+    
