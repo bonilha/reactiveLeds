@@ -230,6 +230,166 @@ _brp_prev_low = 0.0
 
 
 def effect_bass_ripple_pulse_v2(ctx, bands_u8, beat_flag, active):
+    """
+    Bass Ripple Pulse — v2 (full-strip + palette)
+    - Spawna ondas em múltiplos centros distribuídos ao longo do strip (usa a fita toda).
+    - Cores da paleta se ctx.current_palette existir; fallback HSV caso contrário.
+    - Envelope de graves (attack/release) controla intensidade, velocidade e largura.
+    - Composição aditiva limitada (clip 0..255) com decaimento suave.
+    """
+    import numpy as np, time
+
+    # ---------- Estado interno no ctx (não altera globais existentes) ----------
+    st = getattr(ctx, "_brp3", None)
+    if st is None:
+        emitters = np.linspace(0, max(0, ctx.LED_COUNT - 1), num=max(6, ctx.LED_COUNT // 60), dtype=np.float32)
+        st = ctx._brp3 = {
+            "last_t": time.time(),
+            "emitters": emitters,     # centros distribuídos
+            "ripples": [],            # cada ripple: dict(c,r,spd,thick,amp,life,rgb_peak)
+            "env": 0.0,               # envelope de graves
+            "prev_low": 0.0,          # low energy p/ detectar "rise"
+            "flip": 0,                # alternância de padrões
+        }
+
+    now = time.time()
+    dt = now - st["last_t"]
+    st["last_t"] = now
+    dt = float(np.clip(dt, 0.0, 0.05))  # passo estável
+
+    # ---------- Entrada/energia (graves) ----------
+    n = len(bands_u8)
+    if n == 0:
+        # só decai as ondas existentes
+        rip = st["ripples"]
+        if rip:
+            for rp in rip:
+                rp["amp"] *= 0.90
+                rp["life"] *= 0.92
+            st["ripples"] = [rp for rp in rip if rp["life"] > 0.04]
+        # render decay
+        if not rip:
+            ctx.to_pixels_and_show(np.zeros((ctx.LED_COUNT, 3), dtype=np.uint8))
+        else:
+            # render rápido (reaproveitando abaixo)
+            pass  # deixa passar p/ bloco de render mais abaixo
+    # low-band média (1/8 do espectro ou 8 bandas)
+    low_n = max(8, n // 8) if n > 0 else 8
+    low_mean = float(np.mean(np.asarray(bands_u8[:low_n], dtype=np.float32))) if n > 0 else 0.0
+
+    # envelope com attack/release (mantém responsivo sem "tremor")
+    attack, release = 0.55, 0.18
+    env_prev = st["env"]
+    coef = attack if low_mean > env_prev else release
+    env = coef * low_mean + (1.0 - coef) * env_prev
+    st["env"] = env
+    e01 = np.clip(env / 255.0, 0.0, 1.0)
+
+    # ---------- Spawns (múltiplos centros) ----------
+    # Dispara em beat ou subida de energia (detecção de "rise")
+    spawn = bool(beat_flag)
+    if not spawn and (low_mean - st["prev_low"]) > 6.0:
+        spawn = True
+    st["prev_low"] = low_mean
+
+    rip = st["ripples"]
+    max_ripples = 18  # limite global
+    if spawn and active and len(rip) < max_ripples:
+        # quantos centros ativar neste frame
+        base_count = 2 + int(4 * e01)                # 2..6 conforme energia
+        if beat_flag:
+            base_count = min(base_count + 2, 8)      # extra no beat
+        # escolhe centros intercalando (para cobrir o strip)
+        em = st["emitters"]
+        st["flip"] ^= 1
+        start = st["flip"] % 2
+        picked_idx = np.arange(start, em.size, max(1, em.size // max(1, base_count)), dtype=np.int32)[:base_count]
+        centers = em[picked_idx]
+
+        # prepara cor de pico (RGB) por ripple
+        pal = getattr(ctx, "current_palette", None)
+        use_pal = isinstance(pal, (list, tuple)) and len(pal) >= 2
+        pal_arr = np.asarray(pal, dtype=np.uint8) if use_pal else None
+        m = pal_arr.shape[0] if use_pal else 0
+
+        for j, c in enumerate(centers):
+            # parâmetros reativos à energia
+            spd = 90.0 + 240.0 * e01           # px/s
+            thick = 2.0 + 5.0 * e01            # largura gaussiana
+            amp = 90.0 + 160.0 * e01           # pico (0..255)
+            life = 1.0 if beat_flag else 0.88  # vida base
+
+            if use_pal:
+                # escolhe cor da paleta de forma distribuída
+                p = (j / max(1, base_count - 1)) * (m - 1)
+                i0 = int(np.floor(p)) % m
+                i1 = (i0 + 1) % m
+                tcol = float(p - np.floor(p))
+                rgb_peak = (pal_arr[i0].astype(np.float32) * (1.0 - tcol) +
+                            pal_arr[i1].astype(np.float32) * tcol)
+                rgb_peak = np.clip(rgb_peak, 0, 255).astype(np.uint8)
+            else:
+                # fallback HSV em função da posição do centro
+                hue = (int(ctx.base_hue_offset) + int(ctx.hue_seed >> 2) +
+                       int(240.0 * (c / max(1.0, float(ctx.LED_COUNT - 1))))) % 256
+                rgb_peak = ctx.hsv_to_rgb_bytes_vec(
+                    np.array([hue], dtype=np.uint8),
+                    np.array([min(235, ctx.base_saturation)], dtype=np.uint8),
+                    np.array([255], dtype=np.uint8)
+                )[0]
+
+            rip.append({"c": float(c), "r": 0.0, "spd": spd, "thick": thick,
+                        "amp": amp, "life": life, "rgb": rgb_peak})
+
+        if len(rip) > max_ripples:
+            rip[:] = rip[-max_ripples:]  # poda gentil
+
+    # ---------- Atualização das ondas ----------
+    # decaimentos suaves p/ percorrer longas distâncias
+    life_decay = 0.92 ** (dt * 40.0)
+    amp_decay = 0.90 ** (dt * 40.0)
+    width_growth = 1.0 + 0.25 * dt
+
+    for rp in rip:
+        rp["r"] += rp["spd"] * dt
+        rp["life"] *= life_decay
+        rp["amp"] *= amp_decay
+        rp["thick"] *= width_growth
+
+    # remove ondas muito fracas ou que passaram do alcance máximo
+    # (maior distância até a borda, a partir do centro)
+    max_reach = lambda c: max(c, (ctx.LED_COUNT - 1) - c) + 6.0
+    rip[:] = [rp for rp in rip if (rp["life"] > 0.05 and rp["r"] < max_reach(rp["c"]))]
+
+    # ---------- Render vetorizado ----------
+    L = ctx.LED_COUNT
+    if L <= 0:
+        return
+    idx = ctx.I_ALL.astype(np.float32)
+
+    rgb_acc = np.zeros((L, 3), dtype=np.float32)
+    if rip:
+        for rp in rip:
+            d = np.abs(idx - float(rp["c"]))
+            diff = np.abs(d - float(rp["r"]))
+            sig = max(0.7, float(rp["thick"]))
+            # anel gaussiano (pico no raio r)
+            shape = np.exp(-0.5 * (diff / sig) ** 2).astype(np.float32)  # [L]
+            val = shape * float(rp["amp"]) * float(rp["life"])           # 0..~255
+            # compõe aditivo limitado
+            rgb_acc += (val[:, None] / 255.0) * rp["rgb"].astype(np.float32)
+
+    # ajuste para o modo "idle"
+    if not active:
+        rgb_acc *= 0.85
+
+    # aplica piso dinâmico por canal
+    f = float(getattr(ctx, "dynamic_floor", 0))
+    if f > 0:
+        rgb_acc = np.maximum(rgb_acc, f)
+
+    rgb = np.clip(rgb_acc, 0, 255).astype(np.uint8)
+    ctx.to_pixels_and_show(rgb)
     global _brp_active, _brp_env, _brp_prev_low
     n = len(bands_u8)
     if n == 0:
