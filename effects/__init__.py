@@ -32,7 +32,7 @@ def build_effects(ctx):
         ("Line Spectrum (HSV)",         _wrap(ctx, effect_line_spectrum)),
         ("Mirror Spectrum (HSV)",       _wrap(ctx, effect_mirror_spectrum)),
         ("Rainbow Wave (HSV)",          _wrap(ctx, effect_rainbow_wave)),
-        ("Energy Comets",              _wrap(ctx, effect_energy_comets)),
+        ("Multiband Comets",              _wrap(ctx, effect_multiband_comets)),
         ("Peak Hold Columns (HSV)",     _wrap(ctx, effect_peak_hold_columns)),
         ("Full Strip Pulse (Palette)",  _wrap(ctx, effect_full_strip_pulse)),
         ("Waterfall (Palette)",         _wrap(ctx, effect_waterfall)),
