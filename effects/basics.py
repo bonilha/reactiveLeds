@@ -68,121 +68,179 @@ def _spawn_comet(comets, pos, dir_right, level, hue, energy, base_speed):
     life0 = 0.9 + 0.1 * level
     comets.append([pos, (+v0 if dir_right else -v0), life0, int(hue) & 255, sigma0])
 
+
 def effect_multiband_comets(ctx, bands_u8, beat_flag, active):
     """
-    Dispara cometas multicor nas posições das bandas mais ativas,
-    cobrindo a fita inteira. Reativo, colorido e com rastro suave.
+    MultiBand Comets — v2 (full-strip)
+    - Spawns dirigidos pelas bandas mais fortes + "cobertura por zonas" para ocupar toda a fita.
+    - Vida/fricção ajustados para permitir percursos longos (cruzar o strip).
+    - Direções alternadas para distribuir o fluxo.
+    - Se ctx.current_palette existir: usa as cores da paleta por cometa; senão, HSV por banda.
+
+    Estrutura dos cometas (mantida):
+        [pos(float), vel(float), life(0..1), hue(uint8), sigma(float)]
     """
     st = _mbc_state(ctx)
     comets = st["comets"]
     idxs = st["idxs"]
     cooldown = st["cooldown"]
 
-    # ---- dt seguro ----
+    # --- dt estável ---
     now = time.time()
     dt = now - st["last_t"]
     st["last_t"] = now
     dt = min(0.05, max(0.0, dt))
 
-    # ---- entrada normalizada e estatísticas ----
+    # --- normalização e estatística das bandas ---
     x = np.asarray(bands_u8, dtype=np.float32)
-    n = int(x.size)
+    n = int(x.size) if x.size > 0 else 1
     if n == 0:
         x = np.zeros(1, dtype=np.float32); n = 1
     x01 = (x / 255.0).clip(0.0, 1.0)
     mu = float(np.mean(x01))
     sd = float(np.std(x01))
-    thr = mu + 0.75 * sd  # limiar adaptativo para "picos"
-
-    # energia global (0..1)
+    thr = mu + 0.75 * sd
     energy = min(1.0, mu ** 0.85)
 
-    # ---- seleção de bandas topo ----
-    # pegamos as bandas acima do limiar (ou as top-K se poucas)
+    # --- seleção de bandas candidatas (picos) ---
     mask = x01 >= thr
     cand_idx = np.nonzero(mask)[0]
     if cand_idx.size == 0:
-        # fallback: top-K por valor
-        K = max(3, n // 12)  # p.ex., 12% das bandas
+        K = max(3, n // 12)  # top-K fallback
         cand_idx = np.argsort(x01)[-K:]
 
-    # ---- spawns (respeitando cooldown por banda) ----
-    MAX_COMETS = 14
-    BASE_SPEED = 140.0
-    COOLDOWN_S = 0.10  # 100 ms por banda
+    # --- parâmetros (ajustados para strip longo) ---
+    MAX_COMETS = 24
+    BASE_SPEED = 160.0  # um pouco maior que antes
+    COOLDOWN_S = 0.10
     base_hue = (ctx.base_hue_offset + (ctx.hue_seed >> 3)) & 255
+    max_to_spawn = 8 if beat_flag else 4
 
-    # beat permite mais nascimentos
-    max_to_spawn = 6 if beat_flag else 3
+    # --- spawns por picos (prioriza os mais fortes) ---
     spawned = 0
-    for k in np.flip(cand_idx):  # começa pelos mais fortes
+    flip_dir_seed = (int(now * 10) ^ ctx.hue_seed) & 1
+
+    for rank_k in np.flip(cand_idx):
         if len(comets) >= MAX_COMETS or spawned >= max_to_spawn:
             break
-        last_k = cooldown.get(int(k), 0.0)
+        last_k = cooldown.get(int(rank_k), 0.0)
         if (now - last_k) < COOLDOWN_S:
             continue
-        level = float(x01[k])
-        pos = _band_pos_led(k, n, ctx.LED_COUNT)
 
-        # hue pela posição da banda: grave->verde, médio->amarelo, agudo->magenta/azul
-        hue = (base_hue + int(255.0 * (k / max(1, n - 1)))) & 255
+        level = float(x01[rank_k])
+        pos = _band_pos_led(rank_k, n, ctx.LED_COUNT)
 
-        # direção: empurra para o lado mais "aberto" a partir do spawn
-        dir_right = (pos < (ctx.LED_COUNT * 0.5))
-        # aleatoriza um pouco
-        if np.random.random() < 0.2:
-            dir_right = not dir_right
+        # Direção alternada para espalhar (em vez de sempre "lado oposto")
+        dir_right = ((rank_k + flip_dir_seed) % 2) == 0
+
+        # Hue baseado na banda (fallback HSV) — se houver paleta, vamos usá-la no render
+        hue = (base_hue + int(255.0 * (rank_k / max(1, n - 1)))) & 255
 
         _spawn_comet(comets, pos, dir_right, level, hue, energy, base_speed=BASE_SPEED)
-        cooldown[int(k)] = now
+        cooldown[int(rank_k)] = now
         spawned += 1
 
-    # ---- atualização dos cometas ----
-    # fricção e decaimento suaves por segundo (ajustados por dt)
-    friction = 0.88
-    decay = 0.90
+    # --- cobertura por zonas: garante cometas “espalhados” pela fita inteira ---
+    ZONES = max(6, ctx.LED_COUNT // 60)  # 300 LEDs => 6+ zonas
+    seg = ctx.LED_COUNT / float(ZONES)
+    if len(comets) < (ZONES // 2):  # só se estiver ralo
+        # posições atuais para checar lacunas
+        if comets:
+            cur_pos = np.array([c[0] for c in comets], dtype=np.float32)
+        else:
+            cur_pos = np.array([], dtype=np.float32)
+
+        for z in range(ZONES):
+            if len(comets) >= MAX_COMETS or spawned >= max_to_spawn + 2:
+                break
+            z0 = z * seg
+            z1 = (z + 1) * seg
+            zc = 0.5 * (z0 + z1)
+
+            # se não houver cometa na zona, nasce um “coverage comet”
+            if cur_pos.size == 0 or np.all(np.abs(cur_pos - zc) > (0.35 * seg)):
+                dir_right = (z % 2 == 0)
+                # energia baixa/moderada -> evita estourar consumo
+                level = 0.35 + 0.45 * energy
+                hue = (base_hue + int(12 * z)) & 255  # varia levemente por zona
+                _spawn_comet(comets, zc, dir_right, level, hue, energy, base_speed=BASE_SPEED * (0.9 + 0.2 * energy))
+                spawned += 1
+
+    # --- atualização dos cometas (mais vida para cruzar a fita) ---
+    # fricção/decay suavizados para percursos longos; sigma cresce lento
+    friction = 0.93
+    decay = 0.94
     fr_dt = friction ** (dt * 40.0)
     dc_dt = decay ** (dt * 40.0)
 
+    # wrap-around opcional para sempre “usar a fita toda”
+    WRAP_AROUND = True
+
     for c in comets:
-        c[0] += c[1] * dt
-        c[1] *= fr_dt
-        c[2] *= dc_dt
-        c[4] *= (1.0 + 0.35 * dt)  # sigma aumenta levemente (rastro abre)
+        c[0] += c[1] * dt     # pos
+        c[1] *= fr_dt         # vel
+        c[2] *= dc_dt         # life
+        c[4] *= (1.0 + 0.28 * dt)  # sigma (rastro) abre suave
 
-    # remove mortos/fora da fita
-    comets[:] = [c for c in comets if (0 <= c[0] < ctx.LED_COUNT) and (c[2] > 0.05)]
+        if WRAP_AROUND:
+            # volta pelo outro lado; mantém life/vel — cria fluxo contínuo
+            if c[0] < 0.0:
+                c[0] += ctx.LED_COUNT
+            elif c[0] >= ctx.LED_COUNT:
+                c[0] -= ctx.LED_COUNT
 
-    # ---- render vetorizado ----
+    # remove apenas quando "fracos" (com wrap, não usamos corte por borda)
+    comets[:] = [c for c in comets if c[2] > 0.04]
+
+    # --- render vetorizado (com paleta opcional) ---
     rgb = np.zeros((ctx.LED_COUNT, 3), dtype=np.uint8)
     if comets:
-        base_sat = min(230, ctx.base_saturation)
-        # brilho base moderado: respeita cap/brightness (clamp ~190)
-        val_cap = 190
+        base_sat = min(235, ctx.base_saturation)
+        val_cap = 220
+        pal = getattr(ctx, "current_palette", None)
+        use_palette = isinstance(pal, (list, tuple)) and len(pal) >= 2
+        pal_arr = None
+        if use_palette:
+            pal_arr = np.asarray(pal, dtype=np.uint8)
+            m = pal_arr.shape[0]
+
         for pos, vel, life, hue, sigma in comets:
             dist = np.abs(idxs - float(pos))
-            sig = max(0.8, sigma)
-            glow = np.exp(-(dist * dist) / (2.0 * sig * sig)).astype(np.float32)
-            # intensidade por cometa (0..val_cap)
-            val = np.clip(val_cap * life * (0.40 + 0.60 * energy) * glow, 0, val_cap).astype(np.uint8)
+            # se wrap ativo, o "outro lado" pode estar mais perto
+            if WRAP_AROUND:
+                dist = np.minimum(dist, ctx.LED_COUNT - dist)
 
+            sig = max(0.9, sigma)
+            glow = np.exp(-(dist * dist) / (2.0 * sig * sig)).astype(np.float32)
+
+            # intensidade do rastro
+            val = np.clip(val_cap * life * (0.40 + 0.60 * energy) * glow, 0, val_cap).astype(np.uint8)
             if not active:
                 val = (val.astype(np.float32) * 0.85).astype(np.uint8)
 
-            # converte UMA vez a cor do cometa (HSV -> RGB), pico 255
-            rgb_peak = ctx.hsv_to_rgb_bytes_vec(
-                np.array([hue], dtype=np.uint8),
-                np.array([base_sat], dtype=np.uint8),
-                np.array([255], dtype=np.uint8)
-            )[0]  # shape (3,)
+            if use_palette:
+                # cor da paleta em função da posição (mapeia 0..LED_COUNT -> 0..m)
+                pos_norm = (pos / max(1.0, float(ctx.LED_COUNT))) * m
+                i0 = int(np.floor(pos_norm)) % m
+                i1 = (i0 + 1) % m
+                t = float(pos_norm - np.floor(pos_norm))
+                rgb_peak = (pal_arr[i0].astype(np.float32) * (1.0 - t) + pal_arr[i1].astype(np.float32) * t)
+                rgb_peak = np.clip(rgb_peak, 0, 255).astype(np.uint8)
+            else:
+                # fallback HSV (mesma lógica anterior)
+                rgb_peak = ctx.hsv_to_rgb_bytes_vec(
+                    np.array([hue], dtype=np.uint8),
+                    np.array([base_sat], dtype=np.uint8),
+                    np.array([255], dtype=np.uint8)
+                )[0]
 
-            # compõe canal a canal por 'max' com escala val/255
-            # (evita fazer HSV por LED)
+            # compõe por canal com 'max' (estável, evita branco/clip)
             for ch in range(3):
                 comp = (val.astype(np.uint16) * int(rgb_peak[ch]) // 255).astype(np.uint8)
                 rgb[:, ch] = np.maximum(rgb[:, ch], comp)
 
     ctx.to_pixels_and_show(rgb)
+
 
 # Alias amigável (caso queira referenciar por outro nome)
 effect_multicolor_comets = effect_multiband_comets
