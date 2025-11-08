@@ -296,3 +296,107 @@ def effect_bass_pulse_core(ctx, bands_u8, beat_flag, active):
 
     rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
     ctx.to_pixels_and_show(rgb)
+
+# ==== PEAK DOTS EXPANDED — USA TODA A FITA ====
+_peak_levels = None
+_peak_ema = np.zeros(1)  # evita alocação
+
+def effect_peak_dots_expanded(ctx, bands_u8, beat_flag, active):
+    """
+    Picos do espectro → pontos brilhantes espalhados pela fita.
+    - Mais pontos no meio/fim da fita
+    - Brilho proporcional à força do pico
+    - Pulso no beat
+    - Power-aware
+    """
+    global _peak_levels, _peak_ema
+    import numpy as np
+
+    n = len(bands_u8)
+    L = ctx.LED_COUNT
+    if n == 0 or L == 0:
+        ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.uint8))
+        return
+
+    # --- Atualiza níveis de pico (EMA por banda) ---
+    x = np.asarray(bands_u8, dtype=np.float32)
+    if _peak_levels is None or len(_peak_levels) != n:
+        _peak_levels = np.zeros(n, dtype=np.float32)
+    _peak_levels = np.maximum(_peak_levels * (0.88 if active else 0.75), x)
+
+    # --- Energia global para número de pontos ---
+    energy = float(np.mean(_peak_levels)) / 255.0
+    energy = np.clip(energy, 0.0, 1.0)
+    k_base = 6
+    k_max = 16
+    k = int(k_base + (k_max - k_base) * (energy ** 0.7))  # mais pontos com energia
+    k = min(k, n, L // 8)  # limite seguro
+
+    # --- Seleciona os k maiores picos ---
+    if k >= n:
+        idx = np.arange(n)
+    else:
+        idx = np.argpartition(_peak_levels, -k)[-k:]
+        idx = idx[np.argsort(-_peak_levels[idx])]
+
+    # --- Mapeamento NÃO-LINEAR: mais pontos no meio/fim ---
+    # Usa curva quadrática: bandas altas → LEDs mais para o fim
+    band_norm = idx.astype(np.float32) / max(1, n - 1)  # 0..1
+    led_norm = np.sqrt(band_norm)  # comprime graves, expande agudos
+    led_norm = 0.3 + 0.7 * led_norm  # 30% no início, 70% no fim
+    pos = (led_norm * (L - 1)).astype(np.int32)
+    pos = np.clip(pos, 0, L - 1)
+
+    # --- Brilho por ponto ---
+    peak_vals = _peak_levels[idx]
+    val_raw = peak_vals * 1.4  # ganho
+    if beat_flag:
+        val_raw *= 1.35
+    val_raw = np.clip(val_raw, 0, 255)
+
+    # --- Power cap ANTES do RGB ---
+    sum_v = float(np.sum(val_raw))
+    i_color_mA = (ctx.WS2812B_MA_PER_CHANNEL / 255.0) * sum_v * 3
+    i_idle_mA = ctx.WS2812B_IDLE_MA_PER_LED * L
+    i_budget_mA = ctx.CURRENT_BUDGET_A * 1000.0
+
+    scale = 1.0
+    if i_color_mA > 0 and (i_color_mA + i_idle_mA) > i_budget_mA:
+        scale = max(0.0, (i_budget_mA - i_idle_mA) / i_color_mA)
+
+    val = np.clip(val_raw * scale, 0, 255).astype(np.uint8)
+    val = np.maximum(val, ctx.dynamic_floor).astype(np.uint8)
+
+    # --- Render: pontos com halo gaussiano suave ---
+    rgb = np.zeros((L, 3), dtype=np.float32)
+    idxs = ctx.I_ALL.astype(np.float32)
+
+    base_hue = (ctx.base_hue_offset + (ctx.hue_seed >> 2)) % 256
+    base_sat = min(230, ctx.base_saturation)
+
+    for i in range(len(pos)):
+        p = float(pos[i])
+        v = float(val[i])
+        if v <= 0: continue
+
+        # Halo gaussiano (largura ~3-6 LEDs)
+        sigma = 2.0 + 2.0 * (v / 255.0)
+        dist = np.abs(idxs - p)
+        glow = np.exp(-0.5 * (dist / sigma)**2)
+        glow *= v
+
+        # Cor varia com posição (graves = quente, agudos = frio)
+        hue = (base_hue + int(60 * (p / (L - 1)))) % 256
+        sat = np.full_like(glow, base_sat, dtype=np.float32)
+
+        # Adiciona ao buffer (aditivo com cap)
+        contrib = ctx.hsv_to_rgb_bytes_vec(
+            np.full_like(glow, hue, dtype=np.uint8),
+            sat.astype(np.uint8),
+            np.clip(glow, 0, 255).astype(np.uint8)
+        ).astype(np.float32)
+
+        rgb = np.maximum(rgb, contrib)
+
+    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+    ctx.to_pixels_and_show(rgb)

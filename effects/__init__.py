@@ -20,6 +20,7 @@ from .clean import (
     effect_beat_outward_burst,
     effect_quantized_sections,
     effect_bass_pulse_core,
+    effect_peak_dots_expanded,
 )
 from .fire import (
     effect_clean_fire_edge_v3,
@@ -43,7 +44,7 @@ def build_effects(ctx):
         ("Spectral Blade (Clean)",      _wrap(ctx, effect_spectral_blade)),
 #        ("Bass Center Bloom (Clean)",   _wrap(ctx, effect_bass_center)),
         ("Bass Pulse Core (NEW)", _wrap(ctx, effect_bass_pulse_core)),
-        ("Peak Dots (Sparse)",          _wrap(ctx, effect_peak_dots)),
+        ("Peak Dots",          _wrap(ctx, effect_peak_dots_expanded,)),
         ("Centroid Comet (Clean)",      _wrap(ctx, effect_centroid_comet)),
         ("Beat Outward Burst",          _wrap(ctx, effect_beat_outward_burst)),
         ("Quantized Sections",          _wrap(ctx, effect_quantized_sections)),
