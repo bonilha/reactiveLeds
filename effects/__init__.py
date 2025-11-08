@@ -14,7 +14,7 @@ from .dynamics import (
 )
 from .clean import (
     effect_spectral_blade,
-    effect_bass_center_bloom,
+    effect_bass_center,
     effect_peak_dots,
     effect_centroid_comet,
     effect_beat_outward_burst,
@@ -40,7 +40,7 @@ def build_effects(ctx):
         ("Waterfall (Palette)",         _wrap(ctx, effect_waterfall)),
         ("Bass Ripple Pulse v2",        _wrap(ctx, effect_bass_ripple_pulse_v2)),
         ("Spectral Blade (Clean)",      _wrap(ctx, effect_spectral_blade)),
-        ("Bass Center Bloom (Clean)",   _wrap(ctx, effect_bass_center_bloom)),
+        ("Bass Center Bloom (Clean)",   _wrap(ctx, effect_bass_center)),
         ("Peak Dots (Sparse)",          _wrap(ctx, effect_peak_dots)),
         ("Centroid Comet (Clean)",      _wrap(ctx, effect_centroid_comet)),
         ("Beat Outward Burst",          _wrap(ctx, effect_beat_outward_burst)),

@@ -21,6 +21,29 @@ _bass_radius_ema = 0.0
 _beat_flash = 0.0
 
 def effect_bass_center_bloom(ctx, bands_u8, beat_flag, active):
+    import numpy as np
+    global _bass_radius_ema, _beat_flash
+
+    if beat_flag:
+        _beat_flash = 1.0
+    else:
+        _beat_flash *= 0.85
+
+    # --- guarda contra n == 0 ---
+    n = len(bands_u8)
+    if n == 0:
+        # apenas apaga suavemente o buffer (mantendo a estética)
+        dist = np.abs(ctx.I_ALL - ctx.CENTER)
+        core = np.clip((0 - dist * 3), 0, 255).astype(np.uint16)
+        v = ctx.amplify_quad(core)
+        v = ctx.apply_floor_vec(v, active, None)
+        hue = (ctx.base_hue_offset + (v >> 3) + (ctx.hue_seed >> 2)) % 256
+        sat = np.full(ctx.LED_COUNT, max(64, ctx.base_saturation - 40), dtype=np.uint8)
+        rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v.astype(np.uint8))
+        ctx.to_pixels_and_show(rgb)
+        return
+
+    # ... (resto da função original daqui pra frente, inalterado) ...
     global _bass_radius_ema, _beat_flash
     if beat_flag: _beat_flash = 1.0
     else: _beat_flash *= 0.85
