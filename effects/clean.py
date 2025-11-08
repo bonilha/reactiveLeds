@@ -502,4 +502,104 @@ def effect_centroid_comet_expanded(ctx, bands_u8, beat_flag, active):
     rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
     ctx.to_pixels_and_show(rgb)
 
+
+# ==== BEAT OUTWARD BURST — MELHORADO COM PALETAS ====
+_burst_state = {
+    "phase": 0.0,
+    "speed_ema": 0.0,
+    "energy_ema": 0.0,
+    "wave_buf": None
+}
+
+def effect_beat_outward_burst(ctx, bands_u8, beat_flag, active):
+    """
+    Explosão radial no beat com ondas suaves e paleta dinâmica.
+    - Usa ctx.current_palette se existir
+    - Reativo ao grave (velocidade, brilho)
+    - Power-aware
+    """
+    global _burst_state
+    import numpy as np, time
+
+    st = _burst_state
+    L = ctx.LED_COUNT
+    if st["wave_buf"] is None or st["wave_buf"].shape[0] != L:
+        st["wave_buf"] = np.zeros(L, dtype=np.float32)
+
+    # --- Energia dos graves ---
+    n = len(bands_u8)
+    low_n = max(8, n // 8)
+    low = np.asarray(bands_u8[:low_n], dtype=np.float32)
+    low_mean = float(np.mean(low))
+
+    st["energy_ema"] = 0.7 * st["energy_ema"] + 0.3 * low_mean
+    energy01 = np.clip(st["energy_ema"] / 255.0, 0.0, 1.0)
+
+    # --- Velocidade da onda (EMA) ---
+    target_speed = 60.0 + 180.0 * energy01
+    st["speed_ema"] = 0.8 * st["speed_ema"] + 0.2 * target_speed
+
+    # --- Beat trigger ---
+    if beat_flag:
+        st["phase"] = 0.0  # reinicia onda
+        st["speed_ema"] *= 1.4  # boost no beat
+
+    # --- Atualiza fase ---
+    dt = min(0.05, time.time() - getattr(st, "last_t", time.time()))
+    st["last_t"] = time.time()
+    st["phase"] += st["speed_ema"] * dt
+    if st["phase"] > L * 1.5:
+        st["phase"] = L * 1.5  # mantém brilho residual
+
+    # --- Onda gaussiana expansiva ---
+    d = np.abs(ctx.I_ALL.astype(np.float32) - ctx.CENTER)
+    radius = st["phase"]
+    sigma = max(8.0, radius * 0.25)
+    intensity = np.exp(-0.5 * ((d - radius) / max(1.0, sigma))**2)
+    intensity *= (180.0 + 75.0 * energy01)
+    if beat_flag:
+        intensity *= 1.5
+
+    v_raw = intensity
+    v_raw = np.clip(v_raw, 0.0, 255.0)
+
+    # --- POWER CAP ---
+    sum_v = float(np.sum(v_raw))
+    i_color_mA = (ctx.WS2812B_MA_PER_CHANNEL / 255.0) * sum_v * 3
+    i_idle_mA = ctx.WS2812B_IDLE_MA_PER_LED * L
+    i_budget_mA = ctx.CURRENT_BUDGET_A * 1000.0
+
+    scale = 1.0
+    if i_color_mA > 0 and (i_color_mA + i_idle_mA) > i_budget_mA:
+        scale = max(0.0, (i_budget_mA - i_idle_mA) / i_color_mA)
+
+    v = np.clip(v_raw * scale, 0, 255).astype(np.uint8)
+    v = ctx.apply_floor_vec(v, active, None)
+
+    # --- PALETA DINÂMICA ---
+    pal = getattr(ctx, "current_palette", None)
+    if isinstance(pal, (list, tuple)) and len(pal) >= 2:
+        pal_arr = np.asarray(pal, dtype=np.uint8)
+        m = pal_arr.shape[0]
+        t = time.time()
+        phase = (t * 0.3 + radius * 0.001) % m
+        idx0 = int(phase) % m
+        idx1 = (idx0 + 1) % m
+        frac = phase - int(phase)
+        c0 = pal_arr[idx0].astype(np.float32)
+        c1 = pal_arr[idx1].astype(np.float32)
+        base_rgb = c0 * (1.0 - frac) + c1 * frac
+        colored = base_rgb * (v.astype(np.float32) / 255.0)[:, None]
+        gray = v.astype(np.float32)[:, None]
+        s = ctx.base_saturation / 255.0
+        rgb_out = gray * (1.0 - s) + colored * s
+        rgb = np.clip(rgb_out, 0, 255).astype(np.uint8)
+    else:
+        # Fallback HSV
+        hue = (ctx.base_hue_offset + (d.astype(np.int32) * 80) // L + int(radius)) % 256
+        sat = np.full(L, max(190, ctx.base_saturation), dtype=np.uint8)
+        rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
+
+    ctx.to_pixels_and_show(rgb)
+
 # ==== FIM DO ARQUIVO effects/clean.py ====

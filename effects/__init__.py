@@ -18,10 +18,10 @@ from .clean import (
     effect_peak_dots,
     # effect_centroid_comet,
     effect_centroid_comet_expanded,
-    effect_beat_outward_burst,
     effect_quantized_sections,
     effect_bass_pulse_core,
     effect_peak_dots_expanded,
+    effect_beat_outward_burst,
 )
 from .fire import (
     effect_clean_fire_edge_v3,
