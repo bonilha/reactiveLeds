@@ -3,7 +3,7 @@ from .basics import (
     effect_line_spectrum,
     effect_mirror_spectrum,
     effect_rainbow_wave,
-    effect_energy_comets,
+    effect_multiband_comets,
 )
 from .dynamics import (
     effect_peak_hold_columns,
