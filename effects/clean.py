@@ -26,127 +26,111 @@ def effect_spectral_blade(ctx, bands_u8, beat_flag, active):
     rgb[ctx.CENTER + ctx.I_LEFT] = left_rgb
     ctx.to_pixels_and_show(rgb)
 
-# -- Bass Center Bloom (full-strip, palette, anti-NaN/overflow, mais reativo) --
-_bass_radius_ema = 0.0
-_beat_flash = 0.0
-_env_ema = 0.0
-
-# -- Bass Center Bloom (full-strip, palette, anti-NaN/overflow, mais reativo) --
+# -- Bass Center Bloom (OTIMIZADO: MÁXIMA REATIVIDADE + PUNCH VISUAL) --
 _bass_radius_ema = 0.0
 _beat_flash = 0.0
 _env_ema = 0.0
 
 def effect_bass_center_bloom(ctx, bands_u8, beat_flag, active):
     """
-    Bloom central reativo aos graves com cobertura da fita inteira.
-    - Corrige NaN/Inf (np.nan_to_num) e evita bases negativas em potências.
-    - Reatividade maior: ganho = base + env + transiente (+beat).
-    - Usa ctx.current_palette se existir; fallback HSV senão.
+    BLOOM CENTRAL ULTRA-REATIVO AOS GRAVES
+    - Resposta instantânea a kicks e bass drops
+    - Centro explode, halo se expande, cama larga pulsa
+    - Sem latência perceptível: EMA agressivo + ganho transiente
+    - Beat flash + hue shift + saturação dinâmica
     """
-    import numpy as np, time
+    import numpy as np
 
     global _bass_radius_ema, _beat_flash, _env_ema
 
-    # ----- BEAT FLASH (0..1) -----
-    _beat_flash = 1.0 if beat_flag else _beat_flash * 0.85
-    _beat_flash = float(np.clip(_beat_flash, 0.0, 1.0))
+    # ===== 1. BEAT FLASH (explosão imediata) =====
+    _beat_flash = 1.0 if beat_flag else max(0.0, _beat_flash - 0.35)  # Decay RÁPIDO
+    beat_boost = 1.0 + 1.8 * _beat_flash  # até +180% no beat!
 
-    # ----- GUARDAS -----
+    # ===== 2. GUARDAS =====
     n = len(bands_u8)
-    L = int(getattr(ctx, "LED_COUNT", 0))
+    L = ctx.LED_COUNT
     if n == 0 or L <= 0:
         ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.uint8))
         return
 
-    # ----- ENERGIA: ENVELOPE + TRANSIENTE -----
+    # ===== 3. ENERGIA DOS GRAVES (ATAQUE ULTRA-RÁPIDO) =====
     low_n = max(8, n // 8)
     low = np.asarray(bands_u8[:low_n], dtype=np.float32)
-    low_mean = float(np.mean(low))                    # 0..255
-    _env_ema = 0.75 * float(_env_ema) + 0.25 * low_mean
-    env01 = float(np.clip(_env_ema / 255.0, 0.0, 1.0))
-    trans = float(np.clip((low_mean - _env_ema) / 255.0, 0.0, 1.0))
+    low_mean = float(np.mean(low))
 
-    # ----- RAIO (EMA) -----
-    target_radius = float(np.clip((low_mean / 255.0) * (ctx.CENTER * 0.95),
-                                  0.0, float(ctx.CENTER)))
-    _bass_radius_ema = 0.80 * float(_bass_radius_ema) + 0.20 * target_radius
-    radius = float(np.clip(_bass_radius_ema, 0.0, float(ctx.CENTER)))
+    # EMA com ataque 90%, release 40% → responde em <50ms
+    attack_alpha = 0.90
+    release_alpha = 0.40
+    alpha = attack_alpha if low_mean > _env_ema else release_alpha
+    _env_ema = alpha * low_mean + (1.0 - alpha) * _env_ema
 
-    # ----- PERFIS ESPACIAIS (float32) -----
-    idx = ctx.I_ALL.astype(np.float32)
-    d = np.abs(idx - float(ctx.CENTER))
+    env01 = np.clip(_env_ema / 255.0, 0.0, 1.0)
+    trans = max(0.0, (low_mean - _env_ema) / 255.0)  # transiente puro
 
-    # Core: triângulo 0..1
-    base_w = max(1.0, radius)
-    body = np.clip(1.0 - (d / base_w), 0.0, 1.0).astype(np.float32)
+    # ===== 4. RAIO DINÂMICO (CENTRO EXPLODE COM BASS) =====
+    max_radius = ctx.CENTER * 1.3  # permite overflow além do centro
+    target_radius = (low_mean / 255.0) * max_radius
+    _bass_radius_ema = 0.65 * _bass_radius_ema + 0.35 * target_radius  # ultra responsivo
+    radius = np.clip(_bass_radius_ema, 1.0, max_radius)
 
-    # Halo: gaussiano 0..1 (divisor mínimo evita NaN)
-    sigma = 0.35 * max(6.0, radius)
-    halo = np.exp(-0.5 * (d / max(1e-3, sigma))**2).astype(np.float32)
+    # ===== 5. PERFIS ESPACIAIS (OTIMIZADOS) =====
+    d = np.abs(ctx.I_ALL.astype(np.float32) - ctx.CENTER)
 
-    # Wide bed: raised-cosine 0..1 (garante base >=0 antes do power)
-    cos_arg = (d / max(1.0, float(ctx.CENTER))) * (np.pi * 0.5)
-    cos_clip = np.clip(cos_arg, 0.0, np.pi * 0.5)
-    cos_val  = np.cos(cos_clip)
-    cos_val  = np.nan_to_num(cos_val, nan=0.0, posinf=0.0, neginf=0.0)
-    cos_val  = np.maximum(cos_val, 0.0).astype(np.float32)
-    wide = (cos_val ** 1.2).astype(np.float32)  # expoente mais suave (evita warning)
+    # Core: triângulo largo + punch
+    body = np.clip(1.0 - (d / radius), 0.0, 1.0)
 
-    # ----- GANHOS / COMPOSIÇÃO (mais reativos) -----
-    # Ajuste fácil: aumente/diminua estes coeficientes para calibrar o "punch"
-    AMP_BASE = 50.0
-    AMP_ENV  = 170.0   # ganho pelo envelope (lento)
-    AMP_TRANS= 180.0   # ganho pelo transiente (rápido)
-    BEAT_BOOST = 1.12
+    # Halo: gaussiano largo e reativo
+    sigma = 0.45 * radius
+    halo = np.exp(-0.5 * (d / np.maximum(1e-3, sigma))**2)
 
-    amp = AMP_BASE + AMP_ENV * env01 + AMP_TRANS * trans
-    if beat_flag:
-        amp *= BEAT_BOOST
-    amp = float(np.clip(amp, 0.0, 240.0))
+    # Wide bed: raised-cosine com punch
+    cos_arg = (d / ctx.CENTER) * (np.pi * 0.5)
+    wide = np.cos(np.clip(cos_arg, 0.0, np.pi * 0.5))
+    wide = np.maximum(wide, 0.0) ** 1.1
 
-    CORE_W = 0.55 + 0.35 * trans + 0.10 * env01   # 0.55..1.0 (abre no ataque)
-    HALO_W = 0.22 + 0.20 * env01                  # 0.22..0.42 (enche em energia)
-    BED_GAIN = (10.0 + 55.0 * env01)              # cama larga mais discreta
-    BG_GAIN  = (4.0  + 12.0 * env01)              # fundo uniforme leve
+    # ===== 6. GANHO DINÂMICO (PUNCH INSANO) =====
+    AMP_BASE   = 80.0
+    AMP_ENV    = 220.0   # envelope sustenta
+    AMP_TRANS  = 280.0   # transiente = KICK VISUAL
+    AMP_BEAT   = 1.0 + 2.2 * _beat_flash  # flash massivo
 
-    v_core = amp * (CORE_W * body + HALO_W * halo)
-    v_bed  = BED_GAIN * wide
-    v_bg   = BG_GAIN
+    amp = (AMP_BASE + AMP_ENV * env01 + AMP_TRANS * trans) * beat_boost
+    amp = np.clip(amp, 0.0, 255.0)
 
-    v = np.clip(v_core + v_bed + v_bg, 0, 255).astype(np.float32)
+    # Pesos dinâmicos: core domina no ataque
+    CORE_W = 0.7 + 0.3 * trans
+    HALO_W = 0.3 + 0.25 * env01
+    BED_GAIN = 15.0 + 70.0 * env01
+    BG_GAIN  = 8.0 + 20.0 * env01
 
-    # ----- BOOST DE REATIVIDADE -----
-    # Aumentar amplificação geral para mais "punch" nos graves
-    v = v * 1.5  # Multiplicador global para intensificar o bloom
-    v = np.clip(v, 0, 255).astype(np.float32)
+    # ===== 7. COMPOSIÇÃO FINAL (BRILHO EXPLOSIVO) =====
+    v = amp * (CORE_W * body + HALO_W * halo) + BED_GAIN * wide + BG_GAIN
+    v = np.clip(v * 1.6, 0, 255).astype(np.float32)  # boost global
 
-    # Reduzir decay do EMA para resposta mais rápida
-    _env_ema = 0.60 * float(_env_ema) + 0.40 * low_mean  # Ajuste alpha para mais attack
-
-    # Aumentar raio para mais "center bloom"
-    target_radius = float(np.clip((low_mean / 255.0) * (ctx.CENTER * 1.2), 0.0, float(ctx.CENTER)))  # Raio maior
-    _bass_radius_ema = 0.70 * float(_bass_radius_ema) + 0.30 * target_radius  # Mais responsivo
-
-    # ----- COR: PALETTE OU HSV -----
-    v_u8 = np.clip(v, 0, 255).astype(np.uint8)
+    # ===== 8. CORES REATIVAS =====
+    v_u8 = v.astype(np.uint8)
     v_u8 = ctx.apply_floor_vec(v_u8, active, None)
 
-    # Hue baseado na posição para variação (reativo ao seed)
-    frac = d / max(1.0, float(ctx.CENTER))
-    hue_base = ctx.base_hue_offset + (ctx.hue_seed >> 2) + (frac * 48.0).astype(np.int32)
-    hue = (hue_base + (v_u8 >> 3)) % 256
-    sat = np.full(L, ctx.base_saturation, dtype=np.uint8)
+    # Hue: centro quente (vermelho/laranja), bordas frias + variação com bass
+    hue_center = (ctx.base_hue_offset + (ctx.hue_seed >> 2) + 20) % 256
+    hue_edges  = (hue_center + 80) % 256
+    hue_grad = hue_center + (d / ctx.CENTER) * (hue_edges - hue_center)
+    hue = (hue_grad + (v_u8 >> 2) + (32 if beat_flag else 0)) % 256
 
-    # Boost no beat: flash mais forte
+    # Saturação: alta no centro, cai nas bordas
+    sat = np.clip(ctx.base_saturation + 40 - (d / ctx.CENTER) * 60, 120, 255).astype(np.uint8)
+
+    # Beat flash: branco quente + saturação máxima
     if beat_flag:
-        v_u8 = np.clip(v_u8 * 1.3, 0, 255).astype(np.uint8)
-        hue = (hue + 32) % 256  # Shift de cor no beat para feedback visual
+        v_u8 = np.clip(v_u8.astype(np.float32) * 1.5, 0, 255).astype(np.uint8)
+        hue = (hue + 40) % 256
+        sat = np.full(L, 255, dtype=np.uint8)
 
+    # ===== 9. RENDER FINAL =====
     rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v_u8)
-
-    # ----- RENDER -----
     ctx.to_pixels_and_show(rgb)
-
+    
 
 # Alias para compatibilidade
 def effect_bass_center(ctx, bands_u8, beat_flag, active):
