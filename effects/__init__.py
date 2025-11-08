@@ -42,6 +42,7 @@ def build_effects(ctx):
         ("Bass Ripple Pulse v2",        _wrap(ctx, effect_bass_ripple_pulse_v2)),
         ("Spectral Blade (Clean)",      _wrap(ctx, effect_spectral_blade)),
 #        ("Bass Center Bloom (Clean)",   _wrap(ctx, effect_bass_center)),
+        ("Bass Pulse Core (NEW)", _wrap(ctx, effect_bass_pulse_core)),
         ("Peak Dots (Sparse)",          _wrap(ctx, effect_peak_dots)),
         ("Centroid Comet (Clean)",      _wrap(ctx, effect_centroid_comet)),
         ("Beat Outward Burst",          _wrap(ctx, effect_beat_outward_burst)),
