@@ -30,65 +30,84 @@ def effect_spectral_blade(ctx, bands_u8, beat_flag, active):
 _bass_radius_ema = 0.0
 _beat_flash = 0.0
 
+# -- Bass Center Bloom (full-strip, palette, anti-overflow) --
+_bass_radius_ema = 0.0
+_beat_flash = 0.0
+
 def effect_bass_center_bloom(ctx, bands_u8, beat_flag, active):
     """
-    Bloom central reativo aos graves.
-    Implementação segura (float32) com caps em todas as etapas para evitar OverflowError,
-    usando a fita toda, e com colorização por paleta (se ctx.current_palette existir).
+    Bloom central reativo aos graves com cobertura da fita inteira:
+      V_total = Core(tri) + Halo(gauss) + WideBed(energetico) + BG(energia)
+    - Usa ctx.current_palette se existir; fallback HSV senão.
+    - Float32 + caps para evitar OverflowError e flick.
     """
-    import time
+    import numpy as np, time
 
     global _bass_radius_ema, _beat_flash
 
-    # flash curto no beat (clamp 0..1)
+    # --- flash curto no beat (clamp 0..1) ---
     if beat_flag:
         _beat_flash = 1.0
     else:
         _beat_flash *= 0.85
     _beat_flash = float(np.clip(_beat_flash, 0.0, 1.0))
 
-    # guarda contra pacote vazio
+    # --- guardas ---
     n = len(bands_u8)
-    if n == 0 or ctx.LED_COUNT <= 0:
-        ctx.to_pixels_and_show(np.zeros((ctx.LED_COUNT, 3), dtype=np.uint8))
-        return
+    L = int(getattr(ctx, "LED_COUNT", 0))
+    if n == 0 or L <= 0:
+        ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.uint8)); return
 
-    # energia de graves -> raio alvo
+    # --- energia de graves -> raio + energia normalizada ---
     low_n = max(8, n // 8)
     low = np.asarray(bands_u8[:low_n], dtype=np.float32)
     low_mean = float(np.mean(low))  # 0..255
+    e01 = float(np.clip(low_mean / 255.0, 0.0, 1.0))
 
     target_radius = float(np.clip((low_mean / 255.0) * (ctx.CENTER * 0.95), 0.0, float(ctx.CENTER)))
     _bass_radius_ema = 0.80 * float(_bass_radius_ema) + 0.20 * target_radius
     radius = float(np.clip(_bass_radius_ema, 0.0, float(ctx.CENTER)))
 
-    # perfil radial: corpo (triângulo) + halo (gaussiano)
+    # --- perfis espaciais ---
     idx = ctx.I_ALL.astype(np.float32)
     d = np.abs(idx - float(ctx.CENTER))  # distância ao centro
 
+    # Core: triângulo normalizado (0..1) com base ~2*radius
     base_w = max(1.0, radius)
     body = np.clip(1.0 - (d / base_w), 0.0, 1.0).astype(np.float32)
 
+    # Halo: gaussiano suave que cresce com o raio/energia
     sigma = 0.35 * max(6.0, radius)
     halo = np.exp(-0.5 * (d / max(1e-3, sigma))**2).astype(np.float32)
 
-    e01 = float(np.clip(low_mean / 255.0, 0.0, 1.0))
-    shape = np.clip(0.65 * body + 0.35 * halo, 0.0, 1.0).astype(np.float32)
+    # Wide bed: camada larga cobrindo a fita inteira
+    # - raised-cosine leve (0..1, sempre >0 exceto extremos) + energia
+    # - dá presença nas bordas mesmo com radius pequeno
+    cos_arg = (d / max(1.0, float(ctx.CENTER))) * (np.pi * 0.5)  # 0..pi/2
+    wide = (np.cos(np.clip(cos_arg, 0.0, np.pi * 0.5)) ** 1.4).astype(np.float32)  # 0..1
 
-    # ganho: 80..220 + pulso no beat
+    # --- ganhos / composição (todos float32) ---
+    # ganho base mais estável, com leve pulso no beat
     base_amp = 80.0 + 140.0 * e01
-    amp = float(np.clip(base_amp * (1.0 + 0.25 * _beat_flash), 0.0, 235.0))
+    amp = float(np.clip(base_amp * (1.0 + 0.22 * _beat_flash), 0.0, 230.0))
 
-    # brilho por LED (float32 0..255)
-    v_f = np.clip(shape * amp, 0.0, 235.0).astype(np.float32)
+    v_core = amp * (0.55 * body + 0.35 * halo)                     # centro
+    v_bed  = (25.0 + 90.0 * e01) * wide                            # cama larga
+    v_bg   = (10.0 + 25.0 * e01)                                   # uniforme
 
-    # piso dinâmico (canal-agnóstico)
+    v_f = v_core + v_bed + v_bg
+    if not active:
+        v_f *= 0.90  # um pouco mais discreto em idle
+
+    # piso dinâmico
     floor = float(getattr(ctx, "dynamic_floor", 0))
     if floor > 0:
-        v_f = np.maximum(v_f, floor).astype(np.float32)
+        v_f = np.maximum(v_f, floor)
+
+    # cap global antes de colorir (anti-clipping/anti-cap duro)
+    v_f = np.clip(v_f, 0.0, 240.0).astype(np.float32)
 
     # ---------- COR ----------
-    # 1) paleta se houver, 2) fallback HSV
     pal = getattr(ctx, "current_palette", None)
     use_pal = isinstance(pal, (list, tuple)) and len(pal) >= 2
 
@@ -96,9 +115,10 @@ def effect_bass_center_bloom(ctx, bands_u8, beat_flag, active):
         pal_arr = np.asarray(pal, dtype=np.uint8)
         m = pal_arr.shape[0]
 
+        # varrer paleta ao longo do strip + leve animação no tempo
         t = time.time()
-        phase = (t * 0.08) * m
-        pos = ((idx / max(1.0, float(ctx.LED_COUNT))) * m + phase) % m
+        phase = (t * 0.07) * m + (0.25 * m * _beat_flash)
+        pos = ((idx / max(1.0, float(L))) * m + phase) % m
 
         i0 = np.floor(pos).astype(np.int32) % m
         i1 = (i0 + 1) % m
@@ -108,27 +128,28 @@ def effect_bass_center_bloom(ctx, bands_u8, beat_flag, active):
         c1 = pal_arr[i1].astype(np.float32)
         base_rgb = (c0 * (1.0 - frac) + c1 * frac)  # 0..255
 
+        # respeita saturação base
         sat_base = int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255))
         s = sat_base / 255.0
         v_col = (v_f[:, None] / 255.0) * base_rgb
-        gray = v_f[:, None]
-        out = gray * (1.0 - s) + v_col * s
-        rgb = np.clip(out, 0, 255).astype(np.uint8)
+        gray  = v_f[:, None]
+        out   = gray * (1.0 - s) + v_col * s
+        rgb   = np.clip(out, 0, 255).astype(np.uint8)
 
     else:
+        # HSV: hue com variação temporal + espacial (evita monocromia)
         t = time.time()
-        h_time = int((t * 35.0) % 256)
-        h_spatial = ((ctx.I_ALL.astype(np.int32) * 256) // max(1, ctx.LED_COUNT))
+        h_time = int((t * 32.0) % 256)
+        h_spatial = ((ctx.I_ALL.astype(np.int32) * 256) // max(1, L))
         hue = (int(ctx.base_hue_offset) + (int(ctx.hue_seed) >> 2) + h_time + h_spatial) % 256
-
-        sat = np.full(ctx.LED_COUNT, int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255)),
-                      dtype=np.uint8)
+        sat = np.full(L, int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255)), dtype=np.uint8)
         v_u8 = np.clip(v_f, 0.0, 255.0).astype(np.uint8)
         rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v_u8)
 
-    # leve cap final
-    rgb = np.clip(rgb, 0, 250).astype(np.uint8)
+    # cap final moderado
+    rgb = np.clip(rgb, 0, 245).astype(np.uint8)
     ctx.to_pixels_and_show(rgb)
+
 
 # Alias para compatibilidade
 def effect_bass_center(ctx, bands_u8, beat_flag, active):
