@@ -31,8 +31,7 @@ _bass_radius_ema = 0.0
 _beat_flash = 0.0
 _env_ema = 0.0
 
-
-# -- Bass Center Bloom (fix anti-NaN + reatividade) --
+# -- Bass Center Bloom (full-strip, palette, anti-NaN/overflow, mais reativo) --
 _bass_radius_ema = 0.0
 _beat_flash = 0.0
 _env_ema = 0.0
@@ -114,62 +113,38 @@ def effect_bass_center_bloom(ctx, bands_u8, beat_flag, active):
     v_bed  = BED_GAIN * wide
     v_bg   = BG_GAIN
 
-    v_f = v_core + v_bed + v_bg
-    if not active:
-        v_f *= 0.90
+    v = np.clip(v_core + v_bed + v_bg, 0, 255).astype(np.float32)
 
-    # Piso dinâmico
-    floor = float(getattr(ctx, "dynamic_floor", 0))
-    if floor > 0.0:
-        v_f = np.maximum(v_f, floor)
+    # ----- BOOST DE REATIVIDADE -----
+    # Aumentar amplificação geral para mais "punch" nos graves
+    v = v * 1.5  # Multiplicador global para intensificar o bloom
+    v = np.clip(v, 0, 255).astype(np.float32)
 
-    # Anti-NaN/Inf + caps antes do cast
-    v_f = np.nan_to_num(v_f, nan=0.0, posinf=240.0, neginf=0.0).astype(np.float32)
-    v_f = np.clip(v_f, 0.0, 240.0).astype(np.float32)
+    # Reduzir decay do EMA para resposta mais rápida
+    _env_ema = 0.60 * float(_env_ema) + 0.40 * low_mean  # Ajuste alpha para mais attack
 
-    # Curva de resposta para dar mais "punch" em níveis baixos (γ < 1)
-    v_norm = np.clip(v_f / 240.0, 0.0, 1.0).astype(np.float32)
-    v_norm = np.power(v_norm, 0.85, dtype=np.float32)  # mais reativo em baixo nível
-    v_f = (v_norm * 240.0).astype(np.float32)
+    # Aumentar raio para mais "center bloom"
+    target_radius = float(np.clip((low_mean / 255.0) * (ctx.CENTER * 1.2), 0.0, float(ctx.CENTER)))  # Raio maior
+    _bass_radius_ema = 0.70 * float(_bass_radius_ema) + 0.30 * target_radius  # Mais responsivo
 
-    # ----- COR -----
-    pal = getattr(ctx, "current_palette", None)
-    use_pal = isinstance(pal, (list, tuple)) and len(pal) >= 2
+    # ----- COR: PALETTE OU HSV -----
+    v_u8 = np.clip(v, 0, 255).astype(np.uint8)
+    v_u8 = ctx.apply_floor_vec(v_u8, active, None)
 
-    if use_pal:
-        pal_arr = np.asarray(pal, dtype=np.uint8)
-        m = pal_arr.shape[0]
+    # Hue baseado na posição para variação (reativo ao seed)
+    frac = d / max(1.0, float(ctx.CENTER))
+    hue_base = ctx.base_hue_offset + (ctx.hue_seed >> 2) + (frac * 48.0).astype(np.int32)
+    hue = (hue_base + (v_u8 >> 3)) % 256
+    sat = np.full(L, ctx.base_saturation, dtype=np.uint8)
 
-        t = time.time()
-        phase = (t * 0.07) * m + (0.20 * m * _beat_flash)
-        posc = ((idx / max(1.0, float(L))) * m + phase) % m
+    # Boost no beat: flash mais forte
+    if beat_flag:
+        v_u8 = np.clip(v_u8 * 1.3, 0, 255).astype(np.uint8)
+        hue = (hue + 32) % 256  # Shift de cor no beat para feedback visual
 
-        i0 = np.floor(posc).astype(np.int32) % m
-        i1 = (i0 + 1) % m
-        frac = (posc - np.floor(posc)).astype(np.float32)[:, None]
+    rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v_u8)
 
-        c0 = pal_arr[i0].astype(np.float32)
-        c1 = pal_arr[i1].astype(np.float32)
-        base_rgb = (c0 * (1.0 - frac) + c1 * frac)  # 0..255
-
-        sat_base = int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255))
-        s = sat_base / 255.0
-        v_col = (v_f[:, None] / 255.0) * base_rgb
-        gray  = v_f[:, None]
-        out   = gray * (1.0 - s) + v_col * s
-        rgb   = np.clip(np.nan_to_num(out, nan=0.0, posinf=255.0, neginf=0.0), 0, 255).astype(np.uint8)
-
-    else:
-        t = time.time()
-        h_time = int((t * 30.0) % 256)
-        h_spatial = ((ctx.I_ALL.astype(np.int32) * 256) // max(1, L))
-        hue = (int(ctx.base_hue_offset) + (int(ctx.hue_seed) >> 2) + h_time + h_spatial) % 256
-        sat = np.full(L, int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255)), dtype=np.uint8)
-        v_u8 = np.clip(np.nan_to_num(v_f, nan=0.0, posinf=255.0, neginf=0.0), 0.0, 255.0).astype(np.uint8)
-        rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v_u8)
-
-    # Cap final moderado
-    rgb = np.clip(rgb, 0, 245).astype(np.uint8)
+    # ----- RENDER -----
     ctx.to_pixels_and_show(rgb)
 
 
