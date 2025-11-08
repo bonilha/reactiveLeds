@@ -45,86 +45,62 @@ def effect_full_strip_pulse(ctx, bands_u8, beat_flag, active):
     rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
     ctx.to_pixels_and_show(rgb)
 
-# Waterfall reativo melhorado: shift descendente com rainbow por freq + fade suave (fix anti-branco)
+
+# Waterfall clássico reativo: espectro full mapeado por LED, shift down com decay longo (enche strip)
 _water = None
-_water_decay = None
 
 def effect_waterfall(ctx, bands_u8, beat_flag, active):
-    global _water, _water_decay
+    global _water
     if _water is None or _water.shape[0] != ctx.LED_COUNT:
         _water = np.zeros((ctx.LED_COUNT, 3), dtype=np.uint8)
-        _water_decay = np.ones(ctx.LED_COUNT, dtype=np.float32)  # buffer de decaimento por linha
-        print("[DEBUG] Waterfall init: buffers criados para {} LEDs".format(ctx.LED_COUNT))  # <-- Debug init
+        print("[INFO] Waterfall init: buffers para {} LEDs WS2812B".format(ctx.LED_COUNT))  # Único print, pra confirmar
 
     n = len(bands_u8)
     if n == 0:
-        # Idle: fade out suave
-        _water *= 0.92
-        _water_decay *= 0.95
+        _water = (_water.astype(np.float32) * 0.92).astype(np.uint8)  # Fade idle
         ctx.to_pixels_and_show(_water)
         return
 
-    print("[DEBUG] Waterfall frame: n_bands={}, beat={}, active={}, sample_max={}".format(  # <-- Debug frame
-        n, beat_flag, active, np.max(bands_u8) if n > 0 else 0))  # Mostra pico pra checar reatividade
-
-    # Usa mais bandas pra reatividade full (não só graves)
-    limit = min(32, n)  # mids/highs inclusos
-    arr = np.asarray(bands_u8[:limit], dtype=np.float32)
-    maxv = float(np.max(arr)) if limit else 0.0
-    meanv = float(np.mean(arr)) if limit else 0.0
-    combined = (maxv * 1.5 + meanv) / 2.5
-    scaled = np.clip(combined * 1.2, 0, 255)
-    v_base = min(255, int(scaled))
-    if beat_flag:
-        v_base = min(255, int(v_base * 1.3))
-
-    # Saturação FIXA alta (200-255) pra ZERAR branco – cai só 10 em idle
-    base_sat = 220 if active else 180  # Força cor vibrante, ignora base_saturation se baixo
-    sat = np.clip(base_sat, 200, 255)  # Mínimo 200: HSV nunca vira branco
-
-    # Hue: base + rainbow por freq + variação por LED no shift (descendente colorido)
-    hue_base = (ctx.base_hue_offset + (ctx.hue_seed >> 1) + (v_base >> 3)) % 256
-    freq_hue_offset = int((np.mean(np.arange(limit) * arr / np.sum(arr + 1e-6)) * 3) % 256) if np.sum(arr) > 0 else 0
-    hue = (hue_base + freq_hue_offset) % 256
-
-    # Cor do "topo" (input atual) – agora com sat forçada
-    color = ctx.hsv_to_rgb_bytes_vec(
-        np.array([hue], dtype=np.uint8),
-        np.array([sat], dtype=np.uint8),  # Sat fixa alta
-        np.array([v_base], dtype=np.uint8)
-    )[0]
-    print("[DEBUG] Cor topo: hue={}, sat={}, v={}, RGB={}".format(hue, sat, v_base, color))  # <-- Debug cor (deve ter R/G/B !=255 todos)
-
-    # Shift descendente variável (mais rápido em beat)
-    shift = 2 + (1 if beat_flag else 0)  # Aumentei pra 2-3: mais "queda" fluida no serial WS2812B
-    if shift > 0:
-        _water[shift:] = _water[:-shift]
-        _water_decay[shift:] = _water_decay[:-shift]
-
-    # Preenche topo com fade linear + rainbow por linha (evita step, adiciona cor descendente)
-    for j in range(shift):
-        fade_factor = (shift - j) / float(shift)  # 1.0 recente, 0.0 velho
-        line_hue = (hue + (j * 8)) % 256  # Rainbow descendente: +8 por linha pra cor gradual
-        line_color = ctx.hsv_to_rgb_bytes_vec(
-            np.array([line_hue], dtype=np.uint8),
-            np.array([sat], dtype=np.uint8),
-            np.array([int(v_base * fade_factor)], dtype=np.uint8)
-        )[0]
-        faded_color = (line_color.astype(np.float32) * _water_decay[j] * 0.95).astype(np.uint8)  # Atenua extra
-        _water[j] = faded_color
-
-    # Decaimento global suave por linha (simula "queda" e evita acúmulo)
-    if active:
-        decay_rate = 0.94  # Lento pra rastro, mas mais agressivo que antes
+    # Mapeia bands pra LEDs: interpola v por posição (geomspace freq pra hue natural)
+    arr = np.asarray(bands_u8, dtype=np.float32)
+    if n < 2:
+        v_row = np.full(ctx.LED_COUNT, arr[0] if n else 0, dtype=np.float32)
     else:
-        decay_rate = 0.82  # Rápido em idle
-    _water_decay[:shift] = 1.0  # Reset topo
-    _water *= decay_rate
-    _water_decay *= decay_rate
+        # Posições bandas (geomspace pra low freq mais resolução)
+        band_pos = np.logspace(0, 1, n, dtype=np.float32)  # Espaça low freq mais
+        led_pos = np.arange(ctx.LED_COUNT, dtype=np.float32)
+        v_row = np.interp(led_pos, band_pos * (ctx.LED_COUNT / band_pos[-1]), arr)
 
-    # Floor e show (cap power no fxcore.py cuida do resto)
+    # Boost beat e amplify suave (sem quad excessivo, pra evitar sat=0)
+    if beat_flag:
+        v_row *= 1.3
+    v_row = np.clip(v_row * 1.1, 0, 255).astype(np.uint16)  # Ganho linear
+    v_row = ctx.amplify_quad(v_row)  # Mantém do original, mas clip pós
+
+    # Hue por posição: low freq (esq)=vermelho (0), high (dir)=ciano/azul (180-240)
+    hue_row = ((led_pos / ctx.LED_COUNT) * 180 + 30).astype(np.uint8)  # Vermelho-esq → azul-dir
+    hue_row = (ctx.base_hue_offset + hue_row + (ctx.hue_seed >> 2)) % 256
+
+    # Sat alta fixa (200+), cai só em idle pra cor sempre vibrante
+    sat_row = np.full(ctx.LED_COUNT, 230 if active else 180, dtype=np.uint8)
+
+    # Nova row full: HSV por LED
+    new_row = ctx.hsv_to_rgb_bytes_vec(hue_row, sat_row, v_row.astype(np.uint8))
+
+    # Shift down: novo no topo (0), velho pro fundo (simula queda vertical)
+    shift = 1  # Suave @30FPS, serial WS2812B aguenta sem lag
+    if shift > 0:
+        _water[shift:] = _water[:-shift]  # Move down
+        _water[:shift] = new_row[:shift]  # Preenche topo (só 1 linha, mas full espectro)
+
+    # Decay global longo: rastro visível, enche strip em ~5-10s
+    decay = 0.98 if active else 0.90  # Lento pra histórico, rápido idle
+    _water = (_water.astype(np.float32) * decay).astype(np.uint8)
+
+    # Floor e render (cap power em fxcore cuida do 18A max)
     _water = ctx.apply_floor_vec(_water.astype(np.uint16), active, None).astype(np.uint8)
     ctx.to_pixels_and_show(_water)
+
 
 # Bass Ripple Pulse v2 (anel gaussiano)
 class _Ripple:
