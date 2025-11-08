@@ -31,91 +31,108 @@ _bass_radius_ema = 0.0
 _beat_flash = 0.0
 _env_ema = 0.0
 
+
+# -- Bass Center Bloom (fix anti-NaN + reatividade) --
+_bass_radius_ema = 0.0
+_beat_flash = 0.0
+_env_ema = 0.0
+
 def effect_bass_center_bloom(ctx, bands_u8, beat_flag, active):
     """
     Bloom central reativo aos graves com cobertura da fita inteira.
-    - Anti-NaN/overflow: caps e np.nan_to_num antes de cast.
-    - Mais reativo: ganho guiado por envelope + transiente (subida de graves).
+    - Corrige NaN/Inf (np.nan_to_num) e evita bases negativas em potências.
+    - Reatividade maior: ganho = base + env + transiente (+beat).
     - Usa ctx.current_palette se existir; fallback HSV senão.
     """
     import numpy as np, time
 
     global _bass_radius_ema, _beat_flash, _env_ema
 
-    # --- beat flash (0..1) ---
+    # ----- BEAT FLASH (0..1) -----
     _beat_flash = 1.0 if beat_flag else _beat_flash * 0.85
     _beat_flash = float(np.clip(_beat_flash, 0.0, 1.0))
 
-    # --- guardas ---
+    # ----- GUARDAS -----
     n = len(bands_u8)
     L = int(getattr(ctx, "LED_COUNT", 0))
     if n == 0 or L <= 0:
         ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.uint8))
         return
 
-    # --- graves: média + envelope + transiente ---
+    # ----- ENERGIA: ENVELOPE + TRANSIENTE -----
     low_n = max(8, n // 8)
     low = np.asarray(bands_u8[:low_n], dtype=np.float32)
-    low_mean = float(np.mean(low))                         # 0..255
-    _env_ema = 0.75 * float(_env_ema) + 0.25 * low_mean    # envelope mais estável
+    low_mean = float(np.mean(low))                    # 0..255
+    _env_ema = 0.75 * float(_env_ema) + 0.25 * low_mean
     env01 = float(np.clip(_env_ema / 255.0, 0.0, 1.0))
-    # transiente = “subida” instantânea acima do envelope (0..1)
     trans = float(np.clip((low_mean - _env_ema) / 255.0, 0.0, 1.0))
 
-    # --- raio (suavizado) ---
-    target_radius = float(np.clip((low_mean / 255.0) * (ctx.CENTER * 0.95), 0.0, float(ctx.CENTER)))
+    # ----- RAIO (EMA) -----
+    target_radius = float(np.clip((low_mean / 255.0) * (ctx.CENTER * 0.95),
+                                  0.0, float(ctx.CENTER)))
     _bass_radius_ema = 0.80 * float(_bass_radius_ema) + 0.20 * target_radius
     radius = float(np.clip(_bass_radius_ema, 0.0, float(ctx.CENTER)))
 
-    # --- perfis espaciais (float32) ---
+    # ----- PERFIS ESPACIAIS (float32) -----
     idx = ctx.I_ALL.astype(np.float32)
     d = np.abs(idx - float(ctx.CENTER))
 
-    # Core (triângulo 0..1)
+    # Core: triângulo 0..1
     base_w = max(1.0, radius)
     body = np.clip(1.0 - (d / base_w), 0.0, 1.0).astype(np.float32)
 
-    # Halo (gauss 0..1) — usa divisor mínimo para evitar NaN
+    # Halo: gaussiano 0..1 (divisor mínimo evita NaN)
     sigma = 0.35 * max(6.0, radius)
     halo = np.exp(-0.5 * (d / max(1e-3, sigma))**2).astype(np.float32)
 
-    # Wide bed (raised-cosine suave 0..1)
+    # Wide bed: raised-cosine 0..1 (garante base >=0 antes do power)
     cos_arg = (d / max(1.0, float(ctx.CENTER))) * (np.pi * 0.5)
-    wide = (np.cos(np.clip(cos_arg, 0.0, np.pi * 0.5)) ** 1.4).astype(np.float32)
+    cos_clip = np.clip(cos_arg, 0.0, np.pi * 0.5)
+    cos_val  = np.cos(cos_clip)
+    cos_val  = np.nan_to_num(cos_val, nan=0.0, posinf=0.0, neginf=0.0)
+    cos_val  = np.maximum(cos_val, 0.0).astype(np.float32)
+    wide = (cos_val ** 1.2).astype(np.float32)  # expoente mais suave (evita warning)
 
-    # --- ganhos / composição (mais reativos) ---
-    # ganho principal: base + envelope + transiente; leve boost no beat
-    amp = 60.0 + 160.0 * env01 + 120.0 * trans
+    # ----- GANHOS / COMPOSIÇÃO (mais reativos) -----
+    # Ajuste fácil: aumente/diminua estes coeficientes para calibrar o "punch"
+    AMP_BASE = 50.0
+    AMP_ENV  = 170.0   # ganho pelo envelope (lento)
+    AMP_TRANS= 180.0   # ganho pelo transiente (rápido)
+    BEAT_BOOST = 1.12
+
+    amp = AMP_BASE + AMP_ENV * env01 + AMP_TRANS * trans
     if beat_flag:
-        amp *= 1.15
-    amp = float(np.clip(amp, 0.0, 235.0))
+        amp *= BEAT_BOOST
+    amp = float(np.clip(amp, 0.0, 240.0))
 
-    # pesos do core/halo dependem do transiente (abre no "ataque")
-    core_w = 0.50 + 0.35 * trans + 0.10 * env01   # 0.5..0.95
-    halo_w = 0.25 + 0.20 * env01                  # 0.25..0.45
+    CORE_W = 0.55 + 0.35 * trans + 0.10 * env01   # 0.55..1.0 (abre no ataque)
+    HALO_W = 0.22 + 0.20 * env01                  # 0.22..0.42 (enche em energia)
+    BED_GAIN = (10.0 + 55.0 * env01)              # cama larga mais discreta
+    BG_GAIN  = (4.0  + 12.0 * env01)              # fundo uniforme leve
 
-    # cama larga e fundo menores para não “lavar” o contraste
-    bed_gain = (12.0 + 70.0 * env01)              # 12..82
-    bg_gain  = (6.0  + 16.0 * env01)              # 6..22
-
-    v_core = amp * (core_w * body + halo_w * halo)
-    v_bed  = bed_gain * wide
-    v_bg   = bg_gain
+    v_core = amp * (CORE_W * body + HALO_W * halo)
+    v_bed  = BED_GAIN * wide
+    v_bg   = BG_GAIN
 
     v_f = v_core + v_bed + v_bg
     if not active:
         v_f *= 0.90
 
-    # piso dinâmico
+    # Piso dinâmico
     floor = float(getattr(ctx, "dynamic_floor", 0))
     if floor > 0.0:
         v_f = np.maximum(v_f, floor)
 
-    # ----- Anti-NaN/Inf + caps antes do cast -----
+    # Anti-NaN/Inf + caps antes do cast
     v_f = np.nan_to_num(v_f, nan=0.0, posinf=240.0, neginf=0.0).astype(np.float32)
     v_f = np.clip(v_f, 0.0, 240.0).astype(np.float32)
 
-    # ---------- COR ----------
+    # Curva de resposta para dar mais "punch" em níveis baixos (γ < 1)
+    v_norm = np.clip(v_f / 240.0, 0.0, 1.0).astype(np.float32)
+    v_norm = np.power(v_norm, 0.85, dtype=np.float32)  # mais reativo em baixo nível
+    v_f = (v_norm * 240.0).astype(np.float32)
+
+    # ----- COR -----
     pal = getattr(ctx, "current_palette", None)
     use_pal = isinstance(pal, (list, tuple)) and len(pal) >= 2
 
@@ -123,7 +140,6 @@ def effect_bass_center_bloom(ctx, bands_u8, beat_flag, active):
         pal_arr = np.asarray(pal, dtype=np.uint8)
         m = pal_arr.shape[0]
 
-        # varredura leve da paleta + micro-salto com o beat
         t = time.time()
         phase = (t * 0.07) * m + (0.20 * m * _beat_flash)
         posc = ((idx / max(1.0, float(L))) * m + phase) % m
@@ -134,31 +150,28 @@ def effect_bass_center_bloom(ctx, bands_u8, beat_flag, active):
 
         c0 = pal_arr[i0].astype(np.float32)
         c1 = pal_arr[i1].astype(np.float32)
-        base_rgb = (c0 * (1.0 - frac) + c1 * frac)  # 0..255 float32
+        base_rgb = (c0 * (1.0 - frac) + c1 * frac)  # 0..255
 
         sat_base = int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255))
         s = sat_base / 255.0
-
         v_col = (v_f[:, None] / 255.0) * base_rgb
         gray  = v_f[:, None]
         out   = gray * (1.0 - s) + v_col * s
-        rgb   = np.clip(out, 0, 255).astype(np.uint8)
+        rgb   = np.clip(np.nan_to_num(out, nan=0.0, posinf=255.0, neginf=0.0), 0, 255).astype(np.uint8)
 
     else:
-        # HSV com variação temporal + espacial para evitar monocromia
         t = time.time()
-        h_time = int((t * 32.0) % 256)
+        h_time = int((t * 30.0) % 256)
         h_spatial = ((ctx.I_ALL.astype(np.int32) * 256) // max(1, L))
         hue = (int(ctx.base_hue_offset) + (int(ctx.hue_seed) >> 2) + h_time + h_spatial) % 256
-
         sat = np.full(L, int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255)), dtype=np.uint8)
-        # aqui garantimos que não há NaN antes do cast:
         v_u8 = np.clip(np.nan_to_num(v_f, nan=0.0, posinf=255.0, neginf=0.0), 0.0, 255.0).astype(np.uint8)
         rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v_u8)
 
-    # cap final moderado
+    # Cap final moderado
     rgb = np.clip(rgb, 0, 245).astype(np.uint8)
     ctx.to_pixels_and_show(rgb)
+
 
 # Alias para compatibilidade
 def effect_bass_center(ctx, bands_u8, beat_flag, active):
