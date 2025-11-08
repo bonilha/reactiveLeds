@@ -576,93 +576,90 @@ _impact_state = {
 
 def effect_bass_impact_wave(ctx, bands_u8, beat_flag, active):
     """
-    ONDA DE IMPACTO SÓ NO BEAT.
-    - Centro apagado entre beats
-    - Varre a fita em 0.25s
-    - Usa paleta do ambiente
-    - Reatividade 100%
+    ONDA DE IMPACTO NO BEAT (corrigida):
+    - Sem 'apagões': mantém glow de base (bed)
+    - Rastro com decaimento suave (buffer), sem zerar a fita
+    - Ainda reativa: no beat injeta anel + halo e expande rápido
+    - Power-aware (mantido cap local como nos outros efeitos)
     """
-    global _impact_state
     import numpy as np, time
-
+    global _impact_state
     st = _impact_state
     L = ctx.LED_COUNT
+
+    # Inicialização do buffer de rastro
+    if st["buf"] is None or st["buf"].shape[0] != L:
+        st["buf"] = np.zeros(L, dtype=np.float32)
+        st["radius"] = float(L) * 2.0  # começa fora da fita
+
     now = time.time()
-
-    # --- Reset no beat ---
-    if beat_flag:
-        st["radius"] = 0.0
-        st["active"] = True
-        st["last_t"] = now
-
-    if not st["active"]:
-        ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.uint8))
-        return
-
-    # --- Atualiza raio ---
-    dt = min(0.05, now - st["last_t"])
+    dt = 0.0 if st["last_t"] == 0.0 else min(0.05, now - st["last_t"])
     st["last_t"] = now
 
-    # Velocidade brutal
-    speed = 1600.0
+    # Decaimento do rastro (mais lento => mais tempo de brilho residual)
+    decay = 0.90 if active else 0.88
+    st["buf"] *= decay
+
+    # Glow de base (bed) — evita "apagão" total
+    bed_val = max(int(ctx.dynamic_floor), 6)
+
+    # Energia dos graves para escalar velocidade/largura
+    n = len(bands_u8)
+    if n > 0:
+        low_n = max(8, n // 8)
+        low_mean = float(np.mean(np.asarray(bands_u8[:low_n], dtype=np.float32)))
+    else:
+        low_mean = 0.0
+    e = np.clip(low_mean / 255.0, 0.0, 1.0)
+
+    # Trigger no beat: reinicia o raio no centro
+    if beat_flag:
+        st["radius"] = 0.0
+
+    # Avanço do raio (mantém a onda "andando" mesmo sem novo beat)
+    speed = 1200.0 + 600.0 * e  # px/s
     st["radius"] += speed * dt
 
-    # Desativa após cobrir a fita
-    if st["radius"] > L:
-        st["active"] = False
-        ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.float8))
-        return
-
-    # --- Onda: anel fino + halo ---
+    # Perfil da onda (anel fino + halo)
     d = np.abs(ctx.I_ALL.astype(np.float32) - ctx.CENTER)
     radius = st["radius"]
+    ring_width = 22.0 + 18.0 * e
+    sigma = 14.0 + 24.0 * e
 
-    # Anel principal
-    ring_width = 30.0
-    ring = np.where(np.abs(d - radius) < ring_width, 1.0, 0.0)
+    ring = np.clip(1.0 - np.abs(d - radius) / max(1.0, ring_width), 0.0, 1.0)
+    halo = np.exp(-0.5 * ((d - radius) / max(1.0, sigma))**2)
 
-    # Halo suave
-    sigma = 20.0
-    halo = np.exp(-0.5 * ((d - radius) / sigma)**2) * 0.5
+    impact = (ring * 1.0 + halo * 0.6) * (190.0 + 65.0 * e)
+    st["buf"] = np.maximum(st["buf"], impact)
 
-    # Intensidade
-    intensity = (ring + halo) * 255.0
-    v_raw = np.clip(intensity, 0, 255)
+    # Valor final de V = rastro (capado) + bed mínimo
+    v_raw = np.clip(st["buf"], 0.0, 255.0).astype(np.uint8)
+    v = np.maximum(v_raw, bed_val).astype(np.uint8)
+    v = ctx.apply_floor_vec(v, active, None)
 
-    # --- POWER CAP ---
-    sum_v = float(np.sum(v_raw))
+    # --- Power cap local (mesmo padrão usado nos demais efeitos do arquivo) ---
+    sum_v = float(np.sum(v))
     i_color_mA = (ctx.WS2812B_MA_PER_CHANNEL / 255.0) * sum_v * 3
-    i_idle_mA = ctx.WS2812B_IDLE_MA_PER_LED * L
+    i_idle_mA  = ctx.WS2812B_IDLE_MA_PER_LED * L
     i_budget_mA = ctx.CURRENT_BUDGET_A * 1000.0
-
     scale = 1.0
     if i_color_mA > 0 and (i_color_mA + i_idle_mA) > i_budget_mA:
         scale = max(0.0, (i_budget_mA - i_idle_mA) / i_color_mA)
+    if scale < 0.999:
+        v = np.clip(v.astype(np.float32) * scale, 0, 255).astype(np.uint8)
 
-    v = np.clip(v_raw * scale, 0, 255).astype(np.uint8)
-    v = ctx.apply_floor_vec(v, active, None)
-
-    # --- CORES: PALETA + FLASH BRANCO NO CENTRO ---
+    # --- Cores: usa paleta se existir; senão HSV ---
     pal = getattr(ctx, "current_palette", None)
-    if isinstance(pal, (list, tuple)) and len(pal) >= 2:
+    if isinstance(pal, (list, tuple)) and len(pal) >= 1:
         pal_arr = np.asarray(pal, dtype=np.uint8)
         m = pal_arr.shape[0]
-        idx = int(radius * 0.1) % m
-        color = pal_arr[idx].astype(np.float32)
-
-        # Branco no centro, cor no anel
-        white_mask = (d < 20)
-        colored = color * (v.astype(np.float32) / 255.0)[:, None]
-        white = np.full_like(colored, 255.0)
-        rgb_float = np.where(white_mask[:, None], white, colored)
-        rgb = np.clip(rgb_float, 0, 255).astype(np.uint8)
+        idx = int(radius * 0.08) % m
+        base_rgb = pal_arr[idx].astype(np.float32)  # uma cor da paleta
+        rgb = np.clip((v.astype(np.float32)[:, None] / 255.0) * base_rgb[None, :], 0, 255).astype(np.uint8)
     else:
-        hue = (ctx.base_hue_offset + int(radius * 0.5)) % 256
-        sat = np.full(L, 255, dtype=np.uint8)
-        rgb = ctx.hsv_to_rgb_bytes_vec(
-            np.full(L, hue, dtype=np.uint8),
-            sat, v
-        )
+        hue = (ctx.base_hue_offset + (ctx.hue_seed >> 2) + (ctx.I_ALL >> 1) + int(radius * 0.3)) % 256
+        sat = np.full(L, max(180, ctx.base_saturation), dtype=np.uint8)
+        rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
 
     ctx.to_pixels_and_show(rgb)
 
