@@ -17,8 +17,8 @@ from .clean import (
     effect_bass_impact_wave,
 )
 from .fire import (
-    effect_clean_fire_edge_v3,       # Legado (mantido por compatibilidade)
-    effect_clean_fire_center_v3,     # Legado
+    # effect_clean_fire_edge_v3,       # Legado (mantido por compatibilidade)
+    # effect_clean_fire_center_v3,     # Legado
     effect_clean_fire_edge_v4,       # NOVA VERSÃO REATIVA (com paleta + sparks)
     effect_clean_fire_center_v4,     # NOVA VERSÃO REATIVA
 )
