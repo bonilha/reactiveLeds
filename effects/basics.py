@@ -69,8 +69,6 @@ def _spawn_comet(comets, pos, dir_right, level, hue, energy, base_speed):
     comets.append([pos, (+v0 if dir_right else -v0), life0, int(hue) & 255, sigma0])
 
 
-# Alias amigável (caso queira referenciar por outro nome)
-effect_multicolor_comets = effect_multiband_comets
 
 # ------------------------- Energy Comets Melhorado (Distribuído) -------------------------
 # Estado persistente do efeito (anexado ao ctx)
