@@ -15,15 +15,20 @@ import threading
 import argparse
 from typing import Optional, Union
 
-# ------------------------------- Constantes -------------------------------
+# --- Web UI imports ---
+from flask import Flask, Response, request, jsonify
+from flask import stream_with_context
+import json
+
+# ------------------------------- Constantes -----------------------------------
 DEFAULT_RASPBERRY_IP = "192.168.66.71"
 UDP_PORT = 5005
 TCP_TIME_PORT = 5006
 
-PKT_AUDIO_V2 = 0xA2  # [A2][8 ts_pc][bands(150)][beat][trans][dyn_floor][kick] => 163 bytes
-PKT_CFG      = 0xB0  # [B0][ver u8][num_bands u16][fps u16][signal_hold_ms u16][vis_fps u16] => 10 bytes
+PKT_AUDIO_V2 = 0xA2  # [A2][8 ts_pc][bands(150)][beat][trans][dyn_floor][kick] => 163 bytes p/ 150 bandas
+PKT_CFG = 0xB0       # [B0][ver u8][num_bands u16][fps u16][signal_hold_ms u16][vis_fps u16] => 10 bytes
 
-# ------------------------------- Utils de dispositivo -------------------------------
+# --------------------------- Utils de dispositivo -----------------------------
 def resolve_device_index(name_or_index: Optional[Union[str, int]]) -> Optional[int]:
     if name_or_index is None:
         return None
@@ -105,7 +110,7 @@ def open_with_probe(dev_idx, extra, callback, block_size):
         last_err = e
     raise last_err if last_err else RuntimeError("Falha ao abrir InputStream.")
 
-# ----------------------------- FFT / Bandas ------------------------------
+# ------------------------------ FFT / Bandas ----------------------------------
 def make_bands_indices(nfft, sr, num_bands, fmin, fmax_limit):
     freqs = np.fft.rfftfreq(nfft, 1.0/sr)
     fmax = min(fmax_limit, sr/2.0)
@@ -137,7 +142,7 @@ def make_compute_bands(sr, block_size, band_starts, band_ends, raw_ema_alpha, pe
         return ema_bands  # 0..1
     return compute
 
-# ------------------------------- Contextos -------------------------------
+# -------------------------------- Contextos -----------------------------------
 class Shared:
     def __init__(self, n_bands: int):
         self.bands_eq_u8 = np.zeros(n_bands, dtype=np.uint8)
@@ -149,6 +154,10 @@ class Shared:
         self.rms_ema = 0.0
         self.block_max = 0.0
         self.last_update = 0.0
+        # sinais extras p/ UI
+        self.gate_active = False
+        self.is_quiet = False
+        self.resume_threshold = 0.0
 
 class Ctx:
     def __init__(self, rpi_ip: str, max_fps: int):
@@ -165,7 +174,7 @@ class Ctx:
         except Exception:
             pass
 
-# ------------------------------- Time Sync -------------------------------
+# ------------------------------- Time Sync ------------------------------------
 def _recv_exact(sock, n):
     buf = b''
     while len(buf) < n:
@@ -188,7 +197,7 @@ def time_sync_over_tcp(ctx, samples=12, timeout=0.6):
                 if data[:3] != b"TS2":
                     continue
                 echo_t0 = int.from_bytes(data[3:11], 'little')
-                tr_pi  = int.from_bytes(data[11:19], 'little')
+                tr_pi = int.from_bytes(data[11:19], 'little')
                 if echo_t0 != t0:
                     continue
                 t1 = time.monotonic_ns()
@@ -222,7 +231,7 @@ def resync_loop(ctx, interval_ok=60.0, interval_fail=2.0):
                 return
             time.sleep(0.1)
 
-# ------------------------------- Status -----------------------------------
+# --------------------------------- Status -------------------------------------
 def print_status(ctx, tag_extra: str = "", debug_line: str = ""):
     now = time.time()
     if (now - ctx.last_status) > 0.25:
@@ -233,16 +242,16 @@ def print_status(ctx, tag_extra: str = "", debug_line: str = ""):
         sys.stdout.flush()
         ctx.last_status = now
 
-# ------------------------------- Main -------------------------------------
+# ----------------------------------- Main -------------------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--ip", type=str, default=DEFAULT_RASPBERRY_IP)
     parser.add_argument("--block-size", type=int, default=512)
-    parser.add_argument("--fps", type=int, default=75)               # cadência de envio
-    parser.add_argument("--bands", type=int, default=150)            # número de bandas
-    parser.add_argument("--signal-hold", type=int, default=500)      # sustain no Pi (ms)
-    parser.add_argument("--vis-fps", type=int, default=45)           # FPS de render do Pi
+    parser.add_argument("--fps", type=int, default=75)           # cadência de envio
+    parser.add_argument("--bands", type=int, default=150)         # número de bandas
+    parser.add_argument("--signal-hold", type=int, default=500)   # sustain no Pi (ms)
+    parser.add_argument("--vis-fps", type=int, default=45)        # FPS de render do Pi
     # Equalização/normalização
     parser.add_argument("--eq-target", type=float, default=64.0)
     parser.add_argument("--eq-alpha", type=float, default=0.35)
@@ -263,6 +272,11 @@ def main():
     parser.add_argument("--resync", type=float, default=60.0)
     # Debug
     parser.add_argument("--debug", action="store_true")
+    # Web UI
+    parser.add_argument("--web-ui", action="store_true", help="Habilita dashboard web local")
+    parser.add_argument("--web-port", type=int, default=8787, help="Porta do dashboard web")
+    parser.add_argument("--web-fps", type=float, default=12.0, help="Taxa de atualização da UI (frames/s)")
+
     args = parser.parse_args()
 
     NUM_BANDS = int(args.bands)
@@ -281,7 +295,7 @@ def main():
     # Thread de time-sync contínuo (não bloqueia o main)
     threading.Thread(target=resync_loop, args=(ctx, float(args.resync), 2.0), daemon=True).start()
 
-    # ---------------- Envio de CONFIG (B0) ----------------
+    # ----------------------------- Envio de CONFIG (B0) ------------------------
     def send_config_packet():
         ver = 1
         nb = NUM_BANDS & 0xFFFF
@@ -310,16 +324,261 @@ def main():
             time.sleep(2.0)
 
     threading.Thread(target=cfg_sender, daemon=True).start()
-    # -----------------------------------------------------
 
-    # ---------------- Pipeline de Áudio ------------------
+    # --------------------- Config dinâmica (runtime) + Web ---------------------
+    CONFIG_LOCK = threading.Lock()
+    CFG = {
+        # Gate (defaults vindos dos args)
+        "silence_bands": float(args.silence_bands),
+        "silence_rms": float(args.silence_rms),
+        "silence_duration": float(args.silence_duration),
+        "resume_factor": float(args.resume_factor),
+        "resume_stable": float(args.resume_stable),
+        # Pós-EQ / smoothing (opcionais p/ ajuste fino visível)
+        "eq_target": float(args.eq_target),
+        "eq_alpha": float(args.eq_alpha),
+        "post_attack": float(args.post_attack),
+        "post_release": float(args.post_release),
+        "tilt_min": float(args.tilt_min),
+        "tilt_max": float(args.tilt_max),
+    }
+
+    def get_cfg():
+        with CONFIG_LOCK:
+            return dict(CFG)
+
+    def update_cfg(patch: dict):
+        changed = {}
+        with CONFIG_LOCK:
+            for k, v in patch.items():
+                if k in CFG:
+                    try:
+                        v = float(v)
+                    except Exception:
+                        pass
+                    CFG[k] = v
+                    changed[k] = v
+        return changed
+
+    # ----------------------------- Web UI (Flask/SSE) -------------------------
+    app = Flask(__name__)
+
+    HTML_PAGE = """
+<!doctype html><html lang="pt-br"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>PC-Audio Dashboard</title>
+https://cdn.jsdelivr.net/npm/chart.js</script>
+<style>
+ body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:16px;background:#0e1117;color:#e6edf3}
+ .row{display:flex;gap:16px;flex-wrap:wrap}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;flex:1;min-width:320px}
+ .bars{height:180px}
+ .ok{color:#3fb950}.warn{color:#d29922}.bad{color:#f85149}
+ label{display:block;margin:6px 0 2px}
+ input[type=number]{width:140px}
+ button{padding:6px 10px;border-radius:6px;border:1px solid #30363d;background:#21262d;color:#e6edf3;cursor:pointer}
+ button:hover{background:#30363d}
+ .grid{display:grid;grid-template-columns:repeat(2,minmax(180px,1fr));gap:8px}
+ small{color:#8b949e}
+</style>
+</head><body>
+<h2>PC-Audio Dashboard</h2>
+<div class="row">
+  <div class="card" style="flex:2">
+    <canvas id="bars" class="bars"></canvas>
+    <small>Barras (EQ normalizada 0..255)</small>
+  </div>
+  <div class="card" style="min-width:320px">
+    <div><b>Status:</b> <span id="gate">–</span> • <span id="beat">Beat: 0</span> • <span id="kick">Kick: 0</span></div>
+    <div style="margin-top:8px" class="grid">
+      <div><b>avg_ema</b>: <span id="avg"></span></div>
+      <div><b>rms_ema</b>: <span id="rms"></span></div>
+      <div><b>silence_bands</b>: <span id="sb"></span></div>
+      <div><b>silence_rms</b>: <span id="sr"></span></div>
+    </div>
+  </div>
+</div>
+<div class="row">
+  <div class="card">
+    <canvas id="series" style="height:200px"></canvas>
+    <small>AVG/RMS vs thresholds</small>
+  </div>
+  <div class="card">
+    <h3>Ajustes do Gate</h3>
+    <div class="grid">
+      <label>silence_bands <input id="i_sb" type="number" step="0.1"></label>
+      <label>silence_rms <input id="i_sr" type="number" step="1e-6"></label>
+      <label>silence_duration (s) <input id="i_sd" type="number" step="0.1"></label>
+      <label>resume_factor <input id="i_rf" type="number" step="0.1"></label>
+      <label>resume_stable (s) <input id="i_rs" type="number" step="0.1"></label>
+    </div>
+    <div style="margin-top:8px"><button id="apply">Aplicar</button> <button id="calib">Calibrar silêncio (2s)</button></div>
+    <small id="msg"></small>
+  </div>
+</div>
+<script>
+let numBands = 150;
+const barsCtx = document.getElementById('bars').getContext('2d');
+const seriesCtx = document.getElementById('series').getContext('2d');
+
+function makeLabels(n){ return [...Array(n).keys()].map(i=>'B'+(i+1)); }
+
+const barsChart = new Chart(barsCtx, {
+  type:'bar',
+  data:{labels:makeLabels(numBands),datasets:[{label:'Bands',data:Array(numBands).fill(0),backgroundColor:'#58a6ff',borderWidth:0}]},
+  options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{display:false},y:{min:0,max:255}}}
+});
+
+const seriesChart = new Chart(seriesCtx,{
+  type:'line',
+  data:{labels:[],datasets:[
+    {label:'avg_ema', data:[], borderColor:'#58a6ff', tension:.2},
+    {label:'rms_ema', data:[], borderColor:'#a371f7', tension:.2, yAxisID:'y2'},
+    {label:'silence_bands', data:[], borderColor:'#f85149', borderDash:[6,4], tension:0},
+    {label:'silence_rms', data:[], borderColor:'#d29922', borderDash:[6,4], tension:0, yAxisID:'y2'}]},
+  options:{animation:false, scales:{y:{beginAtZero:true}, y2:{beginAtZero:true, position:'right'}}}
+});
+
+const gateEl=document.getElementById('gate'),beatEl=document.getElementById('beat'),kickEl=document.getElementById('kick');
+const avgEl=document.getElementById('avg'),rmsEl=document.getElementById('rms'),sbEl=document.getElementById('sb'),srEl=document.getElementById('sr');
+const i_sb=document.getElementById('i_sb'),i_sr=document.getElementById('i_sr'),i_sd=document.getElementById('i_sd'),i_rf=document.getElementById('i_rf'),i_rs=document.getElementById('i_rs');
+const msg=document.getElementById('msg');
+
+function applyCfg(){
+  const body={
+    silence_bands: parseFloat(i_sb.value),
+    silence_rms: parseFloat(i_sr.value),
+    silence_duration: parseFloat(i_sd.value),
+    resume_factor: parseFloat(i_rf.value),
+    resume_stable: parseFloat(i_rs.value)
+  };
+  fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(r=>r.json()).then(j=>{msg.textContent='OK: '+JSON.stringify(j.changed)}).catch(e=>{msg.textContent='Erro: '+e});
+}
+document.getElementById('apply').onclick=applyCfg;
+document.getElementById('calib').onclick=()=>fetch('/api/calibrate',{method:'POST'}).then(r=>r.json()).then(j=>{
+  i_sb.value=j.suggest.silence_bands; i_sr.value=j.suggest.silence_rms; msg.textContent='Calibrado: '+JSON.stringify(j.suggest);
+});
+
+function setInputs(cfg){ i_sb.value=cfg.silence_bands; i_sr.value=cfg.silence_rms; i_sd.value=cfg.silence_duration; i_rf.value=cfg.resume_factor; i_rs.value=cfg.resume_stable; }
+
+const evt=new EventSource('/api/stream');
+evt.onmessage=(ev)=>{
+  const s=JSON.parse(ev.data);
+  // redimensiona se numBands mudar
+  if (s.bands && s.bands.length && s.bands.length !== numBands){
+    numBands = s.bands.length;
+    barsChart.data.labels = makeLabels(numBands);
+    barsChart.data.datasets[0].data = Array(numBands).fill(0);
+  }
+  // bars
+  barsChart.data.datasets[0].data = s.bands; barsChart.update('none');
+  // status
+  gateEl.innerHTML = s.gate_active ? '<span class="ok">ACTIVE</span>' : (s.is_quiet ? '<span class="warn">IDLE (quiet)</span>' : '<span class="bad">IDLE</span>');
+  beatEl.textContent='Beat: '+s.beat; kickEl.textContent='Kick: '+s.kick;
+  avgEl.textContent=s.avg_ema.toFixed(2); rmsEl.textContent=s.rms_ema.toExponential(2);
+  sbEl.textContent=s.cfg.silence_bands.toFixed(2); srEl.textContent=s.cfg.silence_rms.toExponential(2);
+
+  // series (janela ~15s)
+  const label = (new Date()).toLocaleTimeString();
+  const keep=180;
+  const dsAvg=seriesChart.data.datasets[0], dsRms=seriesChart.data.datasets[1];
+  const dsSB =seriesChart.data.datasets[2], dsSR =seriesChart.data.datasets[3];
+  dsAvg.data.push(s.avg_ema); dsRms.data.push(s.rms_ema);
+  dsSB.data.push(s.cfg.silence_bands); dsSR.data.push(s.cfg.silence_rms);
+  while(dsAvg.data.length>keep){ dsAvg.data.shift(); dsRms.data.shift(); dsSB.data.shift(); dsSR.data.shift();}
+  seriesChart.data.labels.push(label); while(seriesChart.data.labels.length>keep) seriesChart.data.labels.shift();
+  seriesChart.update('none');
+
+  // init inputs na 1ª atualização
+  if(!i_sb.value) setInputs(s.cfg);
+};
+</script>
+</body></html>
+"""
+
+    @app.get("/")
+    def index():
+        return HTML_PAGE
+
+    @app.get("/api/state")
+    def api_state():
+        snap = {
+            "tx": ctx.tx_count,
+            "gate_active": bool(getattr(shared, "gate_active", False)),
+            "is_quiet": bool(getattr(shared, "is_quiet", False)),
+            "avg": float(shared.avg), "rms": float(shared.rms),
+            "avg_ema": float(shared.avg_ema), "rms_ema": float(shared.rms_ema),
+            "beat": int(shared.beat), "kick": int(shared.kick_intensity),
+            "bands": shared.bands_eq_u8.tolist(),
+            "cfg": get_cfg(),
+            "ts": time.time(),
+        }
+        return jsonify(snap)
+
+    @app.post("/api/config")
+    def api_config():
+        patch = request.get_json(force=True, silent=True) or {}
+        changed = update_cfg(patch)
+        return jsonify({"changed": changed})
+
+    @app.post("/api/calibrate")
+    def api_calibrate():
+        # mede 2s de ruído atual e sugere thresholds com margens
+        samples = []
+        t0 = time.time()
+        while time.time() - t0 < 2.0:
+            samples.append((shared.avg_ema, shared.rms_ema))
+            time.sleep(0.05)
+        if samples:
+            avgs = [a for a, _ in samples]; rmss = [r for _, r in samples]
+            p95_avg = float(np.percentile(avgs, 95))
+            p95_rms = float(np.percentile(rmss, 95))
+            suggest = {
+                "silence_bands": round(p95_avg * 1.05, 2),
+                "silence_rms": float(p95_rms * 1.10)
+            }
+            update_cfg(suggest)
+        else:
+            suggest = get_cfg()
+        return jsonify({"suggest": suggest})
+
+    @app.get("/api/stream")
+    def api_stream():
+        interval = max(0.02, 1.0 / float(args.web_fps))
+        @stream_with_context
+        def gen():
+            while not ctx.stop_flag.is_set():
+                snap = {
+                    "gate_active": bool(getattr(shared, "gate_active", False)),
+                    "is_quiet": bool(getattr(shared, "is_quiet", False)),
+                    "avg_ema": float(shared.avg_ema),
+                    "rms_ema": float(shared.rms_ema),
+                    "beat": int(shared.beat),
+                    "kick": int(shared.kick_intensity),
+                    "bands": shared.bands_eq_u8.tolist(),
+                    "cfg": get_cfg()
+                }
+                yield f"data: {json.dumps(snap)}\n\n"
+                time.sleep(interval)
+        return Response(gen(), mimetype="text/event-stream")
+
+    def _run_web():
+        # host 127.0.0.1 por padrão; mude para '0.0.0.0' se quiser abrir na LAN
+        app.run(host="127.0.0.1", port=int(args.web_port), debug=False, threaded=True)
+
+    if args.web_ui:
+        threading.Thread(target=_run_web, daemon=True).start()
+        print(f"\n[WEB] Dashboard em http://127.0.0.1:{int(args.web_port)}")
+
+    # --------------------------- Pipeline de Áudio ------------------------------
     FMIN = 20.0; FMAX = 16000.0
     compute_bands = None
     raw_ema_alpha = float(args.raw_ema)
     peak_ema_alpha = float(args.norm_peak_ema)
 
-    # Equalização e smoothing pós-EQ (iguais à versão estável)
-    tilt_curve = np.exp(np.linspace(np.log(args.tilt_max), np.log(args.tilt_min), NUM_BANDS)).astype(np.float32)
+    # Equalização (estado base)
     band_ema = np.ones(NUM_BANDS, dtype=np.float32) * (args.eq_target / 2.0)
     post_eq_prev = np.zeros(NUM_BANDS, dtype=np.float32)
 
@@ -335,7 +594,6 @@ def main():
     silence_since = None
     resume_since = None
     last_tick = 0.0
-    last_debug = 0.0
 
     # Funções de envio de áudio
     def send_audio_packet(bands_u8: np.ndarray, beat_flag: int, transition_flag: int, dyn_floor: int, kick_intensity: int):
@@ -354,26 +612,31 @@ def main():
         nonlocal energy_idx, energy_count, last_energy, band_ema, post_eq_prev
         if status:
             sys.stdout.write("\n"); print(f"[WARN] Audio status: {status}")
-
         block = indata.mean(axis=1) if indata.ndim > 1 else indata
         if len(block) < args.block_size:
             block = np.pad(block, (0, args.block_size - len(block)), "constant")
         if compute_bands is None:
             return
-
         base_vals = compute_bands(block[:args.block_size])  # 0..1
         base_vals255 = (base_vals * 255.0).astype(np.float32)
 
-        eq_alpha = float(args.eq_alpha)
+        # snapshot dos parâmetros que afetam o render
+        _cfg = get_cfg()
+        eq_alpha = float(_cfg["eq_alpha"])
+        # tilt pode mudar em runtime → recalcule curva
+        tilt_curve_runtime = np.exp(
+            np.linspace(np.log(_cfg["tilt_max"]), np.log(_cfg["tilt_min"]), NUM_BANDS)
+        ).astype(np.float32)
+
         band_ema = (1.0 - eq_alpha) * band_ema + eq_alpha * base_vals255
-        gain = args.eq_target / np.maximum(band_ema, 1.0)
-        eq = base_vals255 * gain * tilt_curve
+        gain = _cfg["eq_target"] / np.maximum(band_ema, 1.0)
+        eq = base_vals255 * gain * tilt_curve_runtime
         eq = np.clip(eq, 0.0, 255.0).astype(np.float32)
 
-        if args.post_attack < 1.0 or args.post_release < 1.0:
-            alpha = np.where(eq > post_eq_prev, args.post_attack, args.post_release).astype(np.float32)
+        if _cfg["post_attack"] < 1.0 or _cfg["post_release"] < 1.0:
+            alpha = np.where(eq > post_eq_prev, _cfg["post_attack"], _cfg["post_release"]).astype(np.float32)
             eq = alpha * eq + (1.0 - alpha) * post_eq_prev
-            post_eq_prev = eq
+        post_eq_prev = eq
 
         bands_u8 = eq.clip(0, 255).astype(np.uint8)
         shared.bands_eq_u8 = bands_u8
@@ -422,10 +685,15 @@ def main():
         sys.stdout.write("\n[FATAL] Não foi possível abrir nenhum dispositivo de áudio.\n")
         sys.exit(1)
 
-    a_idx, b_idx = make_bands_indices(args.block_size, sr_eff, NUM_BANDS, 20.0, 16000.0)
+    a_idx, b_idx = make_bands_indices(args.block_size, sr_eff, NUM_BANDS, FMIN, FMAX)
     compute_bands = make_compute_bands(sr_eff, args.block_size, a_idx, b_idx, raw_ema_alpha, peak_ema_alpha)
 
+    # Inicia web se habilitado (avisar após stream pronto também)
+    if args.web_ui:
+        print(f"[WEB] Dashboard em http://127.0.0.1:{int(args.web_port)}")
+
     stream.start()
+
     try:
         while True:
             # Mesmo sem sync, o programa segue rodando — apenas não transmite A2
@@ -440,31 +708,39 @@ def main():
             beat = shared.beat; kick_intensity = shared.kick_intensity
             now = time.time()
 
-            # Gate de silêncio
-            is_quiet = (avg_ema < args.silence_bands) and (rms_ema < args.silence_rms)
-            resume_threshold = args.silence_bands * args.resume_factor
+            # Gate de silêncio (duplo critério)
+            _cfg = get_cfg()
+            is_quiet = (avg_ema < _cfg["silence_bands"]) and (rms_ema < _cfg["silence_rms"])
+            resume_threshold = _cfg["silence_bands"] * _cfg["resume_factor"]
+            shared.is_quiet = bool(is_quiet)
+            shared.resume_threshold = float(resume_threshold)
 
             if active:
                 if is_quiet:
                     if silence_since is None:
                         silence_since = now
-                    elif (now - silence_since) >= args.silence_duration:
+                    elif (now - silence_since) >= _cfg["silence_duration"]:
+                        # transição OFF
                         send_audio_packet(np.zeros(NUM_BANDS, dtype=np.uint8), 0, 1, 0, 0)
-                        active = False; silence_since = None; resume_since = None
+                        active = False; shared.gate_active = False
+                        silence_since = None; resume_since = None
                         time.sleep(0.01)
                         continue
                 else:
                     silence_since = None
             else:
-                if (avg_ema > resume_threshold) or (rms_ema > args.silence_rms * 3.0):
+                # Inativo -> verificar retomada
+                if (avg_ema > resume_threshold) or (rms_ema > _cfg["silence_rms"] * 3.0):
                     if resume_since is None:
                         resume_since = now
-                    elif (now - resume_since) >= args.resume_stable:
+                    elif (now - resume_since) >= _cfg["resume_stable"]:
                         mean_val = float(np.mean(bands_now))
                         dyn_floor = int(min(12, mean_val * 0.012)) if mean_val > 90 else 0
                         send_audio_packet(bands_now, beat, 1, dyn_floor, kick_intensity)
-                        active = True; resume_since = None; last_tick = now
-                        time.sleep(0.001); continue
+                        active = True; shared.gate_active = True
+                        resume_since = None; last_tick = now
+                        time.sleep(0.001)
+                        continue
                 else:
                     resume_since = None
 
@@ -482,7 +758,6 @@ def main():
             dyn_floor = int(min(12, mean_val * 0.012)) if mean_val > 90 else 0
             send_audio_packet(bands_now, beat, 0, dyn_floor, kick_intensity)
             print_status(ctx, "")
-
     except KeyboardInterrupt:
         pass
     finally:
