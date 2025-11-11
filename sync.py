@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# sync.py — Raspberry Pi 3B renderer (A2/A1 + B0 + B1 reset)
-import socket, time, board, neopixel, random, threading, sys, select, tty, termios, os
+# sync.py — Raspberry Pi renderer (A2/A1 + B0 + B1 reset) com log single/multi linha
+import socket, time, board, neopixel, random, threading, sys, select, tty, termios, os, argparse
 import numpy as np
 from collections import deque
 from fxcore import FXContext
@@ -34,9 +34,9 @@ pixels = (
                       pixel_order=ORDER)
 )
 
-BYPASS_EFFECTS   = False
-ENABLE_SMOKE_TEST= False
-STATUS_MAX_HZ    = 10
+BYPASS_EFFECTS    = False
+ENABLE_SMOKE_TEST = False
+STATUS_MAX_HZ     = 10
 
 # -------------------- Sockets --------------------
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -65,17 +65,9 @@ latest_lock        = threading.Lock()
 stop_flag          = False
 reset_flag         = False
 
-# -------------------- CLI simples --------------------
-LOG_MODE_SINGLE_LINE = True
-for i, arg in enumerate(list(sys.argv)[1:]):
-    if arg == "--log-mode" and i+2 <= len(sys.argv)-1:
-        val = sys.argv[i+2]
-        LOG_MODE_SINGLE_LINE = (val.strip().lower() == "single")
-    elif arg.startswith("--log-mode="):
-        val = arg.split("=",1)[1]
-        LOG_MODE_SINGLE_LINE = (val.strip().lower() == "single")
+# -------------------- Log mode --------------------
+LOG_MODE_SINGLE_LINE = True  # ajustado via argparse
 
-# -------------------- Helpers de log --------------------
 def _w(s: str, *, same_line: bool):
     if same_line:
         sys.stdout.write("\r" + s)
@@ -98,20 +90,13 @@ def log_event_inline(msg: str):
 # -------------------- Caches / LUTs --------------------
 LED_IDX  = np.arange(LED_COUNT, dtype=np.int32)
 H_FIXED  = ((LED_IDX * 256) // LED_COUNT).astype(np.uint16)  # 0..255 u16
-S_FIXED  = np.full(LED_COUNT, 255, dtype=np.uint8)
-
-# Gamma LUT (1.6)
 GAMMA_LUT = (((np.arange(256, dtype=np.float32) / 255.0) ** 1.6) * 255.0).astype(np.uint8)
 
-# Mapa LED->banda
 _band_idx      = None
 _band_idx_for  = -1
-
-# Status throttle
 _status_min_period = 1.0 / max(1, STATUS_MAX_HZ)
 _last_status_ts    = 0.0
 
-# HSV LUT achatada (65536 x 3)
 HSV_LUT_FLAT = None
 
 def _build_hv_lut_flat(s_fixed: int = 255):
@@ -178,7 +163,6 @@ def timesync_tcp_server():
 
 # -------------------- Paleta / cores --------------------
 STRATEGIES = ["complementar", "analoga", "triade", "tetrade", "split"]
-COMPLEMENT_DELTA = 0.06
 
 def clamp01(x): return x % 1.0
 
@@ -188,18 +172,15 @@ def build_palette_from_strategy(h0, strategy, num_colors=5):
         r, g, b = colorsys.hsv_to_rgb(h, s, v)
         return (int(r * 255), int(g * 255), int(b * 255))
     if strategy == "complementar":
-        hA = h0 % 1.0; hB = (h0 + 0.5) % 1.0; d = COMPLEMENT_DELTA
-        hues = [hA, (hA + d) % 1.0, (hA - d) % 1.0, hB, (hB + d) % 1.0, (hB - d) % 1.0]
+        d = 0.06
+        hA = h0 % 1.0; hB = (h0 + 0.5) % 1.0
+        hues = [hA, (hA + d)%1.0, (hA - d)%1.0, hB, (hB + d)%1.0, (hB - d)%1.0]
         s_choices = [0.60, 0.70, 0.80, 0.85]; v_choices = [0.70, 0.80, 0.90, 1.00]
         pal = []
         while len(pal) < num_colors:
             h = random.choice(hues)
-            if len(pal) == 0:
-                s, v = 0.75, 0.95
-            elif len(pal) == 1:
-                s, v = 0.65, 0.75
-            else:
-                s = random.choice(s_choices); v = random.choice(v_choices)
+            s = 0.75 if len(pal)==0 else (0.65 if len(pal)==1 else random.choice(s_choices))
+            v = 0.95 if len(pal)==0 else (0.75 if len(pal)==1 else random.choice(v_choices))
             pal.append(hsv_to_rgb_bytes(h, s, v))
         return pal
     elif strategy == "analoga":
@@ -225,7 +206,6 @@ hue_seed          = random.randint(0, 255)
 base_saturation   = 210
 current_palette   = [(255, 255, 255)] * 5
 current_palette_name = "analoga"
-last_palette_h0   = 0.0
 
 PALETTE_BUFFER_MAX = 8
 palette_queue = deque(maxlen=PALETTE_BUFFER_MAX)
@@ -249,14 +229,14 @@ def get_next_palette():
     return None
 
 def apply_new_colorset():
-    global base_hue_offset, hue_seed, base_saturation, current_palette, current_palette_name, last_palette_h0
+    global base_hue_offset, hue_seed, base_saturation, current_palette, current_palette_name
     pal_data = get_next_palette()
     if pal_data:
-        current_palette, current_palette_name, last_palette_h0 = pal_data
+        current_palette, current_palette_name, _ = pal_data
     else:
         strategy = random.choice(STRATEGIES); h0 = random.random()
         current_palette = build_palette_from_strategy(h0, strategy, num_colors=5)
-        current_palette_name = strategy; last_palette_h0 = h0
+        current_palette_name = strategy
     base_hue_offset = random.randint(0, 255)
     hue_seed = random.randint(0, 255)
     base_saturation = random.randint(190, 230)
@@ -269,7 +249,11 @@ def push_palette_to_ctx(ctx: FXContext):
 # -------------------- Teclado --------------------
 def key_listener():
     global pending_key_change, reset_flag
-    old = termios.tcgetattr(sys.stdin)
+    try:
+        old = termios.tcgetattr(sys.stdin)
+    except Exception:
+        # sem TTY (systemd), apenas retorna
+        return
     try:
         tty.setcbreak(sys.stdin.fileno())
         while True:
@@ -284,13 +268,16 @@ def key_listener():
                 elif k == 'q':
                     os._exit(0)
     finally:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+        try:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+        except Exception:
+            pass
 
 # -------------------- UDP Receiver + CFG --------------------
 def udp_receiver():
     global latest_packet, rx_count, drop_hdr, drop_len
     global EXPECTED_BANDS, CFG_FPS, SIGNAL_HOLD_MS, CFG_VIS_FPS, reset_flag
-    log_info(f"[INFO] UDP receiver 0.0.0.0:{UDP_PORT} (A2/A1+B0/B1).")
+    log_info(f"[INFO] UDP 0.0.0.0:{UDP_PORT} (A2/A1 + B0 + B1)")
     while not stop_flag:
         try:
             data, _ = udp_sock.recvfrom(4096)
@@ -302,6 +289,7 @@ def udp_receiver():
 
             if hdr == PKT_RESET:
                 reset_flag = True
+                log_info("[RST] B1 recebido")
                 continue
 
             if hdr == PKT_AUDIO_V2 and n >= LEN_A2_MIN:
@@ -357,7 +345,10 @@ def udp_receiver():
         except Exception:
             time.sleep(0.001)
 
-# -------------------- Status (linha única) --------------------
+# -------------------- Status --------------------
+_status_min_period = 1.0 / max(1, STATUS_MAX_HZ)
+_last_status_ts = 0.0
+
 def unified_status_line(effect_name, ctx, active, bands, fps, vis_fps, pal_name):
     global _last_status_ts
     now = time.time()
@@ -389,7 +380,13 @@ def hardware_smoke_test(ctx, seconds=0.6):
 
 # -------------------- Main --------------------
 def main():
-    global stop_flag, latency_ms_ema, latest_packet, _band_idx, _band_idx_for, reset_flag
+    global stop_flag, latency_ms_ema, latest_packet, _band_idx, _band_idx_for, reset_flag, LOG_MODE_SINGLE_LINE
+
+    # argparse para --log-mode
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--log-mode', choices=['single','multi'], default='single')
+    args, _unknown = ap.parse_known_args()
+    LOG_MODE_SINGLE_LINE = (args.log_mode == 'single')
 
     threading.Thread(target=timesync_tcp_server, daemon=True).start()
     threading.Thread(target=udp_receiver, daemon=True).start()
@@ -485,12 +482,12 @@ def main():
                     already_off = False
                     signal_active_until = now + (SIGNAL_HOLD_MS / 1000.0)
 
-                global time_sync_ready, time_offset_ns
                 if time_sync_ready and ts_pc_ns is not None:
                     now_ns = time.monotonic_ns()
                     one_way_ns = now_ns - (ts_pc_ns + time_offset_ns)
                     if -5_000_000 <= one_way_ns <= 5_000_000_000:
                         lat_ms = one_way_ns / 1e6
+                        global latency_ms_ema
                         latency_ms_ema = lat_ms if latency_ms_ema is None else 0.85 * latency_ms_ema + 0.15 * lat_ms
 
                 avg_raw = float(np.mean(bands_u8))

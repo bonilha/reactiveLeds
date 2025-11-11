@@ -2,9 +2,8 @@
 # Escala LOG (geomspace) ou MEL (filterbank) via --scale.
 # Envia A1 (padrão, mais reativo). A2 opcional (dyn_floor/kick; dyn_floor=0 aqui para não achatar).
 # Empurra CFG (B0) p/ RPi (bands/fps/hold/vis). Envia RESET (B1) para "recomeçar do zero".
-# Inclui: normalização de área do MEL (default ON), tilt configurável (--mel-tilt),
-# perfil de silêncio por banda com persistência em disco (--noise-profile),
-# e endpoints REST para reset e calibração.
+# Inclui: normalização de área do MEL (default ON), tilt configurável (--mel-tilt, default -0.25),
+# e flag --mel-no-area-norm para desligar a normalização.
 # Fabio Bonilha + M365 Copilot - 2025-11-11
 
 import asyncio
@@ -20,7 +19,6 @@ from typing import Optional, Union, Deque, Tuple
 import numpy as np
 import sounddevice as sd
 from aiohttp import web
-import os
 
 # ============================= Config padrao =============================
 RASPBERRY_IP = "192.168.66.71"
@@ -61,10 +59,8 @@ Monitor de audio (log/mel) + Auto Mode
 Conectando...  Auto: OFF  Estado: -
 Ajuste automático   Calibrar silêncio (5s)   Forçar silêncio   Reset RPi (POST /api/reset)
 
-Dicas:
-- Para calibrar silêncio, deixe o ambiente quieto e POST /api/mode {"mode":"calibrate_silence","duration_sec":5}
-- Status detalhado: /api/status (inclui calibração e thresholds aplicados)
-- Reset remoto: POST /api/reset
+Device **-** SR/Ch **-** AVG **0** RMS **0** TX **0** FPS **0**
+/api/status para JSON detalhado.
 """
 
 # ============================= Helpers de Device (Windows loopback) =============================
@@ -334,10 +330,6 @@ app.router.add_get('/', handle_root)
 async def handle_status(request):
     sh = request.app["shared"]
     ss = request.app["server_state"]
-    now = time.time()
-    calib_eta = max(0.0, ss.get("calib_until", 0.0) - now) if ss.get("calibrating", False) else 0.0
-    last_calib = ss.get("last_calib", {})
-    np_len = int(ss["noise_profile"].shape[0]) if isinstance(ss.get("noise_profile"), np.ndarray) else 0
     return web.json_response({
         "device": sh.device,
         "samplerate": sh.samplerate,
@@ -351,11 +343,6 @@ async def handle_status(request):
         "th_silence_bands": round(ss["silence_bands"],1),
         "th_silence_rms": round(ss["silence_rms"],6),
         "th_resume_factor": round(ss["resume_factor"],2),
-        "calibrating": bool(ss.get("calibrating", False)),
-        "calib_eta": round(calib_eta, 2),
-        "last_calib": last_calib,
-        "noise_profile_active": bool(ss.get("noise_profile", None) is not None),
-        "noise_profile_len": np_len,
         "time": time.time(),
     })
 app.router.add_get('/api/status', handle_status)
@@ -372,12 +359,9 @@ async def handle_mode(request):
     elif data.get("mode") == "calibrate_silence":
         dur = float(data.get("duration_sec", 5))
         ss["calibrating"] = True
-        ss["calib_started"] = time.time()
         ss["calib_until"] = time.time() + max(1.0, min(15.0, dur))
         ss["calib_avg"] = []
         ss["calib_rms"] = []
-        if request.app["server_cfg"].get("noise_profile_enabled", False):
-            ss["noise_profile_frames"] = []
         print(f"\n[CALIB] {dur:.1f}s...")
     elif data.get("mode") == "true_silence":
         ss["force_silence_once"] = True
@@ -405,7 +389,6 @@ async def handle_ws(request):
             now = time.time()
             if now - last_sent >= 0.06:
                 srch = f"{sh.samplerate} / {sh.channels}"
-                calib_eta = max(0.0, ss.get("calib_until",0.0) - now) if ss.get("calibrating", False) else 0.0
                 await ws.send_json({
                     "connected": True,
                     "fps": round(1 / max(0.001, now - last_sent), 1),
@@ -421,9 +404,6 @@ async def handle_ws(request):
                     "th_silence_bands": round(ss["silence_bands"],1),
                     "th_silence_rms": round(ss["silence_rms"],6),
                     "th_resume_factor": round(ss["resume_factor"],2),
-                    "calibrating": bool(ss.get("calibrating", False)),
-                    "calib_eta": round(calib_eta,2),
-                    "noise_profile_active": bool(ss.get("noise_profile", None) is not None),
                 })
                 last_sent = now
             try:
@@ -488,15 +468,9 @@ def main():
     # Reset
     parser.add_argument('--no-reset-on-start', action='store_true', help='Não envia RESET (B1) ao iniciar')
 
-    # ---- Noise profile / silêncio ----
-    parser.add_argument('--noise-profile', action='store_true', help='Habilita perfil de silêncio por banda e subtração pós-FFT/MEL')
-    parser.add_argument('--noise-headroom', type=float, default=1.12, help='Fator >1 para ampliar o perfil antes de subtrair (default 1.12)')
-    parser.add_argument('--min-band', type=int, default=0, help='Valor mínimo (0..255) imposto às bandas após subtração (aplicado ao enviar)')
-    parser.add_argument('--noise-profile-path', type=str, default=None, help='Caminho do arquivo .npy para salvar/carregar perfil de silêncio')
-
     args = parser.parse_args()
 
-    # Guardar cfg
+    # Guardar cfg para handlers
     app["cfg"] = {"rpi_ip": args.raspberry_ip, "rpi_port": args.udp_port}
 
     # FPS TX efetivo
@@ -517,23 +491,10 @@ def main():
         "force_silence_once": False,
         "calibrating": False,
         "calib_until": 0.0,
-        "calib_started": 0.0,
         "calib_avg": [],
         "calib_rms": [],
-        "last_calib": {},
-        "noise_profile": None,
-        "noise_profile_frames": None,
-        "noise_profile_path": None,
-        "calib_max_frames": int(TX_FPS * 10),
     }
     app["server_state"] = server_state
-
-    # Config de servidor para features
-    app["server_cfg"] = {
-        "noise_profile_enabled": bool(args.noise_profile),
-        "noise_headroom": float(args.noise_headroom),
-        "min_band": int(args.min_band),
-    }
 
     # shared e server
     n_bands = int(args.bands)
@@ -559,6 +520,12 @@ def main():
 
     # ---------- Função util de abertura ----------
     def open_with_probe(dev_idx, extra, cb):
+        """
+        Tenta abrir o InputStream no device de saída (loopback no Windows).
+        Se falhar, tenta fallback (input default).
+        Usa callback 'cb' (pode ser None).
+        Retorna: (stream, samplerate, channels, desc_abertura, abriu_loopback_bool)
+        """
         devs = sd.query_devices()
         d = devs[dev_idx] if isinstance(dev_idx, int) and 0 <= dev_idx < len(devs) else None
         ch_pref = int(d.get('max_output_channels', 2)) if d else 2
@@ -622,6 +589,7 @@ def main():
     selected = None  # (dev_idx, extra, desc_tag)
     for dev_idx, extra, desc in choose_candidates(override=args.device):
         try:
+            # abre sem callback só para obter SR/Ch
             s_tmp, sr_eff, ch_eff, open_desc, opened_loopback = open_with_probe(dev_idx, extra, cb=None)
             dev_desc = f"{desc} {open_desc}"
             selected = (dev_idx, extra, desc)
@@ -651,12 +619,12 @@ def main():
         mel_bands = int(args.mel_bands or n_bands)
         mel_fb = build_mel_filterbank(shared.samplerate, NFFT, mel_bands, FMIN, min(FMAX, shared.samplerate/2.0))
 
-        # Normalização de área (default ON)
+        # --- Normalização de área (default ON; desliga com --mel-no-area-norm) ---
         if not args.mel_no_area_norm:
             row_sum = mel_fb.sum(axis=1, keepdims=True)
             mel_fb = mel_fb / np.maximum(row_sum, 1e-9)
 
-        # Tilt pró-graves configurável
+        # --- Tilt pró-graves (expoente negativo realça graves; 0 desliga) ---
         if abs(float(args.mel_tilt)) > 1e-9:
             k = np.arange(mel_bands, dtype=np.float32)
             tilt = ((k + 1.0) / float(mel_bands)) ** float(args.mel_tilt)
@@ -668,23 +636,6 @@ def main():
         a_idx, b_idx = make_bands_indices(NFFT, shared.samplerate, n_bands, FMIN, FMAX, min_bins=2)
         compute_bands = make_compute_bands_log(shared.samplerate, BLOCK_SIZE, NFFT, a_idx, b_idx, EMA_ALPHA, peak_ema_alpha)
         shared.bands = np.zeros(n_bands, dtype=np.uint8)
-
-    # ---------- Noise profile path & load ----------
-    # Monta path default baseado em SR e n_bandas
-    home = os.path.expanduser('~')
-    prof_dir = os.path.join(home, '.reactiveleds')
-    os.makedirs(prof_dir, exist_ok=True)
-    prof_name = f"noise-profile-sr{shared.samplerate}-nb{len(shared.bands)}.npy"
-    prof_path = args.noise_profile_path or os.path.join(prof_dir, prof_name)
-    server_state["noise_profile_path"] = prof_path
-
-    # Tenta carregar se habilitado
-    if app["server_cfg"]["noise_profile_enabled"] and os.path.exists(prof_path):
-        try:
-            server_state["noise_profile"] = np.load(prof_path)
-            print(f"[NOISE] Perfil carregado: {prof_path}")
-        except Exception as e:
-            print(f"[WARN] Falha ao carregar perfil: {e}")
 
     # ---------- Audio callback ----------
     energy_buf = np.zeros(ENERGY_BUFFER_SIZE, dtype=np.float32)
@@ -702,22 +653,13 @@ def main():
         if compute_bands is None:
             return
         bands = compute_bands(block[:BLOCK_SIZE])
-
-        # Coleta de frames para perfil de ruído durante calibração
-        ss = app["server_state"]
-        if ss.get("calibrating", False) and ss.get("noise_profile_frames") is not None:
-            ss["noise_profile_frames"].append(bands.copy())
-            if len(ss["noise_profile_frames"]) > ss.get("calib_max_frames", 600):
-                ss["noise_profile_frames"].pop(0)
-
-        # Atualiza shared
-        app["shared"].bands = bands
+        shared.bands = bands
 
         avg = float(np.mean(bands))
         rms = float(np.sqrt(np.mean(block*block) + 1e-12))
-        app["shared"].avg = avg
-        app["shared"].rms = rms
-        app["shared"].last_update = time.time()
+        shared.avg = avg
+        shared.rms = rms
+        shared.last_update = time.time()
 
         # Beat simples (graves)
         lb = bands[:max(8, len(bands)//12)]
@@ -730,7 +672,7 @@ def main():
         std_energy = float(np.std(buf_view)) if energy_count > 1 else 0.0
         dyn_thr = avg_energy + BEAT_THRESHOLD * std_energy
         is_peak_now = (energy >= max(dyn_thr, BEAT_HEIGHT_MIN)) and (energy >= last_energy)
-        app["shared"].beat = 1 if is_peak_now else 0
+        shared.beat = 1 if is_peak_now else 0
         last_energy = energy
 
     # ---------- Reabrir stream com callback ----------
@@ -752,7 +694,7 @@ def main():
     except Exception as e:
         print(f"[WARN] Falha B0: {e}")
 
-    # ---------- Reset remoto no start ----------
+    # ---------- (Novo) Reset remoto do RPi ----------
     if not args.no_reset_on_start:
         try:
             send_reset_b1(args.raspberry_ip, args.udp_port)
@@ -788,7 +730,7 @@ def main():
             rms = shared.rms
             beat = shared.beat
 
-            # Filtro mediana (avg/rms)
+            # Filtro mediana
             rms_med.append(rms); avg_med.append(avg)
             if len(rms_med) == rms_med.maxlen:
                 rms_filtered = float(np.median(rms_med))
@@ -798,9 +740,8 @@ def main():
                 avg_filtered = avg
 
             ss = app["server_state"]
-            scfg = app["server_cfg"]
 
-            # EMAs globais
+            # EMAs
             if 'avg_ema_val' not in ss:
                 ss['avg_ema_val'] = avg_filtered
                 ss['rms_ema_val'] = rms_filtered
@@ -810,60 +751,13 @@ def main():
             avg_ema = ss['avg_ema_val']
             rms_ema = ss['rms_ema_val']
 
-            # Histórico p/ auto
+            # Histórico p/ auto (usar valores filtrados para maior estabilidade)
             hist_avg.append((now, avg_filtered))
             hist_rms.append((now, rms_filtered))
+
             cutoff = now - 8.0
             while hist_avg and hist_avg[0][0] < cutoff: hist_avg.popleft()
             while hist_rms and hist_rms[0][0] < cutoff: hist_rms.popleft()
-
-            # --- Coleta e fechamento da Calibração de Silêncio ---
-            if ss.get("calibrating", False):
-                ss["calib_avg"].append(float(avg_filtered))
-                ss["calib_rms"].append(float(rms_filtered))
-                if now >= ss.get("calib_until", 0.0):
-                    arr_avg = np.array(ss["calib_avg"], dtype=np.float32) if ss["calib_avg"] else np.array([avg_filtered],dtype=np.float32)
-                    arr_rms = np.array(ss["calib_rms"], dtype=np.float32) if ss["calib_rms"] else np.array([rms_filtered],dtype=np.float32)
-
-                    # thresholds baseados no silêncio (percentil 80)
-                    noise_avg_p = float(np.percentile(arr_avg, 80))
-                    noise_rms_p = float(np.percentile(arr_rms, 80))
-                    th_avg = max(1.0, noise_avg_p * 1.15)
-                    th_rms = max(1e-6, noise_rms_p * 1.25)
-
-                    base = max(th_avg, 1e-3)
-                    music_proxy = float(np.percentile(np.array([v for _,v in hist_avg], dtype=np.float32), 90)) if hist_avg else base*1.6
-                    resume_factor = float(np.clip((music_proxy / base) * 0.9, 1.4, 4.0))
-
-                    ss["silence_bands"] = th_avg
-                    ss["silence_rms"]   = th_rms
-                    ss["resume_factor"] = resume_factor
-
-                    # Perfil de ruído por banda (percentil 90) e persistência
-                    if scfg["noise_profile_enabled"] and ss.get("noise_profile_frames"):
-                        stack = np.stack(ss["noise_profile_frames"], axis=0).astype(np.float32)  # [T,B]
-                        p90 = np.percentile(stack, 90, axis=0).astype(np.float32)
-                        ss["noise_profile"] = np.clip(p90, 0, 255)
-                        try:
-                            np.save(ss["noise_profile_path"], ss["noise_profile"])
-                            print(f"[NOISE] Perfil salvo em {ss['noise_profile_path']}")
-                        except Exception as e:
-                            print(f"[WARN] Falha ao salvar perfil: {e}")
-
-                    # Fechar calibração
-                    ss["last_calib"] = {
-                        "t": time.time(),
-                        "th_avg": float(th_avg),
-                        "th_rms": float(th_rms),
-                        "resume_factor": float(resume_factor),
-                        "frames": int(len(ss.get("noise_profile_frames") or [])),
-                    }
-                    ss["calibrating"] = False
-                    ss["calib_until"] = 0.0
-                    ss["calib_started"] = 0.0
-                    ss["calib_avg"].clear(); ss["calib_rms"].clear()
-                    ss["noise_profile_frames"] = None
-                    print(f"\n[CALIB] OK: th_avg={th_avg:.1f} th_rms={th_rms:.6f} resume_x={resume_factor:.2f}")
 
             # Auto (opcional)
             if ss["auto_mode"] and (now - last_auto_update) >= 0.5:
@@ -886,7 +780,7 @@ def main():
             # /api/mode: forçar silêncio
             if ss.get("force_silence_once"):
                 zero = np.zeros(len(bands_now), dtype=np.uint8)
-                if args.pkt=='a2':
+                if args.pkt=='a2':  # A2 com piso neutro (não achata)
                     send_packet_a2(zero, 0, 1, 0, 0, args.raspberry_ip, args.udp_port, shared)
                 else:
                     send_packet_a1(zero, 0, 1, args.raspberry_ip, args.udp_port, shared)
@@ -911,21 +805,14 @@ def main():
                     if 'resume_since' not in ss or ss['resume_since'] is None:
                         ss['resume_since']=now
                     elif (now - ss['resume_since']) >= ss['resume_stable']:
-                        dyn_floor = 0
+                        dyn_floor = 0  # piso neutro por padrão (A2)
                         lb = bands_now[:max(8, len(bands_now)//12)]
                         energy_norm = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
                         kick_val = 220 if beat else int(max(0, min(255, round(energy_norm*255.0))))
-                        # aplica noise profile antes de enviar
-                        b_send = bands_now
-                        if app["server_cfg"]["noise_profile_enabled"] and ss.get("noise_profile") is not None:
-                            prof = ss["noise_profile"] * float(app["server_cfg"]["noise_headroom"])
-                            b_send = np.clip(bands_now.astype(np.float32) - prof, 0, 255).astype(np.uint8)
-                        if app["server_cfg"]["min_band"] > 0:
-                            b_send = np.maximum(b_send, app["server_cfg"]["min_band"]).astype(np.uint8)
                         if args.pkt=='a2':
-                            send_packet_a2(b_send, beat, 1, dyn_floor, kick_val, args.raspberry_ip, args.udp_port, shared)
+                            send_packet_a2(bands_now, beat, 1, dyn_floor, kick_val, args.raspberry_ip, args.udp_port, shared)
                         else:
-                            send_packet_a1(b_send, beat, 1, args.raspberry_ip, args.udp_port, shared)
+                            send_packet_a1(bands_now, beat, 1, args.raspberry_ip, args.udp_port, shared)
                         print_status(shared, " (from silence)", require_sync=not args.no_require_sync)
                         shared.active=True; ss['resume_since']=None; last_tick=now; time.sleep(0.001); continue
                 else:
@@ -942,23 +829,15 @@ def main():
                 continue
             last_tick = now
 
-            # Envio normal (aplica noise profile e min_band)
-            dyn_floor = 0
+            # Envio normal
+            dyn_floor = 0  # piso neutro para A2 (preserva reatividade)
             lb = bands_now[:max(8, len(bands_now)//12)]
             energy_norm = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
             kick_val = 220 if beat else int(max(0, min(255, round(energy_norm*255.0))))
-
-            b_send = bands_now
-            if app["server_cfg"]["noise_profile_enabled"] and ss.get("noise_profile") is not None:
-                prof = ss["noise_profile"] * float(app["server_cfg"]["noise_headroom"])
-                b_send = np.clip(bands_now.astype(np.float32) - prof, 0, 255).astype(np.uint8)
-            if app["server_cfg"]["min_band"] > 0:
-                b_send = np.maximum(b_send, app["server_cfg"]["min_band"]).astype(np.uint8)
-
             if args.pkt=='a2':
-                send_packet_a2(b_send, beat, 0, dyn_floor, kick_val, args.raspberry_ip, args.udp_port, shared)
+                send_packet_a2(bands_now, beat, 0, dyn_floor, kick_val, args.raspberry_ip, args.udp_port, shared)
             else:
-                send_packet_a1(b_send, beat, 0, args.raspberry_ip, args.udp_port, shared)
+                send_packet_a1(bands_now, beat, 0, args.raspberry_ip, args.udp_port, shared)
             print_status(shared, "", require_sync=not args.no_require_sync)
 
     except KeyboardInterrupt:
