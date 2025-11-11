@@ -409,6 +409,11 @@ def main():
             if pkt is not None:
                 bands_u8, beat_flag, transition_flag, ts_pc_ns, dyn_floor, kick_intensity = pkt
                 last_rx_ts = now
+                # >>> DESARME 'already_off' ao receber o primeiro pacote depois do idle
+                if already_off:
+                    already_off = False
+                    # força um pequeno "arm" do hold para garantir render imediato
+                    signal_active_until = now + (SIGNAL_HOLD_MS / 1000.0)
                 global time_sync_ready, time_offset_ns
                 if time_sync_ready and ts_pc_ns is not None:
                     now_ns = time.monotonic_ns()

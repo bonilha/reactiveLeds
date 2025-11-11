@@ -918,7 +918,8 @@ def main():
                     if 'resume_since' not in ss or ss['resume_since'] is None:
                         ss['resume_since'] = now
                     elif (now - ss['resume_since']) >= ss['resume_stable']:
-                        dyn_floor = int(max(0, min(80, round((avg_ema/255.0)*80.0))))
+                        # dyn_floor = int(max(0, min(80, round((avg_ema/255.0)*80.0))))
+                        dyn_floor = int(max(0, min(12, round((avg_ema/255.0)*12.0))))
                         lb = bands_now[:max(8, n_bands//12)]
                         energy_norm = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
                         kick_val = 220 if beat else int(max(0, min(255, round(energy_norm*255.0))))
@@ -947,7 +948,8 @@ def main():
             last_tick = now
 
             # dyn_floor / kick para A2 (quando ativo)
-            dyn_floor = int(max(0, min(80, round((avg_ema/255.0)*80.0))))
+            # dyn_floor = int(max(0, min(80, round((avg_ema/255.0)*80.0))))
+            dyn_floor = int(max(0, min(12, round((avg_ema/255.0)*12.0))))
             lb = bands_now[:max(8, n_bands//12)]
             energy_norm = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
             kick_val = 220 if beat else int(max(0, min(255, round(energy_norm*255.0))))
