@@ -541,27 +541,53 @@ def main():
     def open_with_probe(dev_idx, extra, callback):
         devs = sd.query_devices()
         d = devs[dev_idx] if isinstance(dev_idx, int) and 0 <= dev_idx < len(devs) else None
+
         ch_pref = int(d.get('max_output_channels', 2)) if d else 2
-        if ch_pref <= 0: ch_pref = 2
-        try: sr_pref = int(round(float(d.get('default_samplerate', 44100)))) if d else 44100
-        except Exception: sr_pref = 44100
-        attempts = [(sr_pref,ch_pref),(48000,2),(48000,1),(44100,2),(44100,1)]
-        seen=set(); ordered=[]
-        for sr,ch in attempts:
-            k=(sr,ch); if k not in seen and sr>0 and ch>0: seen.add(k); ordered.append((sr,ch))
-        last_err=None
-        for sr_try,ch_try in ordered:
+        if ch_pref <= 0:
+            ch_pref = 2
+        try:
+            sr_pref = int(round(float(d.get('default_samplerate', 44100)))) if d else 44100
+        except Exception:
+            sr_pref = 44100
+
+        attempts = [
+            (sr_pref, ch_pref),
+            (48000, 2), (48000, 1),
+            (44100, 2), (44100, 1),
+        ]
+
+        # >>> aqui estava o problema: não use '; if ...' nem '&gt;'
+        seen = set()
+        ordered = []
+        for sr, ch in attempts:
+            k = (sr, ch)
+            if k not in seen and sr > 0 and ch > 0:
+                seen.add(k)
+                ordered.append((sr, ch))
+
+        last_err = None
+        for sr_try, ch_try in ordered:
             try:
-                s = sd.InputStream(samplerate=sr_try, channels=ch_try, dtype='float32',
-                                   blocksize=BLOCK_SIZE, device=dev_idx, callback=callback,
-                                   latency='low', extra_settings=extra)
+                s = sd.InputStream(
+                    samplerate=sr_try, channels=ch_try, dtype='float32',
+                    blocksize=BLOCK_SIZE, device=dev_idx,
+                    callback=callback, latency='low',
+                    extra_settings=extra
+                )
                 return s, int(s.samplerate), int(s.channels), f"(opened sr={int(s.samplerate)} ch={int(s.channels)})", (extra is not None)
             except Exception as e:
-                last_err=e
-        # fallback: input default
-        s = sd.InputStream(channels=2, samplerate=44100, dtype='float32',
-                           blocksize=BLOCK_SIZE, device=None, callback=callback)
+                last_err = e
+
+    # Fallback (não-ideal): input default (mic)
+    try:
+        s = sd.InputStream(
+            channels=2, samplerate=44100, dtype='float32',
+            blocksize=BLOCK_SIZE, device=None, callback=callback
+        )
         return s, int(s.samplerate), 2, "(fallback default INPUT sr=44100 ch=2)", False
+    except Exception as e:
+        last_err = e
+        raise last_err
 
     dev_desc="desconhecido"; stream=None; opened_loopback=False
     for dev_idx, extra, desc in choose_candidates(override=args.device):
