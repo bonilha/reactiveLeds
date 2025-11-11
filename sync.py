@@ -6,6 +6,7 @@ from collections import deque
 from fxcore import FXContext
 from effects import build_effects
 
+# -------------------- Protocolo --------------------
 PKT_AUDIO_V2 = 0xA2
 PKT_AUDIO    = 0xA1
 PKT_CFG      = 0xB0
@@ -13,15 +14,16 @@ PKT_RESET    = 0xB1
 
 LEN_A2_MIN = 13
 LEN_A1_MIN = 11
-LEN_CFG = 10
+LEN_CFG    = 10
 
-UDP_PORT = 5005
+UDP_PORT      = 5005
 TCP_TIME_PORT = 5006
 
-LED_COUNT = 300
-LED_PIN = board.D18
-ORDER = neopixel.GRB
-BRIGHTNESS = 0.8
+# -------------------- LEDs --------------------
+LED_COUNT   = 300
+LED_PIN     = board.D18
+ORDER       = neopixel.GRB
+BRIGHTNESS  = 0.8
 LED_IS_RGBW = False
 
 pixels = (
@@ -32,10 +34,11 @@ pixels = (
                       pixel_order=ORDER)
 )
 
-BYPASS_EFFECTS = False
+BYPASS_EFFECTS   = False
 ENABLE_SMOKE_TEST= False
-STATUS_MAX_HZ = 10
+STATUS_MAX_HZ    = 10
 
+# -------------------- Sockets --------------------
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 22)
@@ -45,38 +48,75 @@ except Exception:
 udp_sock.bind(("0.0.0.0", UDP_PORT))
 udp_sock.setblocking(True)
 
-EXPECTED_BANDS = 150
-CFG_FPS = 75
-SIGNAL_HOLD_MS = 500
-CFG_VIS_FPS = 45
+# -------------------- Estado dinâmico --------------------
+EXPECTED_BANDS  = 150
+CFG_FPS         = 75
+SIGNAL_HOLD_MS  = 500
+CFG_VIS_FPS     = 45
 
 rx_count = drop_len = drop_hdr = 0
-time_offset_ns = 0
-time_sync_ready = False
-latency_ms_ema = None
+time_offset_ns   = 0
+time_sync_ready  = False
+latency_ms_ema   = None
 
 pending_key_change = None
-latest_packet = None
-latest_lock = threading.Lock()
-stop_flag = False
-reset_flag = False
+latest_packet      = None
+latest_lock        = threading.Lock()
+stop_flag          = False
+reset_flag         = False
 
-# ---------- Caches / LUTs ----------
-LED_IDX = np.arange(LED_COUNT, dtype=np.int32)
-H_FIXED = ((LED_IDX * 256) // LED_COUNT).astype(np.uint16)  # 0..255 em uint16
-S_FIXED = np.full(LED_COUNT, 255, dtype=np.uint8)
+# -------------------- CLI simples --------------------
+# Para manter 1 arquivo, tratamos flags básicas manualmente.
+LOG_MODE_SINGLE_LINE = True
+for i, arg in enumerate(list(sys.argv)[1:]):
+    if arg == "--log-mode" and i+2 <= len(sys.argv)-1:
+        val = sys.argv[i+2]
+        LOG_MODE_SINGLE_LINE = (val.strip().lower() == "single")
+    elif arg.startswith("--log-mode="):
+        val = arg.split("=",1)[1]
+        LOG_MODE_SINGLE_LINE = (val.strip().lower() == "single")
+# Ex.: python3 sync.py --log-mode multi
+
+# -------------------- Helpers de log --------------------
+def _w(s: str, *, same_line: bool):
+    """Escreve no stdout com ou sem quebra de linha."""
+    if same_line:
+        sys.stdout.write("\r" + s)
+        sys.stdout.flush()
+    else:
+        print(s, flush=True)
+
+def log_info(msg: str):
+    # Informativos fora do loop principal: em multi, linha nova; em single, linha nova curta.
+    if LOG_MODE_SINGLE_LINE:
+        _w(msg.ljust(140), same_line=True)
+    else:
+        print(msg)
+
+def log_event_inline(msg: str):
+    # Eventos dentro do loop principal (p. ex. reset, idle) respeitam modo single.
+    if LOG_MODE_SINGLE_LINE:
+        _w(msg.ljust(140), same_line=True)
+    else:
+        print(msg)
+
+# -------------------- Caches / LUTs --------------------
+LED_IDX  = np.arange(LED_COUNT, dtype=np.int32)
+H_FIXED  = ((LED_IDX * 256) // LED_COUNT).astype(np.uint16)  # 0..255 u16
+S_FIXED  = np.full(LED_COUNT, 255, dtype=np.uint8)
+
 # Gamma LUT (1.6)
 GAMMA_LUT = (((np.arange(256, dtype=np.float32) / 255.0) ** 1.6) * 255.0).astype(np.uint8)
 
 # Mapa LED->banda
-_band_idx = None
-_band_idx_for = -1
+_band_idx      = None
+_band_idx_for  = -1
 
 # Status throttle
 _status_min_period = 1.0 / max(1, STATUS_MAX_HZ)
-_last_status_ts = 0.0
+_last_status_ts    = 0.0
 
-# LUT (H,V)->RGB achatada (65536 x 3)
+# HSV LUT achatada (65536 x 3)
 HSV_LUT_FLAT = None
 def _build_hv_lut_flat(s_fixed: int = 255):
     h_vals = np.arange(256, dtype=np.uint8)
@@ -87,12 +127,12 @@ def _build_hv_lut_flat(s_fixed: int = 255):
     s = np.full_like(h, s_fixed, dtype=np.uint8)
     rgb_flat = FXContext.hsv_to_rgb_bytes_vec(h, s, v)
     return rgb_flat
-HSV_LUT_FLAT = _build_hv_lut_flat(255)
-H_IDX_BASE_U16 = (H_FIXED << 8).astype(np.uint16)
+HSV_LUT_FLAT  = _build_hv_lut_flat(255)
+H_IDX_BASE_U16= (H_FIXED << 8).astype(np.uint16)
 
-_vals_buf = np.empty(LED_COUNT, dtype=np.uint8)  # bandas mapeadas para LEDs
-_v_buf = np.empty(LED_COUNT, dtype=np.uint8)     # gamma(v)
-_idx_buf_u16= np.empty(LED_COUNT, dtype=np.uint16)  # h*256 + v
+_vals_buf     = np.empty(LED_COUNT, dtype=np.uint8)   # bandas mapeadas para LEDs
+_v_buf        = np.empty(LED_COUNT, dtype=np.uint8)   # gamma(v)
+_idx_buf_u16  = np.empty(LED_COUNT, dtype=np.uint16)  # h*256 + v
 
 _ZERO_CACHE = {}
 def _zeros_of(n):
@@ -102,7 +142,7 @@ def _zeros_of(n):
         _ZERO_CACHE[n] = arr
     return arr
 
-# ---------- Utils ----------
+# -------------------- Utils --------------------
 def _recv_exact(conn, n):
     buf = b''
     while len(buf) < n:
@@ -139,7 +179,7 @@ def timesync_tcp_server():
         except Exception:
             time.sleep(0.05)
 
-# ---------- Paleta / cores ----------
+# -------------------- Paleta / cores --------------------
 STRATEGIES = ["complementar", "analoga", "triade", "tetrade", "split"]
 COMPLEMENT_DELTA = 0.06
 def clamp01(x): return x % 1.0
@@ -168,11 +208,11 @@ def build_palette_from_strategy(h0, strategy, num_colors=5):
         step = 0.10
         hues = [clamp01(h0 + k * step) for k in (-2, -1, 0, 1, 2)]
     elif strategy == "triade":
-        hues = [h0, clamp01(h0 + 1 / 3), clamp01(h0 + 2 / 3)]
+        hues = [h0, clamp01(h0 + 1/3), clamp01(h0 + 2/3)]
     elif strategy == "tetrade":
         hues = [h0, clamp01(h0 + 0.25), clamp01(h0 + 0.5), clamp01(h0 + 0.75)]
     else:
-        off = 1 / 6
+        off = 1/6
         hues = [h0, clamp01(h0 + 0.5 - off), clamp01(h0 + 0.5 + off)]
     pal = []
     while len(pal) < num_colors:
@@ -182,12 +222,13 @@ def build_palette_from_strategy(h0, strategy, num_colors=5):
         pal.append(hsv_to_rgb_bytes(h, s, v))
     return pal
 
-base_hue_offset = random.randint(0, 255)
-hue_seed = random.randint(0, 255)
-base_saturation = 210
-current_palette = [(255, 255, 255)] * 5
+base_hue_offset   = random.randint(0, 255)
+hue_seed          = random.randint(0, 255)
+base_saturation   = 210
+current_palette   = [(255, 255, 255)] * 5
 current_palette_name = "analoga"
-last_palette_h0 = 0.0
+last_palette_h0   = 0.0
+
 PALETTE_BUFFER_MAX = 8
 palette_queue = deque(maxlen=PALETTE_BUFFER_MAX)
 palette_thread_stop = threading.Event()
@@ -220,14 +261,14 @@ def apply_new_colorset():
         current_palette_name = strategy; last_palette_h0 = h0
     base_hue_offset = random.randint(0, 255)
     hue_seed = random.randint(0, 255)
-    base_saturation= random.randint(190, 230)
+    base_saturation = random.randint(190, 230)
 
 def push_palette_to_ctx(ctx: FXContext):
     ctx.base_hue_offset = int(base_hue_offset)
     ctx.hue_seed = int(hue_seed)
     ctx.base_saturation = int(base_saturation)
 
-# ---------- Teclado (nao-busy) ----------
+# -------------------- Teclado --------------------
 def key_listener():
     global pending_key_change, reset_flag
     old = termios.tcgetattr(sys.stdin)
@@ -247,10 +288,11 @@ def key_listener():
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
 
-# ---------- UDP Receiver + CFG ----------
+# -------------------- UDP Receiver + CFG --------------------
 def udp_receiver():
-    global latest_packet, rx_count, drop_hdr, drop_len, EXPECTED_BANDS, CFG_FPS, SIGNAL_HOLD_MS, CFG_VIS_FPS, reset_flag
-    print(f"[INFO] UDP receiver ligado em 0.0.0.0:{UDP_PORT} (aceita A2/A1 com bands variaveis e B0/B1).")
+    global latest_packet, rx_count, drop_hdr, drop_len
+    global EXPECTED_BANDS, CFG_FPS, SIGNAL_HOLD_MS, CFG_VIS_FPS, reset_flag
+    log_info(f"[INFO] UDP receiver 0.0.0.0:{UDP_PORT} (A2/A1+B0/B1).")
     while not stop_flag:
         try:
             data, _ = udp_sock.recvfrom(4096)
@@ -260,7 +302,6 @@ def udp_receiver():
                 continue
             hdr = data[0]
 
-            # RESET remoto
             if hdr == PKT_RESET:
                 reset_flag = True
                 continue
@@ -272,7 +313,7 @@ def udp_receiver():
                     continue
                 ts_pc = int.from_bytes(data[1:9], 'little')
                 bands = np.frombuffer(memoryview(data)[9:9+nb], dtype=np.uint8)
-                beat = data[9 + nb]
+                beat  = data[9 + nb]
                 trans = data[10 + nb]
                 dyn_floor = data[11 + nb]
                 kick_intensity = data[12 + nb]
@@ -290,7 +331,7 @@ def udp_receiver():
                     continue
                 ts_pc = int.from_bytes(data[1:9], 'little')
                 bands = np.frombuffer(memoryview(data)[9:9+nb], dtype=np.uint8)
-                beat = data[9 + nb]
+                beat  = data[9 + nb]
                 trans = data[10 + nb]
                 if EXPECTED_BANDS != nb:
                     EXPECTED_BANDS = int(nb)
@@ -300,16 +341,15 @@ def udp_receiver():
                 continue
 
             if hdr == PKT_CFG and n == LEN_CFG:
-                ver = data[1]
-                nb = data[2] | (data[3] << 8)
-                fps = data[4] | (data[5] << 8)
+                nb   = data[2] | (data[3] << 8)
+                fps  = data[4] | (data[5] << 8)
                 hold = data[6] | (data[7] << 8)
                 vis  = data[8] | (data[9] << 8)
                 if nb > 0: EXPECTED_BANDS = int(nb)
                 if fps > 0: CFG_FPS = int(fps)
                 if hold>=0: SIGNAL_HOLD_MS = int(hold)
                 if vis > 0: CFG_VIS_FPS = int(vis)
-                print(f"[CFG] bands={EXPECTED_BANDS} fps={CFG_FPS} hold={SIGNAL_HOLD_MS} vis_fps={CFG_VIS_FPS}")
+                log_info(f"[CFG] bands={EXPECTED_BANDS} fps={CFG_FPS} hold={SIGNAL_HOLD_MS} vis_fps={CFG_VIS_FPS}")
                 continue
 
             if hdr in (PKT_AUDIO, PKT_AUDIO_V2, PKT_CFG):
@@ -319,7 +359,7 @@ def udp_receiver():
         except Exception:
             time.sleep(0.001)
 
-# ---------- Status ----------
+# -------------------- Status (linha única) --------------------
 def unified_status_line(effect_name, ctx, active, bands, fps, vis_fps, pal_name):
     global _last_status_ts
     now = time.time()
@@ -328,27 +368,31 @@ def unified_status_line(effect_name, ctx, active, bands, fps, vis_fps, pal_name)
     _last_status_ts = now
     curr = ctx.current_a_ema if ctx.current_a_ema is not None else 0.0
     poww = ctx.power_w_ema if ctx.power_w_ema is not None else 0.0
-    cap = ctx.last_cap_scale if ctx.last_cap_scale is not None else 1.0
-    lat = f"{latency_ms_ema:.1f}" if latency_ms_ema is not None else "?"
+    cap  = ctx.last_cap_scale if ctx.last_cap_scale is not None else 1.0
+    lat  = f"{latency_ms_ema:.1f}" if latency_ms_ema is not None else "?"
     line = (f"RX:{rx_count} dropL:{drop_len} dropH:{drop_hdr} "
             f"Eff:{effect_name} Pal:{pal_name} "
             f"active:{'Y' if active else 'N'} "
             f"bands:{bands} fps:{fps} vis:{vis_fps} "
             f"I:{curr:.2f}A P:{poww:.1f}W cap:{cap:.2f} "
             f"lat:{lat}ms")
-    sys.stdout.write("\r" + line.ljust(140)); sys.stdout.flush()
+    if LOG_MODE_SINGLE_LINE:
+        _w(line.ljust(140), same_line=True)
+    else:
+        print(line)
 
-# ---------- Smoke ----------
+# -------------------- Smoke --------------------
 def hardware_smoke_test(ctx, seconds=0.6):
-    print(f"[INFO] NeoPixel bpp={getattr(pixels,'bpp','n/a')} order={ORDER} is_rgbw={LED_IS_RGBW}")
+    log_info(f"[INFO] NeoPixel bpp={getattr(pixels,'bpp','n/a')} order={ORDER} rgbw={LED_IS_RGBW}")
     colors = [(255,0,0),(0,255,0),(0,0,255),(255,255,255),(0,0,0)]
     for rgb in colors:
         arr = np.tile(np.array(rgb, dtype=np.uint8), (LED_COUNT, 1))
         ctx.to_pixels_and_show(arr); time.sleep(seconds)
 
-# ---------- Main ----------
+# -------------------- Main --------------------
 def main():
     global stop_flag, latency_ms_ema, latest_packet, _band_idx, _band_idx_for, reset_flag
+
     threading.Thread(target=timesync_tcp_server, daemon=True).start()
     threading.Thread(target=udp_receiver, daemon=True).start()
     threading.Thread(target=palette_worker, daemon=True).start()
@@ -363,34 +407,36 @@ def main():
     if ENABLE_SMOKE_TEST:
         hardware_smoke_test(ctx, seconds=0.6)
 
-    current_effect = 0
-    last_effect_change = time.time()
+    current_effect      = 0
+    last_effect_change  = time.time()
     effect_max_interval = 300.0
 
     last_bands = np.zeros(EXPECTED_BANDS, dtype=np.uint8)
-    last_beat = 0
+    last_beat  = 0
+
     SIGNAL_HOLD = SIGNAL_HOLD_MS / 1000.0
-    FRAME_DT = 1.0 / max(1, CFG_FPS)
-    RENDER_DT = 1.0 / max(1, CFG_VIS_FPS)
+    FRAME_DT    = 1.0 / max(1, CFG_FPS)
+    RENDER_DT   = 1.0 / max(1, CFG_VIS_FPS)
+
     signal_active_until = 0.0
-    already_off = False
-    last_rx_ts = time.time()
-    next_frame = time.time()
-    last_render_ts = 0.0
+    already_off         = False
+    last_rx_ts          = time.time()
+    next_frame          = time.time()
+    last_render_ts      = 0.0
 
     try:
         while True:
             now = time.time()
 
-            # Atualiza tempos desejados dinamicamente
-            desired_frame_dt = 1.0 / max(1, CFG_FPS)
-            desired_hold = SIGNAL_HOLD_MS / 1000.0
+            # Recarrega tempos desejados dinamicamente (depois de B0)
+            desired_frame_dt  = 1.0 / max(1, CFG_FPS)
+            desired_hold      = SIGNAL_HOLD_MS / 1000.0
             desired_render_dt = 1.0 / max(1, CFG_VIS_FPS)
-            if abs(desired_frame_dt - FRAME_DT) > 1e-6: FRAME_DT = desired_frame_dt
-            if abs(desired_hold - SIGNAL_HOLD) > 1e-6: SIGNAL_HOLD = desired_hold
-            if abs(desired_render_dt- RENDER_DT) > 1e-6: RENDER_DT = desired_render_dt
+            if abs(desired_frame_dt  - FRAME_DT)  > 1e-6: FRAME_DT  = desired_frame_dt
+            if abs(desired_hold      - SIGNAL_HOLD) > 1e-6: SIGNAL_HOLD = desired_hold
+            if abs(desired_render_dt - RENDER_DT) > 1e-6: RENDER_DT = desired_render_dt
 
-            # Teclas
+            # Teclado
             global pending_key_change
             if pending_key_change is not None:
                 if pending_key_change == 'next':
@@ -401,6 +447,7 @@ def main():
                 apply_new_colorset()
                 push_palette_to_ctx(ctx)
                 last_effect_change = now
+                log_event_inline("[KEY] effect change")
 
             # RESET remoto/local
             if reset_flag:
@@ -409,16 +456,16 @@ def main():
                     latest_packet = None
                 pixels.fill((0,0,0)); pixels.show()
                 last_bands = np.zeros(EXPECTED_BANDS, dtype=np.uint8)
-                last_beat = 0
+                last_beat  = 0
                 signal_active_until = 0.0
                 already_off = False
                 _band_idx_for = -1  # força recálculo
                 apply_new_colorset()
                 push_palette_to_ctx(ctx)
                 last_effect_change = now
-                print("\n[RST] Reset aplicado (B1/tecla).")
+                log_event_inline("[RST] reset aplicado")
 
-            # Timeout RX: apaga fita
+            # Timeout RX: apaga fita e mostra status
             if (now - last_rx_ts) > 2.0:
                 if not already_off:
                     pixels.fill((0,0,0)); pixels.show()
@@ -441,7 +488,7 @@ def main():
                 bands_u8, beat_flag, transition_flag, ts_pc_ns, dyn_floor, kick_intensity = pkt
                 last_rx_ts = now
 
-                # chegou pacote após idle: arma hold e libera render imediato
+                # saiu do idle => arma hold e libera render imediato
                 if already_off:
                     already_off = False
                     signal_active_until = now + (SIGNAL_HOLD_MS / 1000.0)
@@ -470,10 +517,8 @@ def main():
                     last_bands[:] = bands_u8
                     last_beat = int(beat_flag)
 
-                # Piso dinâmico (não utilizado nos efeitos base)
                 ctx.dynamic_floor = int(dyn_floor)
 
-                # Troca automática de efeito
                 time_up = (now - last_effect_change) > effect_max_interval
                 if transition_flag == 1 or time_up:
                     current_effect = (current_effect + 1) % len(effects)
@@ -490,41 +535,36 @@ def main():
                 _band_idx_for = b.size
 
             # Render
+            name = effects[current_effect][0] if not BYPASS_EFFECTS else "Fallback HSV (LUT)"
             if (now - last_render_ts) >= RENDER_DT:
                 last_render_ts = now
                 try:
                     if not BYPASS_EFFECTS:
-                        name, func = effects[current_effect]
+                        _, func = effects[current_effect]
                         b_in = b if active else _zeros_of(b.size)
                         func(b_in, last_beat if active else 0, active)
                     else:
+                        # fallback direto HSV por LUT
                         np.take(b, _band_idx, out=_vals_buf)
                         np.take(GAMMA_LUT, _vals_buf, out=_v_buf)
                         np.add(H_IDX_BASE_U16, _v_buf.astype(np.uint16), out=_idx_buf_u16, dtype=np.uint16)
                         rgb = HSV_LUT_FLAT[_idx_buf_u16]
                         ctx.to_pixels_and_show(rgb)
-                        name = "Fallback HSV (LUT)"
                 except Exception as e:
                     vals = np.repeat(b, 2)
-                    if vals.size < LED_COUNT:
-                        vals = np.pad(vals, (0, LED_COUNT - vals.size), 'constant')
-                    else:
-                        vals = vals[:LED_COUNT]
+                    if vals.size < LED_COUNT: vals = np.pad(vals, (0, LED_COUNT - vals.size), 'constant')
+                    else: vals = vals[:LED_COUNT]
                     rgb = np.stack([vals, vals, vals], axis=-1)
                     ctx.to_pixels_and_show(rgb)
                     name = f"Fallback Gray ({e.__class__.__name__})"
-            else:
-                name = effects[current_effect][0] if not BYPASS_EFFECTS else "Fallback HSV (LUT)"
 
             unified_status_line(name, ctx, active, b.size, CFG_FPS, CFG_VIS_FPS, current_palette_name)
 
-            # pacing do loop
+            # pacing
             next_frame += FRAME_DT
             sl = next_frame - time.time()
-            if sl > 0:
-                time.sleep(sl)
-            else:
-                next_frame = time.time()
+            if sl > 0: time.sleep(sl)
+            else: next_frame = time.time()
 
     except KeyboardInterrupt:
         pass
@@ -532,6 +572,8 @@ def main():
         stop_flag = True
         palette_thread_stop.set()
         pixels.fill((0, 0, 0)); pixels.show()
+        if LOG_MODE_SINGLE_LINE:
+            _w("\r".ljust(140), same_line=True)
         sys.stdout.write("\n"); sys.stdout.flush()
 
 if __name__ == "__main__":
