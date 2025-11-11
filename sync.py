@@ -66,7 +66,6 @@ stop_flag          = False
 reset_flag         = False
 
 # -------------------- CLI simples --------------------
-# Para manter 1 arquivo, tratamos flags básicas manualmente.
 LOG_MODE_SINGLE_LINE = True
 for i, arg in enumerate(list(sys.argv)[1:]):
     if arg == "--log-mode" and i+2 <= len(sys.argv)-1:
@@ -75,11 +74,9 @@ for i, arg in enumerate(list(sys.argv)[1:]):
     elif arg.startswith("--log-mode="):
         val = arg.split("=",1)[1]
         LOG_MODE_SINGLE_LINE = (val.strip().lower() == "single")
-# Ex.: python3 sync.py --log-mode multi
 
 # -------------------- Helpers de log --------------------
 def _w(s: str, *, same_line: bool):
-    """Escreve no stdout com ou sem quebra de linha."""
     if same_line:
         sys.stdout.write("\r" + s)
         sys.stdout.flush()
@@ -87,14 +84,12 @@ def _w(s: str, *, same_line: bool):
         print(s, flush=True)
 
 def log_info(msg: str):
-    # Informativos fora do loop principal: em multi, linha nova; em single, linha nova curta.
     if LOG_MODE_SINGLE_LINE:
         _w(msg.ljust(140), same_line=True)
     else:
         print(msg)
 
 def log_event_inline(msg: str):
-    # Eventos dentro do loop principal (p. ex. reset, idle) respeitam modo single.
     if LOG_MODE_SINGLE_LINE:
         _w(msg.ljust(140), same_line=True)
     else:
@@ -118,6 +113,7 @@ _last_status_ts    = 0.0
 
 # HSV LUT achatada (65536 x 3)
 HSV_LUT_FLAT = None
+
 def _build_hv_lut_flat(s_fixed: int = 255):
     h_vals = np.arange(256, dtype=np.uint8)
     v_vals = np.arange(256, dtype=np.uint8)
@@ -130,11 +126,12 @@ def _build_hv_lut_flat(s_fixed: int = 255):
 HSV_LUT_FLAT  = _build_hv_lut_flat(255)
 H_IDX_BASE_U16= (H_FIXED << 8).astype(np.uint16)
 
-_vals_buf     = np.empty(LED_COUNT, dtype=np.uint8)   # bandas mapeadas para LEDs
-_v_buf        = np.empty(LED_COUNT, dtype=np.uint8)   # gamma(v)
-_idx_buf_u16  = np.empty(LED_COUNT, dtype=np.uint16)  # h*256 + v
+_vals_buf     = np.empty(LED_COUNT, dtype=np.uint8)
+_v_buf        = np.empty(LED_COUNT, dtype=np.uint8)
+_idx_buf_u16  = np.empty(LED_COUNT, dtype=np.uint16)
 
 _ZERO_CACHE = {}
+
 def _zeros_of(n):
     arr = _ZERO_CACHE.get(n)
     if arr is None:
@@ -182,6 +179,7 @@ def timesync_tcp_server():
 # -------------------- Paleta / cores --------------------
 STRATEGIES = ["complementar", "analoga", "triade", "tetrade", "split"]
 COMPLEMENT_DELTA = 0.06
+
 def clamp01(x): return x % 1.0
 
 def build_palette_from_strategy(h0, strategy, num_colors=5):
@@ -428,7 +426,6 @@ def main():
         while True:
             now = time.time()
 
-            # Recarrega tempos desejados dinamicamente (depois de B0)
             desired_frame_dt  = 1.0 / max(1, CFG_FPS)
             desired_hold      = SIGNAL_HOLD_MS / 1000.0
             desired_render_dt = 1.0 / max(1, CFG_VIS_FPS)
@@ -436,7 +433,6 @@ def main():
             if abs(desired_hold      - SIGNAL_HOLD) > 1e-6: SIGNAL_HOLD = desired_hold
             if abs(desired_render_dt - RENDER_DT) > 1e-6: RENDER_DT = desired_render_dt
 
-            # Teclado
             global pending_key_change
             if pending_key_change is not None:
                 if pending_key_change == 'next':
@@ -449,7 +445,6 @@ def main():
                 last_effect_change = now
                 log_event_inline("[KEY] effect change")
 
-            # RESET remoto/local
             if reset_flag:
                 reset_flag = False
                 with latest_lock:
@@ -459,13 +454,12 @@ def main():
                 last_beat  = 0
                 signal_active_until = 0.0
                 already_off = False
-                _band_idx_for = -1  # força recálculo
+                _band_idx_for = -1
                 apply_new_colorset()
                 push_palette_to_ctx(ctx)
                 last_effect_change = now
                 log_event_inline("[RST] reset aplicado")
 
-            # Timeout RX: apaga fita e mostra status
             if (now - last_rx_ts) > 2.0:
                 if not already_off:
                     pixels.fill((0,0,0)); pixels.show()
@@ -477,7 +471,6 @@ def main():
                 else: next_frame = time.time()
                 continue
 
-            # Pega último pacote
             pkt = None
             with latest_lock:
                 if latest_packet is not None:
@@ -488,12 +481,10 @@ def main():
                 bands_u8, beat_flag, transition_flag, ts_pc_ns, dyn_floor, kick_intensity = pkt
                 last_rx_ts = now
 
-                # saiu do idle => arma hold e libera render imediato
                 if already_off:
                     already_off = False
                     signal_active_until = now + (SIGNAL_HOLD_MS / 1000.0)
 
-                # latência (se timesync ok)
                 global time_sync_ready, time_offset_ns
                 if time_sync_ready and ts_pc_ns is not None:
                     now_ns = time.monotonic_ns()
@@ -529,12 +520,10 @@ def main():
             active = (now < signal_active_until)
             b = last_bands
 
-            # Recalcula mapeamento LED->banda se mudou bands
             if _band_idx_for != b.size:
                 _band_idx = (LED_IDX * b.size) // LED_COUNT
                 _band_idx_for = b.size
 
-            # Render
             name = effects[current_effect][0] if not BYPASS_EFFECTS else "Fallback HSV (LUT)"
             if (now - last_render_ts) >= RENDER_DT:
                 last_render_ts = now
@@ -544,7 +533,6 @@ def main():
                         b_in = b if active else _zeros_of(b.size)
                         func(b_in, last_beat if active else 0, active)
                     else:
-                        # fallback direto HSV por LUT
                         np.take(b, _band_idx, out=_vals_buf)
                         np.take(GAMMA_LUT, _vals_buf, out=_v_buf)
                         np.add(H_IDX_BASE_U16, _v_buf.astype(np.uint16), out=_idx_buf_u16, dtype=np.uint16)
@@ -560,7 +548,6 @@ def main():
 
             unified_status_line(name, ctx, active, b.size, CFG_FPS, CFG_VIS_FPS, current_palette_name)
 
-            # pacing
             next_frame += FRAME_DT
             sl = next_frame - time.time()
             if sl > 0: time.sleep(sl)
