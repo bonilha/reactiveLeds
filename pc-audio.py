@@ -1,35 +1,210 @@
-# pc-audio.py — Captura, processa e envia bandas PRONTAS (UDP) para o Raspberry Pi.
-# Protocolos: A2 (áudio pronto) + B0 (config de parâmetros comuns)
-# • Mantém tentativa de time-sync contínua (não encerra em timeout)
-# • Envia config (burst inicial + periódico) e começa a transmitir assim que houver sync
-# • Parâmetros “idênticos” centralizados aqui: --bands, --fps, --signal-hold, --vis-fps
+#!/usr/bin/env python3
+# pc-audio.py - Web UI + WebSocket + Captura WASAPI loopback + Auto Mode e Calibracao
+# Envia A2 (dyn_floor + kick_intensity) e empurra CFG (B0) para o RPi.
+# Fabio Bonilha (consolidacao por M365 Copilot)
+# Data: 2025-11-11
 
+import asyncio
 import socket
 import time
-import numpy as np
-import sounddevice as sd
-from collections import deque
 import sys
 import platform
 import threading
 import argparse
-from typing import Optional, Union
+from collections import deque
+from typing import Optional, Union, Deque, Tuple
 
-# --- Web UI imports ---
-from flask import Flask, Response, request, jsonify
-from flask import stream_with_context
-import json
+import numpy as np
+import sounddevice as sd
+from aiohttp import web
 
-# ------------------------------- Constantes -----------------------------------
-DEFAULT_RASPBERRY_IP = "192.168.66.71"
+# ============================= Config padrao =============================
+RASPBERRY_IP = "192.168.66.71"
 UDP_PORT = 5005
 TCP_TIME_PORT = 5006
 
-PKT_AUDIO_V2 = 0xA2  # [A2][8 ts_pc][bands(150)][beat][trans][dyn_floor][kick] => 163 bytes p/ 150 bandas
-PKT_CFG = 0xB0       # [B0][ver u8][num_bands u16][fps u16][signal_hold_ms u16][vis_fps u16] => 10 bytes
+DEFAULT_NUM_BANDS = 150
+BLOCK_SIZE = 1024
+FMIN, FMAX = 20.0, 16000.0
+EMA_ALPHA = 0.75
 
-# --------------------------- Utils de dispositivo -----------------------------
-def resolve_device_index(name_or_index: Optional[Union[str, int]]) -> Optional[int]:
+# Beat detection simples (graves)
+ENERGY_BUFFER_SIZE = 10
+BEAT_THRESHOLD = 1.2
+BEAT_HEIGHT_MIN = 0.08
+
+# Time sync (habilitado por padrao; pode ser desativado por --no-require-sync)
+REQUIRE_TIME_SYNC = True
+RESYNC_INTERVAL_SEC = 60.0
+RESYNC_RETRY_INTERVAL = 2.0
+TIME_SYNC_SAMPLES = 12
+
+# Protocolo UDP para o RPi
+PKT_AUDIO_V2 = 0xA2  # [A2][8 ts_pc][bands][beat][trans][dyn_floor][kick]
+PKT_AUDIO    = 0xA1  # [A1][8 ts_pc][bands][beat][trans]
+PKT_CFG      = 0xB0  # [B0][1 ver][nb_lo][nb_hi][fps_lo][fps_hi][hold_lo][hold_hi][vis_lo][vis_hi]
+
+# ============================= HTML (Frontend) =============================
+HTML = """<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <title>Reactive LEDs - Monitor</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root{
+      --bg:#0d1117; --panel:#161b22; --ink:#c9d1d9; --muted:#8b949e;
+      --brand:#2ea043; --warn:#d29922; --danger:#f85149; --accent:#58a6ff;
+      --chip:#21262d; --chip-b:#30363d;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,Segoe UI,Roboto,Arial}
+    header{padding:16px 20px;background:linear-gradient(180deg,#0f1623, #0d1117)}
+    .wrap{max-width:1100px;margin:0 auto;padding:20px}
+    h1{margin:0 0 4px;font-size:18px}
+    .sub{color:var(--muted);font-size:12px}
+    .grid{display:grid;grid-template-columns:1fr;gap:16px}
+    @media(min-width:900px){.grid{grid-template-columns:1.2fr .8fr}}
+    .panel{background:var(--panel);border:1px solid var(--chip-b);border-radius:10px;padding:14px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    button{background:var(--chip);border:1px solid var(--chip-b);color:var(--ink);
+      border-radius:8px;padding:10px 14px;cursor:pointer;transition:.15s}
+    button:hover{border-color:var(--accent);box-shadow:0 0 0 2px #1f6feb33 inset}
+    .btn-brand{background:#1f6feb22;border-color:#1f6feb;color:#cfe6ff}
+    .btn-danger{background:#f8514920;border-color:#f85149;color:#ffcccc}
+    .btn-warn{background:#d2992220;border-color:#d29922;color:#ffe5b4}
+    .pill{padding:3px 8px;border-radius:999px;border:1px solid var(--chip-b);background:var(--chip);font-size:12px}
+    .ok{color:#8cffc9;border-color:#2ea043}
+    .bad{color:#ffb3b3;border-color:#f85149}
+    .muted{color:var(--muted)}
+    #spec{width:100%;height:260px;background:#0a0f16;border:1px solid var(--chip-b);border-radius:8px;display:block}
+    .kvs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+    .kv{background:var(--chip);border:1px solid var(--chip-b);border-radius:8px;padding:8px 10px}
+    .kv b{float:right;color:#fff}
+    .split{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    a.link{color:#9ecbff;text-decoration:none}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <h1>Reactive LEDs</h1>
+      <div class="sub">Monitor de audio + Auto Mode para silencio/musica</div>
+    </div>
+  </header>
+  <div class="wrap grid">
+    <section class="panel">
+      <canvas id="spec"></canvas>
+    </section>
+
+    <section class="panel">
+      <div class="split">
+        <span class="pill" id="badgeConn">Conectando...</span>
+        <span class="pill" id="badgeAuto">Auto: OFF</span>
+        <span class="pill" id="badgeState">Estado: -</span>
+      </div>
+      <div style="height:8px"></div>
+      <div class="row">
+        <button id="btnAuto" class="btn-brand">Ajuste automatico de musica (ligar/desligar)</button>
+        <button id="btnCalib" class="btn-warn">Nivel de silencio (calibrar 5s)</button>
+        <button id="btnSilence" class="btn-danger">Forcar silencio agora</button>
+      </div>
+      <div style="height:10px"></div>
+      <div class="kvs">
+        <div class="kv">Device <b id="dev">-</b></div>
+        <div class="kv">SR/Ch <b id="srch">-</b></div>
+        <div class="kv">AVG <b id="avg">0</b></div>
+        <div class="kv">RMS <b id="rms">0</b></div>
+        <div class="kv">TX <b id="tx">0</b></div>
+        <div class="kv">FPS <b id="fps">0</b></div>
+        <div class="kv">lim AVG(sil) <b id="limAvg">-</b></div>
+        <div class="kv">lim RMS(sil) <b id="limRms">-</b></div>
+        <div class="kv">resume x <b id="resume">-</b></div>
+      </div>
+      <div style="height:6px"></div>
+      <div class="muted">Use <code>/api/status</code> para JSON detalhado.</div>
+    </section>
+  </div>
+
+  <script>
+  (() => {
+    const c = document.getElementById('spec');
+    const ctx = c.getContext('2d');
+    const el = id => document.getElementById(id);
+    const badgeConn=el('badgeConn'), badgeAuto=el('badgeAuto'), badgeState=el('badgeState');
+    const dev=el('dev'), srch=el('srch'), avg=el('avg'), rms=el('rms'), tx=el('tx'), fps=el('fps');
+    const limAvg=el('limAvg'), limRms=el('limRms'), resume=el('resume');
+
+    function resize(){ c.width=c.clientWidth; c.height=260; }
+    window.addEventListener('resize', resize); resize();
+
+    const wsUrl = (location.protocol==='https:'?'wss://':'ws://') + location.host + '/ws';
+    let ws;
+
+    function draw(bands, beat){
+      ctx.clearRect(0,0,c.width,c.height);
+      if (!bands || !bands.length) return;
+      const w = c.width / bands.length;
+      for(let i=0;i<bands.length;i++){
+        const v = bands[i]/255;
+        const h = (c.height-2) * v;
+        ctx.fillStyle = `hsl(${Math.floor(180+140*v)}, 90%, ${35+45*v}%)`;
+        ctx.fillRect(i*w, c.height-h, Math.max(1,w-1), h);
+      }
+      if (beat) { ctx.fillStyle='rgba(255,80,80,0.12)'; ctx.fillRect(0,0,c.width,c.height); }
+    }
+
+    function connect(){
+      ws = new WebSocket(wsUrl);
+      ws.onopen = () => { badgeConn.textContent='Conectado'; badgeConn.classList.add('ok'); };
+      ws.onclose = () => { badgeConn.textContent='Desconectado'; badgeConn.classList.remove('ok'); setTimeout(connect, 1200); };
+      ws.onmessage = (ev) => {
+        const d = JSON.parse(ev.data||'{}');
+        if (d.bands) draw(d.bands, d.beat);
+        fps.textContent = d.fps ?? 0;
+        avg.textContent = d.avg ?? 0;
+        rms.textContent = d.rms ?? 0;
+        tx.textContent  = d.tx_count ?? 0;
+        dev.textContent = d.device || '-';
+        srch.textContent= d.sr_ch || '-';
+        badgeState.textContent = 'Estado: ' + (d.silence ? 'silencio' : 'ativo');
+        badgeAuto.textContent = 'Auto: ' + (d.auto_mode ? 'ON' : 'OFF');
+        limAvg.textContent = d.th_silence_bands ?? '-';
+        limRms.textContent = d.th_silence_rms ?? '-';
+        resume.textContent = d.th_resume_factor ?? '-';
+      };
+    }
+    connect();
+
+    // Auto ON/OFF (toggle)
+    let autoWanted = false;
+    document.getElementById('btnAuto').onclick = async () => {
+      autoWanted = !autoWanted;
+      await fetch('/api/mode', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ mode: autoWanted ? 'auto_on' : 'auto_off' })
+      });
+    };
+
+    // Calibrar silencio 5s
+    document.getElementById('btnCalib').onclick = async () => {
+      await fetch('/api/mode', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ mode:'calibrate_silence', duration_sec: 5 })
+      });
+    };
+
+    // Forcar silencio (transicao imediata)
+    document.getElementById('btnSilence').onclick = async () => {
+      await fetch('/api/mode', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ mode:'true_silence' })
+      });
+    };
+  })();
+  </script>
+</body>
+</html>"""
+
+# ============================= Helpers de Device (Windows loopback) =============================
+def resolve_device_index(name_or_index: Optional[Union[str, int]]):
     if name_or_index is None:
         return None
     devs = sd.query_devices()
@@ -40,7 +215,7 @@ def resolve_device_index(name_or_index: Optional[Union[str, int]]) -> Optional[i
     except (TypeError, ValueError):
         pass
     needle = str(name_or_index).lower()
-    for i, d in enumerate(devs):
+    for i, d in enumerate(sd.query_devices()):
         if needle in d["name"].lower():
             return i
     return None
@@ -51,66 +226,52 @@ def auto_candidate_outputs():
     default_out = sd.default.device[1]
     if isinstance(default_out, int) and default_out >= 0:
         cands.append(default_out)
-    keywords = ["speaker","alto-falante","headphone","fone","realtek","echo","dot","hdmi","display audio"]
+    keywords = ["speaker","alto-falante","headphone","fone","realtek","echo","dot","hdmi","display audio","nvidia","realtek hd"]
     for i, d in enumerate(devs):
-        if d.get("max_output_channels", 0) > 0 and any(k in d["name"].lower() for k in keywords):
-            if i not in cands:
-                cands.append(i)
+        if d.get("max_output_channels",0)>0 and any(k in d["name"].lower() for k in keywords):
+            if i not in cands: cands.append(i)
     for i, d in enumerate(devs):
-        if d.get("max_output_channels", 0) > 0 and i not in cands:
+        if d.get("max_output_channels",0)>0 and i not in cands:
             cands.append(i)
     return cands
 
-def choose_candidates(override: Optional[Union[str, int]] = None):
+def choose_candidates(override: Optional[Union[str,int]]=None):
     devs = sd.query_devices()
     system = platform.system().lower()
     idx = resolve_device_index(override)
     if idx is not None:
         d = devs[idx]
         extra = None
-        if system.startswith("win") and d.get("max_output_channels", 0) > 0:
+        loopback = False
+        if system.startswith("win") and d.get("max_output_channels",0)>0:
             try:
                 extra = sd.WasapiSettings(loopback=True)
+                loopback = True
             except Exception:
                 extra = None
-        return [(idx, extra, f"Override: idx={idx} '{d['name']}' (loopback={extra is not None})")]
+                loopback = False
+        tag = f"{'WASAPI loopback' if loopback else 'OUTPUT (no-loopback)'}: '{d['name']}'"
+        return [(idx, extra, tag)]
     if system.startswith("win"):
         cands = []
         for i in auto_candidate_outputs():
             d = devs[i]
             try:
                 extra = sd.WasapiSettings(loopback=True)
+                tag = f"WASAPI loopback: '{d['name']}'"
             except Exception:
                 extra = None
-            cands.append((i, extra, f"WASAPI loopback: '{d['name']}'"))
+                tag = f"OUTPUT (no-loopback): '{d['name']}'"
+            cands.append((i, extra, tag))
         if cands:
             return cands
     default_in = sd.default.device[0]
     if isinstance(default_in, int) and default_in >= 0:
         d = devs[default_in]
-        return [(default_in, None, f"Default INPUT: idx={default_in} '{d['name']}'")]
+        return [(default_in, None, f"Default INPUT (mic): idx={default_in} '{d['name']}'")]
     return [(None, None, "PortAudio default (fallback)")]
 
-def open_with_probe(dev_idx, extra, callback, block_size):
-    attempts = [(48000,2),(48000,1),(44100,2),(44100,1)]
-    last_err = None
-    for sr_try, ch_try in attempts:
-        try:
-            s = sd.InputStream(channels=ch_try, samplerate=sr_try, dtype="float32",
-                               blocksize=block_size, device=dev_idx,
-                               callback=callback, extra_settings=extra)
-            return s, int(s.samplerate), ch_try, f"(opened sr={int(s.samplerate)} ch={ch_try})"
-        except Exception as e:
-            last_err = e
-    try:
-        s = sd.InputStream(channels=2, samplerate=44100, dtype="float32",
-                           blocksize=block_size, device=None, callback=callback)
-        return s, int(s.samplerate), 2, "(fallback default INPUT sr=44100 ch=2)"
-    except Exception as e:
-        last_err = e
-    raise last_err if last_err else RuntimeError("Falha ao abrir InputStream.")
-
-# ------------------------------ FFT / Bandas ----------------------------------
+# ============================= FFT / Bandas =============================
 def make_bands_indices(nfft, sr, num_bands, fmin, fmax_limit):
     freqs = np.fft.rfftfreq(nfft, 1.0/sr)
     fmax = min(fmax_limit, sr/2.0)
@@ -121,7 +282,7 @@ def make_bands_indices(nfft, sr, num_bands, fmin, fmax_limit):
     b_idx = np.maximum(b_idx, a_idx + 1)
     return a_idx, b_idx
 
-def make_compute_bands(sr, block_size, band_starts, band_ends, raw_ema_alpha, peak_ema_alpha):
+def make_compute_bands(sr, block_size, band_starts, band_ends, ema_alpha, peak_ema_alpha):
     window = np.hanning(block_size).astype(np.float32)
     ema_bands = np.zeros(len(band_starts), dtype=np.float32)
     peak_ema = 1.0
@@ -138,57 +299,29 @@ def make_compute_bands(sr, block_size, band_starts, band_ends, raw_ema_alpha, pe
         peak_ema = (1.0 - peak_ema_alpha) * peak_ema + peak_ema_alpha * max(cur_max, 1e-6)
         norm = max(peak_ema, 1e-6)
         vals = (vals / norm).clip(0.0, 1.0)
-        ema_bands = raw_ema_alpha * vals + (1.0 - raw_ema_alpha) * ema_bands
-        return ema_bands  # 0..1
+        ema_bands = ema_alpha * vals + (1.0 - ema_alpha) * ema_bands
+        return (ema_bands * 255.0).clip(0,255).astype(np.uint8)
     return compute
 
-# -------------------------------- Contextos -----------------------------------
-class Shared:
-    def __init__(self, n_bands: int):
-        self.bands_eq_u8 = np.zeros(n_bands, dtype=np.uint8)
-        self.beat = 0
-        self.kick_intensity = 0
-        self.avg = 0.0
-        self.rms = 0.0
-        self.avg_ema = 0.0
-        self.rms_ema = 0.0
-        self.block_max = 0.0
-        self.last_update = 0.0
-        # sinais extras p/ UI
-        self.gate_active = False
-        self.is_quiet = False
-        self.resume_threshold = 0.0
-
-class Ctx:
-    def __init__(self, rpi_ip: str, max_fps: int):
-        self.rpi_ip = rpi_ip
-        self.max_fps = max_fps
-        self.min_send_interval = 1.0 / max(1, max_fps)
-        self.tx_count = 0
-        self.last_status = 0.0
-        self.time_sync_ok = False
-        self.stop_flag = threading.Event()
-        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
-        except Exception:
-            pass
-
-# ------------------------------- Time Sync ------------------------------------
+# ============================= Time Sync (TCP cliente) =============================
 def _recv_exact(sock, n):
     buf = b''
     while len(buf) < n:
         ch = sock.recv(n - len(buf))
         if not ch:
-            raise ConnectionError("Conexão fechada durante receive.")
+            raise ConnectionError("Conexao fechada durante receive.")
         buf += ch
     return buf
 
-def time_sync_over_tcp(ctx, samples=12, timeout=0.6):
-    """Faz 1 rodada de sync e retorna True/False (NÃO encerra o programa)."""
+_time_sync_ok = False
+_stop_resync = threading.Event()
+_last_status = 0.0
+
+def time_sync_over_tcp(raspberry_ip, port=TCP_TIME_PORT, samples=TIME_SYNC_SAMPLES, timeout=0.6):
+    global _time_sync_ok
     results = []
     try:
-        with socket.create_connection((ctx.rpi_ip, TCP_TIME_PORT), timeout=1.8) as s:
+        with socket.create_connection((raspberry_ip, port), timeout=1.8) as s:
             s.settimeout(timeout)
             for _ in range(samples):
                 t0 = time.monotonic_ns()
@@ -202,571 +335,638 @@ def time_sync_over_tcp(ctx, samples=12, timeout=0.6):
                     continue
                 t1 = time.monotonic_ns()
                 rtt = t1 - t0
-                mid = t0 + rtt // 2
+                mid = t0 + rtt//2
                 offset = tr_pi - mid
                 results.append((rtt, offset))
             if not results:
-                ctx.time_sync_ok = False
-                print("\n[WARN] Time sync TCP falhou (sem amostras válidas).")
+                _time_sync_ok = False
+                print("\n[WARN] Time sync TCP falhou (sem amostras validas).")
                 return False
             rtt_min, offset_best = sorted(results, key=lambda x: x[0])[0]
             s.sendall(b"TS3" + int(offset_best).to_bytes(8, 'little', signed=True))
             ack = _recv_exact(s, 3 + 8)
             ok = (ack[:3] == b"TS3" and int.from_bytes(ack[3:11], 'little', signed=True) == int(offset_best))
-            ctx.time_sync_ok = bool(ok)
+            _time_sync_ok = bool(ok)
             print(f"\n[INFO] Time sync TCP: RTT_min={rtt_min/1e6:.2f} ms, offset={offset_best/1e6:.3f} ms, ack={'OK' if ok else 'NOK'}")
-            return ctx.time_sync_ok
+            return _time_sync_ok
     except Exception as e:
-        ctx.time_sync_ok = False
+        _time_sync_ok = False
         print(f"\n[WARN] Time sync TCP erro: {e}")
         return False
 
-def resync_loop(ctx, interval_ok=60.0, interval_fail=2.0):
-    """Loop que fica tentando sync para sempre (não bloqueia o main)."""
-    while not ctx.stop_flag.is_set():
-        ok = time_sync_over_tcp(ctx)
-        wait = interval_ok if ok else interval_fail
-        for _ in range(int(wait*10)):
-            if ctx.stop_flag.is_set():
-                return
-            time.sleep(0.1)
+def resync_worker(raspberry_ip, resync_interval):
+    while not _stop_resync.is_set():
+        if _time_sync_ok:
+            if _stop_resync.wait(resync_interval):
+                break
+        else:
+            if _stop_resync.wait(RESYNC_RETRY_INTERVAL):
+                break
+        time_sync_over_tcp(raspberry_ip)
 
-# --------------------------------- Status -------------------------------------
-def print_status(ctx, tag_extra: str = "", debug_line: str = ""):
+# ============================= Estado compartilhado =============================
+class Shared:
+    def __init__(self, n_bands):
+        self.bands = np.zeros(n_bands, dtype=np.uint8)
+        self.beat = 0
+        self.avg = 0.0
+        self.rms = 0.0
+        self.active = False
+        self.tx_count = 0
+        self.device = ""
+        self.samplerate = 0
+        self.channels = 0
+        self.last_update = 0.0
+
+# ============================= UDP =============================
+udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+except Exception:
+    pass
+
+def send_packet_a1(bands_u8, beat_flag, transition_flag, rpi_ip, rpi_port, shared):
+    ts_ns = time.monotonic_ns()
+    payload = bytes([PKT_AUDIO]) + ts_ns.to_bytes(8, 'little') \
+            + bands_u8.tobytes() + bytes([beat_flag, transition_flag])
+    udp_sock.sendto(payload, (rpi_ip, rpi_port))
+    shared.tx_count += 1
+
+def send_packet_a2(bands_u8, beat_flag, transition_flag, dyn_floor, kick, rpi_ip, rpi_port, shared):
+    ts_ns = time.monotonic_ns()
+    payload = bytes([PKT_AUDIO_V2]) + ts_ns.to_bytes(8, 'little') \
+            + bands_u8.tobytes() + bytes([beat_flag, transition_flag, dyn_floor, kick])
+    udp_sock.sendto(payload, (rpi_ip, rpi_port))
+    shared.tx_count += 1
+
+def send_cfg_b0(rpi_ip, rpi_port, bands, fps, hold_ms, vis_fps):
+    # [B0][ver=1][nb_lo][nb_hi][fps_lo][fps_hi][hold_lo][hold_hi][vis_lo][vis_hi]
+    def le16(x): return [x & 0xFF, (x >> 8) & 0xFF]
+    pkt = bytearray()
+    pkt.append(PKT_CFG)
+    pkt.append(1)  # ver
+    pkt += bytes(le16(int(bands)))
+    pkt += bytes(le16(int(fps)))
+    pkt += bytes(le16(int(hold_ms)))
+    pkt += bytes(le16(int(vis_fps)))
+    udp_sock.sendto(bytes(pkt), (rpi_ip, rpi_port))
+
+# ============================= Servidor Web/WS =============================
+app = web.Application()
+
+async def handle_root(request):
+    return web.Response(body=HTML, content_type='text/html')
+app.router.add_get('/', handle_root)
+
+async def handle_status(request):
+    sh = request.app["shared"]
+    ss = request.app["server_state"]
+    return web.json_response({
+        "device": sh.device,
+        "samplerate": sh.samplerate,
+        "channels": sh.channels,
+        "avg": round(float(sh.avg), 2),
+        "rms": round(float(sh.rms), 6),
+        "active": bool(sh.active),
+        "tx_count": sh.tx_count,
+        "bands_len": len(sh.bands),
+        "auto_mode": bool(ss["auto_mode"]),
+        "th_silence_bands": round(ss["silence_bands"],1),
+        "th_silence_rms": round(ss["silence_rms"],6),
+        "th_resume_factor": round(ss["resume_factor"],2),
+        "time": time.time(),
+    })
+app.router.add_get('/api/status', handle_status)
+
+async def handle_mode(request):
+    data = await request.json()
+    ss = request.app["server_state"]
+    if data.get("mode") == "auto_on":
+        ss["auto_mode"] = True
+        print("\n[AUTO] ON - thresholds serao adaptados continuamente.")
+    elif data.get("mode") == "auto_off":
+        ss["auto_mode"] = False
+        print("\n[AUTO] OFF - thresholds permanecem fixos.")
+    elif data.get("mode") == "calibrate_silence":
+        dur = float(data.get("duration_sec", 5))
+        ss["calibrating"] = True
+        ss["calib_until"] = time.time() + max(1.0, min(15.0, dur))
+        ss["calib_avg"] = []
+        ss["calib_rms"] = []
+        print(f"\n[CALIB] Iniciando calib. de silencio por {dur:.1f}s...")
+    elif data.get("mode") == "true_silence":
+        ss["force_silence_once"] = True
+        print("\n[SILENCIO] Forcando apagamento de LEDs...")
+    elif data.get("mode") == "samba_mode":
+        ss["auto_mode"] = True
+        ss["safety_margin_avg"] = 1.5
+        ss["safety_margin_rms"] = 1.8
+        ss["resume_boost"] = 2.0
+        print("\n[SAMBA MODE] Auto ligado com margens agressivas.")
+    return web.json_response({"status": "ok"})
+app.router.add_post('/api/mode', handle_mode)
+
+async def handle_ws(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    print("[WS] Cliente conectado - monitor ao vivo ON")
+    last_sent = 0.0
+    sh = request.app["shared"]; ss = request.app["server_state"]
+    try:
+        while True:
+            now = time.time()
+            if now - last_sent >= 0.06:
+                srch = f"{sh.samplerate} / {sh.channels}"
+                await ws.send_json({
+                    "connected": True,
+                    "fps": round(1 / max(0.001, now - last_sent), 1),
+                    "bands": sh.bands.tolist(),
+                    "beat": bool(sh.beat),
+                    "silence": not sh.active,
+                    "avg": round(float(sh.avg), 1),
+                    "rms": round(float(sh.rms), 5),
+                    "tx_count": sh.tx_count,
+                    "device": sh.device,
+                    "sr_ch": srch,
+                    "auto_mode": bool(ss["auto_mode"]),
+                    "th_silence_bands": round(ss["silence_bands"],1),
+                    "th_silence_rms": round(ss["silence_rms"],6),
+                    "th_resume_factor": round(ss["resume_factor"],2),
+                })
+                last_sent = now
+            try:
+                msg = await asyncio.wait_for(ws.receive(), timeout=0.01)
+                if msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
+                    break
+            except asyncio.TimeoutError:
+                pass
+    except Exception as e:
+        print(f"[WS] Erro: {e}")
+    finally:
+        print("[WS] Cliente desconectado")
+    return ws
+app.router.add_get('/ws', handle_ws)
+
+# ============================= Util de status no console =============================
+def print_status(shared, tag_extra: str = "", require_sync=True):
+    global _last_status, _time_sync_ok
     now = time.time()
-    if (now - ctx.last_status) > 0.25:
-        tag = "SYNC✓" if ctx.time_sync_ok else "WAITING SYNC"
-        extra = f" {tag_extra}" if tag_extra else ""
-        dbg = f" {debug_line}" if debug_line else ""
-        sys.stdout.write(f"\rTX: {ctx.tx_count} {tag}{extra}{dbg}")
+    if (now - _last_status) > 0.25:
+        tag = "SYNC✓" if _time_sync_ok else ("SYNC OFF" if not require_sync else "WAITING SYNC")
+        sys.stdout.write(f"\rTX: {shared.tx_count} {tag}{tag_extra}")
         sys.stdout.flush()
-        ctx.last_status = now
+        _last_status = now
 
-# ----------------------------------- Main -------------------------------------
+# ============================= Main =============================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--ip", type=str, default=DEFAULT_RASPBERRY_IP)
-    parser.add_argument("--block-size", type=int, default=512)
-    parser.add_argument("--fps", type=int, default=75)           # cadência de envio
-    parser.add_argument("--bands", type=int, default=150)         # número de bandas
-    parser.add_argument("--signal-hold", type=int, default=500)   # sustain no Pi (ms)
-    parser.add_argument("--vis-fps", type=int, default=45)        # FPS de render do Pi
-    # Equalização/normalização
-    parser.add_argument("--eq-target", type=float, default=64.0)
-    parser.add_argument("--eq-alpha", type=float, default=0.35)
-    parser.add_argument("--tilt-min", type=float, default=0.9)
-    parser.add_argument("--tilt-max", type=float, default=1.8)
-    parser.add_argument("--norm-peak-ema", type=float, default=0.40)
-    parser.add_argument("--raw-ema", type=float, default=1.0)
-    # Pós-EQ
-    parser.add_argument("--post-attack", type=float, default=1.0)
-    parser.add_argument("--post-release", type=float, default=1.0)
-    # Gate
-    parser.add_argument("--silence-bands", type=float, default=3.0)
-    parser.add_argument("--silence-rms", type=float, default=1e-5)
-    parser.add_argument("--silence-duration", type=float, default=0.8)
-    parser.add_argument("--resume-factor", type=float, default=2.0)
-    parser.add_argument("--resume-stable", type=float, default=0.4)
-    # Resync
-    parser.add_argument("--resync", type=float, default=60.0)
-    # Debug
-    parser.add_argument("--debug", action="store_true")
-    # Web UI
-    parser.add_argument("--web-ui", action="store_true", help="Habilita dashboard web local")
-    parser.add_argument("--web-port", type=int, default=8787, help="Porta do dashboard web")
-    parser.add_argument("--web-fps", type=float, default=12.0, help="Taxa de atualização da UI (frames/s)")
+    parser.add_argument('--bind', type=str, default='0.0.0.0', help='Endereco para o servidor web (default: 0.0.0.0)')
+    parser.add_argument('--port', type=int, default=8000, help='Porta do servidor web (default: 8000)')
+    parser.add_argument('--device', type=str, default=None, help='Nome ou indice do device de saida (WASAPI loopback no Windows).')
+    parser.add_argument('--raspberry-ip', type=str, default=RASPBERRY_IP, help='IP do Raspberry para envio UDP.')
+    parser.add_argument('--udp-port', type=int, default=UDP_PORT, help='Porta UDP no Raspberry.')
+    parser.add_argument('--bands', type=int, default=DEFAULT_NUM_BANDS, help='Numero de bandas.')
+
+    # Packet choice
+    parser.add_argument('--pkt', type=str, choices=['a1','a2'], default='a2', help='Formato de envio do audio (a1 ou a2).')
+
+    # CFG que sera empurrado via B0
+    parser.add_argument('--tx-fps', type=int, default=50, help='FPS do TX (para B0).')
+    parser.add_argument('--signal-hold-ms', type=int, default=600, help='Hold de sinal no RPi (para B0).')
+    parser.add_argument('--vis-fps', type=int, default=45, help='FPS de render no RPi (para B0).')
+
+    # Time-sync
+    parser.add_argument('--require-sync', action='store_true', help='Requer time-sync TCP antes de transmitir.')
+    parser.add_argument('--no-require-sync', action='store_true', help='Nao requer time-sync (ignora).')
+    parser.add_argument('--resync', type=float, default=RESYNC_INTERVAL_SEC, help='Intervalo de re-sync TCP (s).')
+
+    # Gate de silencio (defaults realistas)
+    parser.add_argument('--silence-bands', type=float, default=28.0)
+    parser.add_argument('--silence-rms',   type=float, default=0.0015)
+    parser.add_argument('--silence-duration', type=float, default=0.8)
+    parser.add_argument('--resume-factor', type=float, default=1.8)
+    parser.add_argument('--resume-stable', type=float, default=0.35)
+
+    # Alphas + Auto Mode params
+    parser.add_argument('--avg-ema', type=float, default=0.05)
+    parser.add_argument('--rms-ema', type=float, default=0.05)
+    parser.add_argument('--norm-peak-ema', type=float, default=0.10)
+    parser.add_argument('--auto-noise-window', type=float, default=8.0, help='Janela (s) p/ percentil de ruido.')
+    parser.add_argument('--auto-music-window', type=float, default=6.0, help='Janela (s) p/ percentil de musica.')
+    parser.add_argument('--auto-noise-p', type=float, default=0.20, help='Percentil de ruido (0..1).')
+    parser.add_argument('--auto-music-p', type=float, default=0.80, help='Percentil de musica (0..1).')
+    parser.add_argument('--auto-margin-avg', type=float, default=1.4, help='Margem sobre AVG do ruido.')
+    parser.add_argument('--auto-margin-rms', type=float, default=1.6, help='Margem sobre RMS do ruido.')
+    parser.add_argument('--auto-resume-boost', type=float, default=1.8, help='Fator p/ resume vs silencio.')
 
     args = parser.parse_args()
+    n_bands = int(args.bands)
 
-    NUM_BANDS = int(args.bands)
-    MAX_FPS = int(args.fps)
-    MIN_SEND_INTERVAL = 1.0 / max(1, MAX_FPS)
-    SIGNAL_HOLD_MS = int(args.signal_hold)
-    VIS_FPS = int(args.vis_fps)
+    # FPS efetivo do TX
+    TX_FPS = max(1, int(args.tx_fps))
+    MIN_SEND_INTERVAL = 1.0 / TX_FPS
 
-    # Contexto PC (estado)
-    ctx = Ctx(args.ip, MAX_FPS)
-    shared = Shared(NUM_BANDS)
-
-    print(f"[CFG] bands={NUM_BANDS} fps={MAX_FPS} hold={SIGNAL_HOLD_MS}ms vis_fps={VIS_FPS} -> PC pipeline")
-    print("[INFO] Iniciando time-sync TCP (porta 5006)...")
-
-    # Thread de time-sync contínuo (não bloqueia o main)
-    threading.Thread(target=resync_loop, args=(ctx, float(args.resync), 2.0), daemon=True).start()
-
-    # ----------------------------- Envio de CONFIG (B0) ------------------------
-    def send_config_packet():
-        ver = 1
-        nb = NUM_BANDS & 0xFFFF
-        fps = MAX_FPS & 0xFFFF
-        hold = SIGNAL_HOLD_MS & 0xFFFF
-        vis = VIS_FPS & 0xFFFF
-        payload = bytes([
-            PKT_CFG, ver,
-            nb & 0xFF, (nb >> 8) & 0xFF,
-            fps & 0xFF, (fps >> 8) & 0xFF,
-            hold & 0xFF, (hold >> 8) & 0xFF,
-            vis & 0xFF, (vis >> 8) & 0xFF,
-        ])
-        ctx.udp_sock.sendto(payload, (ctx.rpi_ip, UDP_PORT))
-
-    def cfg_sender():
-        # Burst inicial: 5 pacotes em ~1s (cobre casos em que o Pi sobe depois)
-        for _ in range(5):
-            try: send_config_packet()
-            except Exception: pass
-            time.sleep(0.2)
-        # Periódico: a cada 2 s
-        while not ctx.stop_flag.is_set():
-            try: send_config_packet()
-            except Exception: pass
-            time.sleep(2.0)
-
-    threading.Thread(target=cfg_sender, daemon=True).start()
-
-    # --------------------- Config dinâmica (runtime) + Web ---------------------
-    CONFIG_LOCK = threading.Lock()
-    CFG = {
-        # Gate (defaults vindos dos args)
+    server_state = {
         "silence_bands": float(args.silence_bands),
         "silence_rms": float(args.silence_rms),
         "silence_duration": float(args.silence_duration),
         "resume_factor": float(args.resume_factor),
         "resume_stable": float(args.resume_stable),
-        # Pós-EQ / smoothing (opcionais p/ ajuste fino visível)
-        "eq_target": float(args.eq_target),
-        "eq_alpha": float(args.eq_alpha),
-        "post_attack": float(args.post_attack),
-        "post_release": float(args.post_release),
-        "tilt_min": float(args.tilt_min),
-        "tilt_max": float(args.tilt_max),
+
+        "avg_ema": float(args.avg_ema),
+        "rms_ema": float(args.rms_ema),
+        "norm_peak_ema": float(args.norm_peak_ema),
+
+        "auto_mode": False,
+        "force_silence_once": False,
+        "calibrating": False,
+        "calib_until": 0.0,
+        "calib_avg": [],
+        "calib_rms": [],
+
+        "noise_window": float(args.auto_noise_window),
+        "music_window": float(args.auto_music_window),
+        "p_noise": float(args.auto_noise_p),
+        "p_music": float(args.auto_music_p),
+        "safety_margin_avg": float(args.auto_margin_avg),
+        "safety_margin_rms": float(args.auto_margin_rms),
+        "resume_boost": float(args.auto_resume_boost),
     }
+    app["server_state"] = server_state
 
-    def get_cfg():
-        with CONFIG_LOCK:
-            return dict(CFG)
+    shared = Shared(n_bands)
+    app["shared"] = shared
 
-    def update_cfg(patch: dict):
-        changed = {}
-        with CONFIG_LOCK:
-            for k, v in patch.items():
-                if k in CFG:
-                    try:
-                        v = float(v)
-                    except Exception:
-                        pass
-                    CFG[k] = v
-                    changed[k] = v
-        return changed
+    # Servidor web
+    def start_web():
+        web.run_app(app, host=args.bind, port=args.port)
+    threading.Thread(target=start_web, daemon=True).start()
+    print(f"\n[WEB] Servindo em http://{args.bind}:{args.port} - abra no navegador (localhost, IP ou FQDN)")
 
-    # ----------------------------- Web UI (Flask/SSE) -------------------------
-    app = Flask(__name__)
+    # Time-sync
+    require_sync = REQUIRE_TIME_SYNC
+    if args.no_require_sync: require_sync = False
+    if args.require_sync:    require_sync = True
 
-    HTML_PAGE = """
-<!doctype html><html lang="pt-br"><head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>PC-Audio Dashboard</title>
-https://cdn.jsdelivr.net/npm/chart.js</script>
-<style>
- body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:16px;background:#0e1117;color:#e6edf3}
- .row{display:flex;gap:16px;flex-wrap:wrap}
- .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;flex:1;min-width:320px}
- .bars{height:180px}
- .ok{color:#3fb950}.warn{color:#d29922}.bad{color:#f85149}
- label{display:block;margin:6px 0 2px}
- input[type=number]{width:140px}
- button{padding:6px 10px;border-radius:6px;border:1px solid #30363d;background:#21262d;color:#e6edf3;cursor:pointer}
- button:hover{background:#30363d}
- .grid{display:grid;grid-template-columns:repeat(2,minmax(180px,1fr));gap:8px}
- small{color:#8b949e}
-</style>
-</head><body>
-<h2>PC-Audio Dashboard</h2>
-<div class="row">
-  <div class="card" style="flex:2">
-    <canvas id="bars" class="bars"></canvas>
-    <small>Barras (EQ normalizada 0..255)</small>
-  </div>
-  <div class="card" style="min-width:320px">
-    <div><b>Status:</b> <span id="gate">–</span> • <span id="beat">Beat: 0</span> • <span id="kick">Kick: 0</span></div>
-    <div style="margin-top:8px" class="grid">
-      <div><b>avg_ema</b>: <span id="avg"></span></div>
-      <div><b>rms_ema</b>: <span id="rms"></span></div>
-      <div><b>silence_bands</b>: <span id="sb"></span></div>
-      <div><b>silence_rms</b>: <span id="sr"></span></div>
-    </div>
-  </div>
-</div>
-<div class="row">
-  <div class="card">
-    <canvas id="series" style="height:200px"></canvas>
-    <small>AVG/RMS vs thresholds</small>
-  </div>
-  <div class="card">
-    <h3>Ajustes do Gate</h3>
-    <div class="grid">
-      <label>silence_bands <input id="i_sb" type="number" step="0.1"></label>
-      <label>silence_rms <input id="i_sr" type="number" step="1e-6"></label>
-      <label>silence_duration (s) <input id="i_sd" type="number" step="0.1"></label>
-      <label>resume_factor <input id="i_rf" type="number" step="0.1"></label>
-      <label>resume_stable (s) <input id="i_rs" type="number" step="0.1"></label>
-    </div>
-    <div style="margin-top:8px"><button id="apply">Aplicar</button> <button id="calib">Calibrar silêncio (2s)</button></div>
-    <small id="msg"></small>
-  </div>
-</div>
-<script>
-let numBands = 150;
-const barsCtx = document.getElementById('bars').getContext('2d');
-const seriesCtx = document.getElementById('series').getContext('2d');
+    if require_sync:
+        print("[INFO] Iniciando time-sync TCP (porta 5006)...")
+        time_sync_over_tcp(args.raspberry_ip)
+        t_sync = threading.Thread(target=resync_worker, args=(args.raspberry_ip, float(args.resync)), daemon=True)
+        t_sync.start()
 
-function makeLabels(n){ return [...Array(n).keys()].map(i=>'B'+(i+1)); }
-
-const barsChart = new Chart(barsCtx, {
-  type:'bar',
-  data:{labels:makeLabels(numBands),datasets:[{label:'Bands',data:Array(numBands).fill(0),backgroundColor:'#58a6ff',borderWidth:0}]},
-  options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{display:false},y:{min:0,max:255}}}
-});
-
-const seriesChart = new Chart(seriesCtx,{
-  type:'line',
-  data:{labels:[],datasets:[
-    {label:'avg_ema', data:[], borderColor:'#58a6ff', tension:.2},
-    {label:'rms_ema', data:[], borderColor:'#a371f7', tension:.2, yAxisID:'y2'},
-    {label:'silence_bands', data:[], borderColor:'#f85149', borderDash:[6,4], tension:0},
-    {label:'silence_rms', data:[], borderColor:'#d29922', borderDash:[6,4], tension:0, yAxisID:'y2'}]},
-  options:{animation:false, scales:{y:{beginAtZero:true}, y2:{beginAtZero:true, position:'right'}}}
-});
-
-const gateEl=document.getElementById('gate'),beatEl=document.getElementById('beat'),kickEl=document.getElementById('kick');
-const avgEl=document.getElementById('avg'),rmsEl=document.getElementById('rms'),sbEl=document.getElementById('sb'),srEl=document.getElementById('sr');
-const i_sb=document.getElementById('i_sb'),i_sr=document.getElementById('i_sr'),i_sd=document.getElementById('i_sd'),i_rf=document.getElementById('i_rf'),i_rs=document.getElementById('i_rs');
-const msg=document.getElementById('msg');
-
-function applyCfg(){
-  const body={
-    silence_bands: parseFloat(i_sb.value),
-    silence_rms: parseFloat(i_sr.value),
-    silence_duration: parseFloat(i_sd.value),
-    resume_factor: parseFloat(i_rf.value),
-    resume_stable: parseFloat(i_rs.value)
-  };
-  fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(r=>r.json()).then(j=>{msg.textContent='OK: '+JSON.stringify(j.changed)}).catch(e=>{msg.textContent='Erro: '+e});
-}
-document.getElementById('apply').onclick=applyCfg;
-document.getElementById('calib').onclick=()=>fetch('/api/calibrate',{method:'POST'}).then(r=>r.json()).then(j=>{
-  i_sb.value=j.suggest.silence_bands; i_sr.value=j.suggest.silence_rms; msg.textContent='Calibrado: '+JSON.stringify(j.suggest);
-});
-
-function setInputs(cfg){ i_sb.value=cfg.silence_bands; i_sr.value=cfg.silence_rms; i_sd.value=cfg.silence_duration; i_rf.value=cfg.resume_factor; i_rs.value=cfg.resume_stable; }
-
-const evt=new EventSource('/api/stream');
-evt.onmessage=(ev)=>{
-  const s=JSON.parse(ev.data);
-  // redimensiona se numBands mudar
-  if (s.bands && s.bands.length && s.bands.length !== numBands){
-    numBands = s.bands.length;
-    barsChart.data.labels = makeLabels(numBands);
-    barsChart.data.datasets[0].data = Array(numBands).fill(0);
-  }
-  // bars
-  barsChart.data.datasets[0].data = s.bands; barsChart.update('none');
-  // status
-  gateEl.innerHTML = s.gate_active ? '<span class="ok">ACTIVE</span>' : (s.is_quiet ? '<span class="warn">IDLE (quiet)</span>' : '<span class="bad">IDLE</span>');
-  beatEl.textContent='Beat: '+s.beat; kickEl.textContent='Kick: '+s.kick;
-  avgEl.textContent=s.avg_ema.toFixed(2); rmsEl.textContent=s.rms_ema.toExponential(2);
-  sbEl.textContent=s.cfg.silence_bands.toFixed(2); srEl.textContent=s.cfg.silence_rms.toExponential(2);
-
-  // series (janela ~15s)
-  const label = (new Date()).toLocaleTimeString();
-  const keep=180;
-  const dsAvg=seriesChart.data.datasets[0], dsRms=seriesChart.data.datasets[1];
-  const dsSB =seriesChart.data.datasets[2], dsSR =seriesChart.data.datasets[3];
-  dsAvg.data.push(s.avg_ema); dsRms.data.push(s.rms_ema);
-  dsSB.data.push(s.cfg.silence_bands); dsSR.data.push(s.cfg.silence_rms);
-  while(dsAvg.data.length>keep){ dsAvg.data.shift(); dsRms.data.shift(); dsSB.data.shift(); dsSR.data.shift();}
-  seriesChart.data.labels.push(label); while(seriesChart.data.labels.length>keep) seriesChart.data.labels.shift();
-  seriesChart.update('none');
-
-  // init inputs na 1ª atualização
-  if(!i_sb.value) setInputs(s.cfg);
-};
-</script>
-</body></html>
-"""
-
-    @app.get("/")
-    def index():
-        return HTML_PAGE
-
-    @app.get("/api/state")
-    def api_state():
-        snap = {
-            "tx": ctx.tx_count,
-            "gate_active": bool(getattr(shared, "gate_active", False)),
-            "is_quiet": bool(getattr(shared, "is_quiet", False)),
-            "avg": float(shared.avg), "rms": float(shared.rms),
-            "avg_ema": float(shared.avg_ema), "rms_ema": float(shared.rms_ema),
-            "beat": int(shared.beat), "kick": int(shared.kick_intensity),
-            "bands": shared.bands_eq_u8.tolist(),
-            "cfg": get_cfg(),
-            "ts": time.time(),
-        }
-        return jsonify(snap)
-
-    @app.post("/api/config")
-    def api_config():
-        patch = request.get_json(force=True, silent=True) or {}
-        changed = update_cfg(patch)
-        return jsonify({"changed": changed})
-
-    @app.post("/api/calibrate")
-    def api_calibrate():
-        # mede 2s de ruído atual e sugere thresholds com margens
-        samples = []
-        t0 = time.time()
-        while time.time() - t0 < 2.0:
-            samples.append((shared.avg_ema, shared.rms_ema))
-            time.sleep(0.05)
-        if samples:
-            avgs = [a for a, _ in samples]; rmss = [r for _, r in samples]
-            p95_avg = float(np.percentile(avgs, 95))
-            p95_rms = float(np.percentile(rmss, 95))
-            suggest = {
-                "silence_bands": round(p95_avg * 1.05, 2),
-                "silence_rms": float(p95_rms * 1.10)
-            }
-            update_cfg(suggest)
-        else:
-            suggest = get_cfg()
-        return jsonify({"suggest": suggest})
-
-    @app.get("/api/stream")
-    def api_stream():
-        interval = max(0.02, 1.0 / float(args.web_fps))
-        @stream_with_context
-        def gen():
-            while not ctx.stop_flag.is_set():
-                snap = {
-                    "gate_active": bool(getattr(shared, "gate_active", False)),
-                    "is_quiet": bool(getattr(shared, "is_quiet", False)),
-                    "avg_ema": float(shared.avg_ema),
-                    "rms_ema": float(shared.rms_ema),
-                    "beat": int(shared.beat),
-                    "kick": int(shared.kick_intensity),
-                    "bands": shared.bands_eq_u8.tolist(),
-                    "cfg": get_cfg()
-                }
-                yield f"data: {json.dumps(snap)}\n\n"
-                time.sleep(interval)
-        return Response(gen(), mimetype="text/event-stream")
-
-    def _run_web():
-        # host 127.0.0.1 por padrão; mude para '0.0.0.0' se quiser abrir na LAN
-        app.run(host="127.0.0.1", port=int(args.web_port), debug=False, threaded=True)
-
-    if args.web_ui:
-        threading.Thread(target=_run_web, daemon=True).start()
-        print(f"\n[WEB] Dashboard em http://127.0.0.1:{int(args.web_port)}")
-
-    # --------------------------- Pipeline de Áudio ------------------------------
-    FMIN = 20.0; FMAX = 16000.0
-    compute_bands = None
-    raw_ema_alpha = float(args.raw_ema)
-    peak_ema_alpha = float(args.norm_peak_ema)
-
-    # Equalização (estado base)
-    band_ema = np.ones(NUM_BANDS, dtype=np.float32) * (args.eq_target / 2.0)
-    post_eq_prev = np.zeros(NUM_BANDS, dtype=np.float32)
-
-    # Beat buffer
-    ENERGY_BUFFER_SIZE = 10
+    # Beat: buffer circular
     energy_buf = np.zeros(ENERGY_BUFFER_SIZE, dtype=np.float32)
     energy_idx = 0
     energy_count = 0
     last_energy = 0.0
 
     # Gate
-    active = False
-    silence_since = None
-    resume_since = None
     last_tick = 0.0
 
-    # Funções de envio de áudio
-    def send_audio_packet(bands_u8: np.ndarray, beat_flag: int, transition_flag: int, dyn_floor: int, kick_intensity: int):
-        ts_ns = time.monotonic_ns()
-        payload = (
-            bytes([PKT_AUDIO_V2]) +
-            ts_ns.to_bytes(8, 'little') +
-            bands_u8.tobytes() +
-            bytes([beat_flag & 0xFF, transition_flag & 0xFF, dyn_floor & 0xFF, kick_intensity & 0xFF])
-        )
-        ctx.udp_sock.sendto(payload, (ctx.rpi_ip, UDP_PORT))
-        ctx.tx_count += 1
+    # Filtros mediana
+    rms_med = deque(maxlen=7)
+    avg_med = deque(maxlen=7)
 
-    # Callback de áudio
+    # Historicos para Auto Mode (timestamp,value)
+    hist_avg: Deque[Tuple[float,float]] = deque()
+    hist_rms: Deque[Tuple[float,float]] = deque()
+    last_auto_update = 0.0
+
+    def hist_push(hist: Deque[Tuple[float,float]], now: float, val: float, window: float):
+        hist.append((now, val))
+        cutoff = now - window
+        while hist and hist[0][0] < cutoff:
+            hist.popleft()
+
+    def hist_percentile(hist: Deque[Tuple[float,float]], q: float) -> float:
+        if not hist:
+            return 0.0
+        arr = np.array([v for _,v in hist], dtype=np.float32)
+        q = min(1.0, max(0.0, q))
+        return float(np.percentile(arr, q*100.0))
+
+    # Callback de audio
+    compute_bands = None
     def audio_cb(indata, frames, time_info, status):
-        nonlocal energy_idx, energy_count, last_energy, band_ema, post_eq_prev
+        nonlocal energy_idx, energy_count, last_energy, compute_bands
         if status:
             sys.stdout.write("\n"); print(f"[WARN] Audio status: {status}")
         block = indata.mean(axis=1) if indata.ndim > 1 else indata
-        if len(block) < args.block_size:
-            block = np.pad(block, (0, args.block_size - len(block)), "constant")
+        if len(block) < BLOCK_SIZE:
+            block = np.pad(block, (0, BLOCK_SIZE - len(block)), "constant")
         if compute_bands is None:
             return
-        base_vals = compute_bands(block[:args.block_size])  # 0..1
-        base_vals255 = (base_vals * 255.0).astype(np.float32)
-
-        # snapshot dos parâmetros que afetam o render
-        _cfg = get_cfg()
-        eq_alpha = float(_cfg["eq_alpha"])
-        # tilt pode mudar em runtime → recalcule curva
-        tilt_curve_runtime = np.exp(
-            np.linspace(np.log(_cfg["tilt_max"]), np.log(_cfg["tilt_min"]), NUM_BANDS)
-        ).astype(np.float32)
-
-        band_ema = (1.0 - eq_alpha) * band_ema + eq_alpha * base_vals255
-        gain = _cfg["eq_target"] / np.maximum(band_ema, 1.0)
-        eq = base_vals255 * gain * tilt_curve_runtime
-        eq = np.clip(eq, 0.0, 255.0).astype(np.float32)
-
-        if _cfg["post_attack"] < 1.0 or _cfg["post_release"] < 1.0:
-            alpha = np.where(eq > post_eq_prev, _cfg["post_attack"], _cfg["post_release"]).astype(np.float32)
-            eq = alpha * eq + (1.0 - alpha) * post_eq_prev
-        post_eq_prev = eq
-
-        bands_u8 = eq.clip(0, 255).astype(np.uint8)
-        shared.bands_eq_u8 = bands_u8
-
-        # AVG e RMS para o gate
-        avg = float(np.mean(bands_u8))
-        rms = float(np.sqrt(np.mean(block * block) + 1e-12))
-        shared.avg_ema = shared.avg_ema * 0.85 + 0.15 * avg if shared.last_update > 0 else avg
-        shared.rms_ema = shared.rms_ema * 0.85 + 0.15 * rms if shared.last_update > 0 else rms
-        shared.avg = avg; shared.rms = rms; shared.last_update = time.time()
-
-        # Beat/kick
-        low_bands = bands_u8[:max(8, NUM_BANDS // 12)]
-        energy = float(np.mean(low_bands)) / 255.0
+        bands = compute_bands(block[:BLOCK_SIZE])
+        shared.bands = bands
+        avg = float(np.mean(bands))
+        rms = float(np.sqrt(np.mean(block*block) + 1e-12))
+        shared.avg = avg
+        shared.rms = rms
+        shared.last_update = time.time()
+        # Beat simples (graves)
+        lb = bands[:max(8, n_bands//12)]
+        energy = float(np.mean(lb)) / 255.0
         energy_buf[energy_idx] = energy
         energy_idx = (energy_idx + 1) % ENERGY_BUFFER_SIZE
         energy_count = min(energy_count + 1, ENERGY_BUFFER_SIZE)
         buf_view = energy_buf if energy_count == ENERGY_BUFFER_SIZE else energy_buf[:energy_count]
         avg_energy = float(np.mean(buf_view)) if energy_count > 0 else 0.0
         std_energy = float(np.std(buf_view)) if energy_count > 1 else 0.0
-        dyn_thr = avg_energy + 1.20 * std_energy
-        shared.beat = 1 if ((energy >= max(dyn_thr, 0.08)) and (energy >= last_energy)) else 0
+        dyn_thr = avg_energy + BEAT_THRESHOLD * std_energy
+        is_peak_now = (energy >= max(dyn_thr, BEAT_HEIGHT_MIN)) and (energy >= last_energy)
+        shared.beat = 1 if is_peak_now else 0
         last_energy = energy
 
-        if not hasattr(audio_cb, "_kick_ema"):
-            audio_cb._kick_ema = 0.0
-        audio_cb._kick_ema = 0.60 * audio_cb._kick_ema + 0.40 * (np.mean(low_bands) / 255.0)
-        onset = max(0.0, (np.mean(low_bands) / 255.0) - audio_cb._kick_ema)
-        ki = int(np.clip(onset * 255.0 * 2.2, 0, 255))
-        if shared.beat == 1:
-            ki = min(255, ki + 60)
-        shared.kick_intensity = ki
+        # Coleta para calibra/auto
+        ss = app["server_state"]
+        now = shared.last_update
+        hist_push(hist_avg, now, avg, ss["noise_window"])
+        hist_push(hist_rms, now, rms, ss["noise_window"])
+        if ss["calibrating"]:
+            ss["calib_avg"].append(avg)
+            ss["calib_rms"].append(rms)
 
-    # Abrir stream
-    cands = choose_candidates(override=args.device)
-    stream = None; sr_eff = 44100
-    for dev_idx, extra, desc in cands:
+    # Abrir stream: tentar WASAPI loopback com probe de sr/ch
+    def open_with_probe(dev_idx, extra, callback):
+        devs = sd.query_devices()
+        d = devs[dev_idx] if isinstance(dev_idx, int) and 0 <= dev_idx < len(devs) else None
+        ch_pref = int(d.get('max_output_channels', 2)) if d else 2
+        if ch_pref <= 0: ch_pref = 2
         try:
-            stream, sr_eff, ch_eff, open_desc = open_with_probe(dev_idx, extra, audio_cb, args.block_size)
-            sys.stdout.write(f"\n[INFO] Capturando de: {desc} {open_desc}\n")
+            sr_pref = int(round(float(d.get('default_samplerate', 44100)))) if d else 44100
+        except Exception:
+            sr_pref = 44100
+        attempts = []
+        attempts += [(sr_pref, ch_pref)]
+        attempts += [(48000, 2), (48000, 1), (44100, 2), (44100, 1)]
+        seen = set(); ordered = []
+        for sr, ch in attempts:
+            key = (sr, ch)
+            if key not in seen and sr > 0 and ch > 0:
+                seen.add(key); ordered.append((sr, ch))
+        last_err = None
+        for sr_try, ch_try in ordered:
+            try:
+                s = sd.InputStream(
+                    samplerate=sr_try, channels=ch_try, dtype='float32',
+                    blocksize=BLOCK_SIZE, device=dev_idx,
+                    callback=callback, latency='low',
+                    extra_settings=extra
+                )
+                return s, int(s.samplerate), int(s.channels), f"(opened sr={int(s.samplerate)} ch={int(s.channels)})", (extra is not None)
+            except Exception as e:
+                last_err = e
+        # Fallback (nao-ideal): input default (mic)
+        try:
+            s = sd.InputStream(
+                channels=2, samplerate=44100, dtype='float32',
+                blocksize=BLOCK_SIZE, device=None, callback=callback
+            )
+            return s, int(s.samplerate), 2, "(fallback default INPUT sr=44100 ch=2)", False
+        except Exception as e:
+            last_err = e
+            raise last_err
+
+    dev_desc = "desconhecido"
+    stream = None
+    sr_eff = 44100
+    ch_eff = 2
+    opened_loopback = False
+
+    for dev_idx, extra, desc in choose_candidates(override=args.device):
+        try:
+            stream, sr_eff, ch_eff, open_desc, opened_loopback = open_with_probe(dev_idx, extra, audio_cb)
+            dev_desc = f"{desc} {open_desc}"
+            print(f"\n[INFO] Capturando de: {dev_desc}")
             break
         except Exception as e:
-            sys.stdout.write(f"\n[WARN] Falha ao abrir {desc}: {e}\n")
+            print(f"\n[WARN] Falha ao abrir {desc}: {e}")
             continue
+
     if stream is None:
-        sys.stdout.write("\n[FATAL] Não foi possível abrir nenhum dispositivo de áudio.\n")
+        print("\n[FATAL] Nao foi possivel abrir nenhum dispositivo de audio.")
         sys.exit(1)
 
-    a_idx, b_idx = make_bands_indices(args.block_size, sr_eff, NUM_BANDS, FMIN, FMAX)
-    compute_bands = make_compute_bands(sr_eff, args.block_size, a_idx, b_idx, raw_ema_alpha, peak_ema_alpha)
+    shared.device = dev_desc
+    try:
+        stream.start()
+        shared.samplerate = int(stream.samplerate)
+        shared.channels  = int(stream.channels)
+    except Exception as e:
+        print(f"\n[FATAL] Falha ao iniciar stream: {e}")
+        sys.exit(1)
 
-    # Inicia web se habilitado (avisar após stream pronto também)
-    if args.web_ui:
-        print(f"[WEB] Dashboard em http://127.0.0.1:{int(args.web_port)}")
+    # Preparar bandas com o SR efetivo
+    a_idx, b_idx = make_bands_indices(BLOCK_SIZE, shared.samplerate, n_bands, FMIN, FMAX)
+    compute_bands = make_compute_bands(shared.samplerate, BLOCK_SIZE, a_idx, b_idx, EMA_ALPHA, app["server_state"]["norm_peak_ema"])
 
-    stream.start()
+    # Envia CFG (B0) ao iniciar
+    try:
+        send_cfg_b0(args.raspberry_ip, args.udp_port, n_bands, TX_FPS, int(args.signal_hold_ms), int(args.vis_fps))
+        print(f"[CFG->RPi] bands={n_bands} fps={TX_FPS} hold={int(args.signal_hold_ms)} vis_fps={int(args.vis_fps)}")
+    except Exception as e:
+        print(f"[WARN] Falha ao enviar B0: {e}")
+
+    print("[PRONTO] Monitor online - abra o navegador.")
 
     try:
+        last_auto_update = 0.0
+        silence_since = None
         while True:
-            # Mesmo sem sync, o programa segue rodando — apenas não transmite A2
-            if not ctx.time_sync_ok:
-                print_status(ctx, " (paused)")
+            now = time.time()
+
+            # Time-sync gate (opcional)
+            if (REQUIRE_TIME_SYNC and not _time_sync_ok) and not args.no_require_sync:
+                print_status(shared, " (paused)", require_sync=True)
                 time.sleep(0.05)
                 continue
 
-            bands_now = shared.bands_eq_u8
-            avg = shared.avg; rms = shared.rms
-            avg_ema = shared.avg_ema; rms_ema = shared.rms_ema
-            beat = shared.beat; kick_intensity = shared.kick_intensity
-            now = time.time()
+            bands_now = shared.bands
+            avg = shared.avg
+            rms = shared.rms
+            beat = shared.beat
 
-            # Gate de silêncio (duplo critério)
-            _cfg = get_cfg()
-            is_quiet = (avg_ema < _cfg["silence_bands"]) and (rms_ema < _cfg["silence_rms"])
-            resume_threshold = _cfg["silence_bands"] * _cfg["resume_factor"]
-            shared.is_quiet = bool(is_quiet)
-            shared.resume_threshold = float(resume_threshold)
+            # Filtro mediana
+            rms_med.append(rms); avg_med.append(avg)
+            if len(rms_med) == rms_med.maxlen:
+                rms_filtered = float(np.median(rms_med))
+                avg_filtered = float(np.median(avg_med))
+            else:
+                rms_filtered = rms
+                avg_filtered = avg
 
-            if active:
+            ss = app["server_state"]
+
+            # EMA p/ gate
+            if 'avg_ema_val' not in ss:
+                ss['avg_ema_val'] = avg_filtered
+                ss['rms_ema_val'] = rms_filtered
+            else:
+                ss['avg_ema_val'] = ss['avg_ema_val']*(1.0-ss['avg_ema']) + ss['avg_ema']*avg_filtered
+                ss['rms_ema_val'] = ss['rms_ema_val']*(1.0-ss['rms_ema']) + ss['rms_ema']*rms_filtered
+
+            avg_ema = ss['avg_ema_val']
+            rms_ema = ss['rms_ema_val']
+
+            # Auto Mode (ajuste continuo) - e "kick" se detectar nao-silencio
+            if ss["auto_mode"] and (now - last_auto_update) >= 0.5:
+                noise_avg_p = hist_percentile(hist_avg, ss["p_noise"])
+                noise_rms_p = hist_percentile(hist_rms, ss["p_noise"])
+                music_avg_p = hist_percentile(hist_avg, ss["p_music"])
+
+                th_avg = max(1.0, noise_avg_p * ss["safety_margin_avg"])
+                th_rms = max(1e-6, noise_rms_p * ss["safety_margin_rms"])
+
+                base = max(th_avg, 1e-3)
+                dyn_resume = max(1.3, min(4.0, (music_avg_p / base) * 0.9)) * ss["resume_boost"]/1.8
+
+                ss["silence_bands"] = th_avg
+                ss["silence_rms"]   = th_rms
+                ss["resume_factor"] = dyn_resume
+                last_auto_update = now
+
+                cur_avg_ema = avg_ema
+                cur_rms_ema = rms_ema
+                is_quiet_now = (cur_avg_ema < ss['silence_bands']) and (cur_rms_ema < ss['silence_rms'])
+                if not is_quiet_now and not shared.active:
+                    # kick
+                    dyn_floor = int(max(0, min(80, round((cur_avg_ema/255.0)*80.0))))
+                    # energia "kick"
+                    lb = bands_now[:max(8, n_bands//12)]
+                    energy_norm = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
+                    kick_val = 220 if beat else int(max(0, min(255, round(energy_norm*255.0))))
+                    if args.pkt == 'a2':
+                        send_packet_a2(bands_now, beat, 1, dyn_floor, kick_val, args.raspberry_ip, args.udp_port, shared)
+                    else:
+                        send_packet_a1(bands_now, beat, 1, args.raspberry_ip, args.udp_port, shared)
+                    shared.active = True
+                    last_tick = now
+                    print(f"[AUTO] Kick: thAVG={th_avg:.1f} thRMS={th_rms:.6f} resumeX={dyn_resume:.2f} | EMA AVG={cur_avg_ema:.1f} RMS={cur_rms_ema:.6f}")
+                    time.sleep(0.001)
+                    continue
+
+            # Calibracao guiada (botao "Nivel de silencio")
+            if ss["calibrating"]:
+                if now >= ss["calib_until"]:
+                    ss["calibrating"] = False
+                    if ss["calib_avg"] and ss["calib_rms"]:
+                        noise_avg = float(np.percentile(np.array(ss["calib_avg"]), 30))
+                        noise_rms = float(np.percentile(np.array(ss["calib_rms"]), 30))
+                        ss["silence_bands"] = max(1.0, noise_avg * ss["safety_margin_avg"])
+                        ss["silence_rms"]   = max(1e-6, noise_rms * ss["safety_margin_rms"])
+                        print(f"[CALIB] OK: noiseAVG~{noise_avg:.1f} -> limAVG={ss['silence_bands']:.1f}; noiseRMS~{noise_rms:.6f} -> limRMS={ss['silence_rms']:.6f}")
+
+                        # KICK pos-calib
+                        cur_avg_ema = avg_ema
+                        cur_rms_ema = rms_ema
+                        is_quiet_now = (cur_avg_ema < ss['silence_bands']) and (cur_rms_ema < ss['silence_rms'])
+                        if not is_quiet_now and not shared.active:
+                            dyn_floor = int(max(0, min(80, round((cur_avg_ema/255.0)*80.0))))
+                            lb = bands_now[:max(8, n_bands//12)]
+                            energy_norm = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
+                            kick_val = 220 if beat else int(max(0, min(255, round(energy_norm*255.0))))
+                            if args.pkt == 'a2':
+                                send_packet_a2(bands_now, beat, 1, dyn_floor, kick_val, args.raspberry_ip, args.udp_port, shared)
+                            else:
+                                send_packet_a1(bands_now, beat, 1, args.raspberry_ip, args.udp_port, shared)
+                            shared.active = True
+                            last_tick = now
+                            print_status(shared, " (kick from calib)", require_sync=not args.no_require_sync)
+                            time.sleep(0.001)
+                            continue
+                    else:
+                        print("[CALIB] Sem amostras validas; ignorado.")
+                # durante a calib, segue fluxo normal
+
+            # Gate: histerese com EMA
+            avg_ema = ss['avg_ema_val']
+            rms_ema = ss['rms_ema_val']
+            is_quiet = (avg_ema < ss['silence_bands']) and (rms_ema < ss['silence_rms'])
+            resume_threshold = ss['silence_bands'] * ss['resume_factor']
+
+            # Forcado via /api/mode
+            if ss.get("force_silence_once"):
+                zero = np.zeros(n_bands, dtype=np.uint8)
+                if args.pkt == 'a2':
+                    send_packet_a2(zero, 0, 1, 0, 0, args.raspberry_ip, args.udp_port, shared)
+                else:
+                    send_packet_a1(zero, 0, 1, args.raspberry_ip, args.udp_port, shared)
+                shared.active = False
+                ss["force_silence_once"] = False
+                time.sleep(0.05)
+                continue
+
+            if shared.active:
                 if is_quiet:
                     if silence_since is None:
                         silence_since = now
-                    elif (now - silence_since) >= _cfg["silence_duration"]:
-                        # transição OFF
-                        send_audio_packet(np.zeros(NUM_BANDS, dtype=np.uint8), 0, 1, 0, 0)
-                        active = False; shared.gate_active = False
-                        silence_since = None; resume_since = None
+                    elif (now - silence_since) >= ss['silence_duration']:
+                        zero = np.zeros(n_bands, dtype=np.uint8)
+                        if args.pkt == 'a2':
+                            send_packet_a2(zero, 0, 1, 0, 0, args.raspberry_ip, args.udp_port, shared)
+                        else:
+                            send_packet_a1(zero, 0, 1, args.raspberry_ip, args.udp_port, shared)
+                        print_status(shared, " (to silence)", require_sync=not args.no_require_sync)
+                        shared.active = False
+                        silence_since = None
                         time.sleep(0.01)
                         continue
                 else:
                     silence_since = None
             else:
-                # Inativo -> verificar retomada
-                if (avg_ema > resume_threshold) or (rms_ema > _cfg["silence_rms"] * 3.0):
-                    if resume_since is None:
-                        resume_since = now
-                    elif (now - resume_since) >= _cfg["resume_stable"]:
-                        mean_val = float(np.mean(bands_now))
-                        dyn_floor = int(min(12, mean_val * 0.012)) if mean_val > 90 else 0
-                        send_audio_packet(bands_now, beat, 1, dyn_floor, kick_intensity)
-                        active = True; shared.gate_active = True
-                        resume_since = None; last_tick = now
+                if (avg_ema > resume_threshold) or (rms_ema > ss['silence_rms'] * 3.0):
+                    if 'resume_since' not in ss or ss['resume_since'] is None:
+                        ss['resume_since'] = now
+                    elif (now - ss['resume_since']) >= ss['resume_stable']:
+                        dyn_floor = int(max(0, min(80, round((avg_ema/255.0)*80.0))))
+                        lb = bands_now[:max(8, n_bands//12)]
+                        energy_norm = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
+                        kick_val = 220 if beat else int(max(0, min(255, round(energy_norm*255.0))))
+                        if args.pkt == 'a2':
+                            send_packet_a2(bands_now, beat, 1, dyn_floor, kick_val, args.raspberry_ip, args.udp_port, shared)
+                        else:
+                            send_packet_a1(bands_now, beat, 1, args.raspberry_ip, args.udp_port, shared)
+                        print_status(shared, " (from silence)", require_sync=not args.no_require_sync)
+                        shared.active = True
+                        ss['resume_since'] = None
+                        last_tick = now
                         time.sleep(0.001)
                         continue
                 else:
-                    resume_since = None
+                    ss['resume_since'] = None
 
-            if not active:
-                print_status(ctx, " (idle)")
+            if not shared.active:
+                print_status(shared, " (idle)", require_sync=not args.no_require_sync)
                 time.sleep(0.05)
                 continue
 
+            # Respeitar TX FPS
             if (now - last_tick) < MIN_SEND_INTERVAL:
                 time.sleep(0.001)
                 continue
             last_tick = now
 
-            mean_val = float(np.mean(bands_now))
-            dyn_floor = int(min(12, mean_val * 0.012)) if mean_val > 90 else 0
-            send_audio_packet(bands_now, beat, 0, dyn_floor, kick_intensity)
-            print_status(ctx, "")
+            # dyn_floor / kick para A2 (quando ativo)
+            dyn_floor = int(max(0, min(80, round((avg_ema/255.0)*80.0))))
+            lb = bands_now[:max(8, n_bands//12)]
+            energy_norm = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
+            kick_val = 220 if beat else int(max(0, min(255, round(energy_norm*255.0))))
+
+            if args.pkt == 'a2':
+                send_packet_a2(bands_now, beat, 0, dyn_floor, kick_val, args.raspberry_ip, args.udp_port, shared)
+            else:
+                send_packet_a1(bands_now, beat, 0, args.raspberry_ip, args.udp_port, shared)
+            print_status(shared, "", require_sync=not args.no_require_sync)
+
     except KeyboardInterrupt:
         pass
     finally:
-        ctx.stop_flag.set()
+        _stop_resync.set()
         try:
             stream.stop(); stream.close()
         except Exception:
             pass
         sys.stdout.write("\n"); sys.stdout.flush()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
