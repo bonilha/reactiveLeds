@@ -61,74 +61,59 @@ def effect_full_strip_pulse(ctx, bands_u8, beat_flag, active):
     rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v.astype(np.uint8))
     ctx.to_pixels_and_show(rgb)
 
-
-# ===== Waterfall reativo (com paleta) =====
-# ===== Waterfall reativo (com paleta) — v2 com pré-ênfase de graves + gamma suave =====
+# ===== Waterfall reativo (com paleta) — v3 foco em headroom + resposta =====
 _water = None
 def effect_waterfall(ctx, bands_u8, beat_flag, active):
     """
-    Waterfall v2 — destaca graves/bateria:
-      - Pré-ênfase logaritmica das bandas baixas (mais LEDs para as primeiras bandas)
-      - Curva de ganho gamma suave (melhor resposta em níveis baixos)
-      - Decay adaptativo (mais lento em beat/ativos)
-      - Mantém suporte a current_palette, fallback HSV, e piso dinâmico
+    Waterfall v3 — corrige brilho/consumo e melhora reatividade:
+      - remove boosts agressivos e acumulação excessiva
+      - compressão "soft-knee" (mais detalhe em baixo nível, sem saturar picos)
+      - limiter de consumo pré-envio (usa ~55% do budget de corrente)
+      - decay mais rápido do buffer para reduzir arrasto
     """
     import numpy as np
     global _water
-    if _water is None or _water.shape[0] != ctx.LED_COUNT:
-        _water = np.zeros((ctx.LED_COUNT, 3), dtype=np.uint8)
-        print(f"[INFO] Waterfall v2 init: {ctx.LED_COUNT} LEDs")
+    L = ctx.LED_COUNT
+    if _water is None or _water.shape[0] != L:
+        _water = np.zeros((L, 3), dtype=np.uint8)
 
     n = len(bands_u8)
     if n == 0:
-        # decay suave se não há sinal
-        _water = (_water.astype(np.float32) * 0.90).astype(np.uint8)
+        # Sem sinal: apaga rápido (mantém black rápido e consumo baixo)
+        _water = (_water.astype(np.float32) * 0.60).astype(np.uint8)
         ctx.to_pixels_and_show(_water)
         return
 
-    # ---------- 1) Mapear bandas -> LEDs com pré-ênfase de graves ----------
+    # ---------- 1) Mapear bandas -> LEDs (sem boosts agressivos) ----------
     arr = np.asarray(bands_u8, dtype=np.float32)
 
-    # (a) Equalização leve tipo "loudness": mais ganho nos primeiros 10–15% de bandas
-    low_frac = 0.12
-    k_low = max(1, int(n * low_frac))
-    if k_low > 0:
-        # até +6 dB para as bandas bem baixas, decaindo até 0 dB no restante
-        low_gain = np.linspace(2.0, 1.0, k_low, dtype=np.float32)  # 2.0x ~ +6 dB
-        arr[:k_low] *= low_gain
-
-    # (b) Remapeamento log-freq -> posição (espalha graves em mais LEDs)
-    L = ctx.LED_COUNT
-    # curva log: 0..1 -> 0..1 com mais densidade em 0..0.2
+    # Remapeamento levemente logarítmico (espalha um pouco mais graves, mas sem exagero)
     x_led = np.linspace(0.0, 1.0, L, dtype=np.float32)
-    # controle: quanto mais alto alfa, mais "compressão" para graves
-    alfa = 0.22
+    alfa = 0.12  # menor que antes
     pos_bands = (np.log1p(alfa * x_led) / np.log1p(alfa))  # 0..1
     idx_bands = pos_bands * max(1, n - 1)
-    # interpolação com np.interp
     band_pos = np.arange(n, dtype=np.float32)
     v_row = np.interp(idx_bands, band_pos, arr).astype(np.float32)
 
-    # (c) Boost adicional em beat
+    # Leve empurrão só no beat (sem multiplicações grandes)
     if beat_flag:
-        v_row *= 1.35
+        v_row *= 1.10
 
-    # ---------- 2) Curva de ganho "gamma suave" (melhor para níveis baixos) ----------
-    # Normaliza 0..1, aplica pow(gamma), volta a 0..255
+    # ---------- 2) Curva de ganho "soft-knee" (expande baixos, comprime altos) ----------
+    # y = x*(1+e) / (1 + e*x) em 0..1  (e controla a curvatura; 0.6 é suave)
     v01 = np.clip(v_row / 255.0, 0.0, 1.0)
-    gamma = 1.35  # <2.0 preserva energia em baixos níveis; ajuste fino aqui
-    v01 = v01 ** gamma
+    e = 0.60
+    v01 = (v01 * (1.0 + e)) / (1.0 + e * v01)
     v_u8 = np.clip(v01 * 255.0, 0, 255).astype(np.uint8)
 
-    # ---------- 3) Gerar linha de cores a partir da paleta (ou fallback HSV) ----------
+    # ---------- 3) Linha de cores (paleta se houver; senão HSV) ----------
     pal = getattr(ctx, "current_palette", None)
     if isinstance(pal, (list, tuple)) and len(pal) >= 2:
         pal_arr = np.asarray(pal, dtype=np.uint8)
         m = pal_arr.shape[0]
-
         pos = (np.arange(L, dtype=np.float32) / max(1.0, float(L))) * m
         if beat_flag:
-            pos = (pos + 0.25) % m  # respira no beat, menor deslocamento
+            pos = (pos + 0.18) % m  # deslocamento menor que antes
         idx0 = np.floor(pos).astype(np.int32)
         idx1 = (idx0 + 1) % m
         t = (pos - idx0).astype(np.float32)[:, None]
@@ -137,7 +122,6 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
         c1 = pal_arr[idx1].astype(np.float32)
         base_rgb = c0 * (1.0 - t) + c1 * t  # [L,3] float32
 
-        # mistura conforme saturação base
         sat_base = int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255))
         s = sat_base / 255.0
         v_fac = (v_u8.astype(np.float32) / 255.0)[:, None]
@@ -146,29 +130,44 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
         new_row = gray_rgb * (1.0 - s) + colored * s
         new_row = np.clip(new_row, 0, 255).astype(np.uint8)
     else:
-        # fallback HSV com leve empurrão para tons quentes no beat
         hue_base = (np.arange(L, dtype=np.float32) / max(1, L)) * 200.0
         hue_row = (ctx.base_hue_offset + hue_base.astype(np.int32) + (ctx.hue_seed >> 2)) % 256
         if beat_flag:
-            hue_row = (hue_row + 14) % 256
+            hue_row = (hue_row + 10) % 256
         hue_row = hue_row.astype(np.uint8)
         sat_base = int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255))
         sat_row = np.full(L, sat_base if active else max(100, sat_base - 60), dtype=np.uint8)
         new_row = ctx.hsv_to_rgb_bytes_vec(hue_row, sat_row, v_u8)
 
-    # ---------- 4) Composição no buffer waterfall com decay adaptativo ----------
-    # Decay mais lento quando active/beat (preserva “rastro” de bateria/baixo)
-    base_decay = 0.90 if active else 0.85
+    # ---------- 4) Composição com decay rápido (menos brilho médio) ----------
+    decay = 0.70 if active else 0.60  # bem mais rápido que 0.75 anterior
     if beat_flag:
-        base_decay = min(0.93, base_decay + 0.02)
-    _water = (_water.astype(np.float32) * base_decay).astype(np.uint8)
+        decay = min(0.75, decay + 0.02)
+    _water = (_water.astype(np.float32) * decay).astype(np.uint8)
 
-    # Soma com saturação
+    # Soma saturada
     _water = np.clip(_water.astype(np.uint16) + new_row.astype(np.uint16), 0, 255).astype(np.uint8)
 
-    # ---------- 5) Piso dinâmico + render ----------
+    # ---------- 5) Piso dinâmico e LIMITER de consumo (pré-envio) ----------
     out = ctx.apply_floor_vec(_water.astype(np.uint16), active, None).astype(np.uint8)
+
+    # Limiter: utiliza ~55% do orçamento de corrente para deixar headroom de dinâmica
+    ma_per_channel = float(ctx.WS2812B_MA_PER_CHANNEL)  # ~20 mA @ 255
+    idle_mA = float(ctx.WS2812B_IDLE_MA_PER_LED) * float(L)
+    budget_mA = float(ctx.CURRENT_BUDGET_A) * 1000.0
+    target_util = 0.55  # <-- ajuste fino: 0.45..0.65 conforme seu gosto/consumo
+    max_color_mA = max(0.0, budget_mA * target_util - idle_mA)
+
+    sum_rgb = float(np.sum(out, dtype=np.uint64))
+    if sum_rgb > 0.0 and max_color_mA > 0.0:
+        need_mA = (ma_per_channel / 255.0) * sum_rgb
+        scale = min(1.0, max_color_mA / need_mA) if need_mA > 0.0 else 1.0
+        if scale < 0.999:
+            out = np.clip(out.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+
     ctx.to_pixels_and_show(out)
+
+
 
 # ===== Bass Ripple Pulse v2 (anel gaussiano, anti-flick) =====
 class _Ripple:
