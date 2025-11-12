@@ -61,15 +61,16 @@ def effect_full_strip_pulse(ctx, bands_u8, beat_flag, active):
     rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v.astype(np.uint8))
     ctx.to_pixels_and_show(rgb)
 
-# ===== Waterfall reativo (com paleta) — v3 foco em headroom + resposta =====
+# effects/dynamics.py - WATERFALL V4 (substituir a função existente)
+
 _water = None
 def effect_waterfall(ctx, bands_u8, beat_flag, active):
     """
-    Waterfall v3 — corrige brilho/consumo e melhora reatividade:
-      - remove boosts agressivos e acumulação excessiva
-      - compressão "soft-knee" (mais detalhe em baixo nível, sem saturar picos)
-      - limiter de consumo pré-envio (usa ~55% do budget de corrente)
-      - decay mais rápido do buffer para reduzir arrasto
+    Waterfall v4 — corrige saturação do terço inicial:
+      - Atenuação progressiva (taper) do início → fim da fita
+      - Reduz mapeamento log (menos concentração em graves)
+      - Limiter por região (evita saturação localizada)
+      - Decay mais agressivo para dar headroom dinâmico
     """
     import numpy as np
     global _water
@@ -79,48 +80,49 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
 
     n = len(bands_u8)
     if n == 0:
-        # Sem sinal: apaga rápido (mantém black rápido e consumo baixo)
         _water = (_water.astype(np.float32) * 0.60).astype(np.uint8)
         ctx.to_pixels_and_show(_water)
         return
 
-    # ---------- 1) Mapear bandas -> LEDs (sem boosts agressivos) ----------
+    # ---------- 1) Mapear bandas → LEDs (menos log = mais uniforme) ----------
     arr = np.asarray(bands_u8, dtype=np.float32)
-
-    # Remapeamento levemente logarítmico (espalha um pouco mais graves, mas sem exagero)
+    
     x_led = np.linspace(0.0, 1.0, L, dtype=np.float32)
-    alfa = 0.12  # menor que antes
-    pos_bands = (np.log1p(alfa * x_led) / np.log1p(alfa))  # 0..1
+    alfa = 0.05  # REDUZIDO (era 0.12) - menos concentração em graves
+    pos_bands = (np.log1p(alfa * x_led) / np.log1p(alfa))
     idx_bands = pos_bands * max(1, n - 1)
     band_pos = np.arange(n, dtype=np.float32)
     v_row = np.interp(idx_bands, band_pos, arr).astype(np.float32)
 
-    # Leve empurrão só no beat (sem multiplicações grandes)
     if beat_flag:
-        v_row *= 1.10
+        v_row *= 1.08  # boost menor
 
-    # ---------- 2) Curva de ganho "soft-knee" (expande baixos, comprime altos) ----------
-    # y = x*(1+e) / (1 + e*x) em 0..1  (e controla a curvatura; 0.6 é suave)
+    # ---------- 2) TAPER: atenua início da fita progressivamente ----------
+    # Curva suave: início em ~0.45, cresce até 1.0 no meio/fim
+    taper = np.clip(0.45 + 0.55 * (x_led ** 0.8), 0.45, 1.0).astype(np.float32)
+    v_row *= taper  # <-- CHAVE: graves ficam ~45% do valor original
+
+    # ---------- 3) Soft-knee (igual antes) ----------
     v01 = np.clip(v_row / 255.0, 0.0, 1.0)
     e = 0.60
     v01 = (v01 * (1.0 + e)) / (1.0 + e * v01)
     v_u8 = np.clip(v01 * 255.0, 0, 255).astype(np.uint8)
 
-    # ---------- 3) Linha de cores (paleta se houver; senão HSV) ----------
+    # ---------- 4) Linha de cores ----------
     pal = getattr(ctx, "current_palette", None)
     if isinstance(pal, (list, tuple)) and len(pal) >= 2:
         pal_arr = np.asarray(pal, dtype=np.uint8)
         m = pal_arr.shape[0]
         pos = (np.arange(L, dtype=np.float32) / max(1.0, float(L))) * m
         if beat_flag:
-            pos = (pos + 0.18) % m  # deslocamento menor que antes
+            pos = (pos + 0.15) % m
         idx0 = np.floor(pos).astype(np.int32)
         idx1 = (idx0 + 1) % m
         t = (pos - idx0).astype(np.float32)[:, None]
 
         c0 = pal_arr[idx0].astype(np.float32)
         c1 = pal_arr[idx1].astype(np.float32)
-        base_rgb = c0 * (1.0 - t) + c1 * t  # [L,3] float32
+        base_rgb = c0 * (1.0 - t) + c1 * t
 
         sat_base = int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255))
         s = sat_base / 255.0
@@ -139,23 +141,38 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
         sat_row = np.full(L, sat_base if active else max(100, sat_base - 60), dtype=np.uint8)
         new_row = ctx.hsv_to_rgb_bytes_vec(hue_row, sat_row, v_u8)
 
-    # ---------- 4) Composição com decay rápido (menos brilho médio) ----------
-    decay = 0.70 if active else 0.60  # bem mais rápido que 0.75 anterior
+    # ---------- 5) Decay MAIS AGRESSIVO (dá headroom) ----------
+    decay = 0.62 if active else 0.55  # era 0.70/0.60 — agora mais rápido
     if beat_flag:
-        decay = min(0.75, decay + 0.02)
+        decay = min(0.68, decay + 0.03)
     _water = (_water.astype(np.float32) * decay).astype(np.uint8)
 
-    # Soma saturada
-    _water = np.clip(_water.astype(np.uint16) + new_row.astype(np.uint16), 0, 255).astype(np.uint8)
+    # ---------- 6) Limiter POR REGIÃO (evita saturação local) ----------
+    # Divide a fita em 3 regiões e limita cada uma individualmente
+    third = L // 3
+    regions = [
+        (0, third, 0.50),           # início: 50% do normal
+        (third, 2*third, 0.72),     # meio: 72%
+        (2*third, L, 1.0)           # fim: 100%
+    ]
+    
+    for start, end, scale in regions:
+        region_old = _water[start:end].astype(np.uint16)
+        region_new = new_row[start:end].astype(np.uint16)
+        region_sum = np.clip(region_old + region_new, 0, 255).astype(np.uint8)
+        
+        # Aplica escala regional
+        region_sum = np.clip(region_sum.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+        _water[start:end] = region_sum
 
-    # ---------- 5) Piso dinâmico e LIMITER de consumo (pré-envio) ----------
+    # ---------- 7) Piso dinâmico ----------
     out = ctx.apply_floor_vec(_water.astype(np.uint16), active, None).astype(np.uint8)
 
-    # Limiter: utiliza ~55% do orçamento de corrente para deixar headroom de dinâmica
-    ma_per_channel = float(ctx.WS2812B_MA_PER_CHANNEL)  # ~20 mA @ 255
+    # ---------- 8) Limiter global (55% do budget) ----------
+    ma_per_channel = float(ctx.WS2812B_MA_PER_CHANNEL)
     idle_mA = float(ctx.WS2812B_IDLE_MA_PER_LED) * float(L)
     budget_mA = float(ctx.CURRENT_BUDGET_A) * 1000.0
-    target_util = 0.55  # <-- ajuste fino: 0.45..0.65 conforme seu gosto/consumo
+    target_util = 0.55
     max_color_mA = max(0.0, budget_mA * target_util - idle_mA)
 
     sum_rgb = float(np.sum(out, dtype=np.uint64))
@@ -166,7 +183,6 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
             out = np.clip(out.astype(np.float32) * scale, 0, 255).astype(np.uint8)
 
     ctx.to_pixels_and_show(out)
-
 
 
 # ===== Bass Ripple Pulse v2 (anel gaussiano, anti-flick) =====
