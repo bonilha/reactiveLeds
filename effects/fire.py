@@ -26,7 +26,7 @@ def effect_clean_fire_edge_v4(ctx, bands_u8, beat_flag, active):
         _fire_sparks_edge = []
 
     if len(bands_u8) == 0:
-        _fire_heat_edge_v4 *= 0.9
+        _fire_heat_edge_v4 *= 0.85
         ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.uint8))
         return
 
@@ -36,21 +36,21 @@ def effect_clean_fire_edge_v4(ctx, bands_u8, beat_flag, active):
     env = 0.7 * low + 0.3 * mid
     e01 = np.clip(env / 255, 0, 1)
 
-    # Parâmetros suaves
-    decay = 0.96
-    cooling = 0.01 + 0.02 * (1 - e01)
-    jitter = 4.0 + 6.0 * e01
+    # Parâmetros
+    decay = 0.94
+    cooling = 0.02 + 0.02 * (1 - e01)
+    jitter = 3.0 + 5.0 * e01
 
     # Injeta calor nas extremidades
     src = np.zeros(L, dtype=np.float32)
-    inj = (100 + 200 * e01) * (1.3 if beat_flag else 1.0)
-    src[0:3] += inj
-    src[-3:] += inj
+    inj = (120 + 250 * e01) * (1.5 if beat_flag else 1.0)
+    src[0:4] += inj
+    src[-4:] += inj
 
-    # Propagação vertical
+    # Propagação
     h = _fire_heat_edge_v4
     padded = np.pad(h, (1, 1), mode='edge')
-    kernel = np.array([0.15, 0.7, 0.15])
+    kernel = np.array([0.2, 0.6, 0.2])
     adv = np.convolve(padded, kernel, mode='valid')
 
     noise = (np.random.rand(L) - 0.5) * jitter
@@ -59,19 +59,19 @@ def effect_clean_fire_edge_v4(ctx, bands_u8, beat_flag, active):
     _fire_heat_edge_v4 = h_new
 
     # Sparks discretos
-    if beat_flag and len(_fire_sparks_edge) < 6:
+    if beat_flag and len(_fire_sparks_edge) < 5:
         for _ in range(2):
             pos = np.random.choice([0, L-1])
-            _fire_sparks_edge.append([pos, 0.95])
+            _fire_sparks_edge.append([pos, 0.9])
 
     for sp in _fire_sparks_edge[:]:
-        sp[1] *= 0.9
+        sp[1] *= 0.88
         if sp[1] < 0.1:
             _fire_sparks_edge.remove(sp)
             continue
         i = sp[0]
         if 0 <= i < L:
-            h_new[i] = min(255, h_new[i] + 80 * sp[1])
+            h_new[i] = min(255, h_new[i] + 90 * sp[1])
 
     v = np.clip(h_new, 0, 255).astype(np.uint8)
     v = ctx.apply_floor_vec(v, active, None)
@@ -86,28 +86,27 @@ def effect_clean_fire_center_v4(ctx, bands_u8, beat_flag, active):
         _fire_sparks_center = []
 
     if len(bands_u8) == 0:
-        _fire_heat_center_v4 *= 0.9
+        _fire_heat_center_v4 *= 0.85
         ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.uint8))
         return
 
-    # Dinâmica baseada em graves e médios
     low = np.mean(bands_u8[:max(8, len(bands_u8)//8)])
     mid = np.mean(bands_u8[len(bands_u8)//8:len(bands_u8)//4])
     env = 0.7 * low + 0.3 * mid
     e01 = np.clip(env / 255, 0, 1)
 
-    decay = 0.95
-    cooling = 0.015 + 0.02 * (1 - e01)
-    jitter = 5.0 + 7.0 * e01
+    decay = 0.93
+    cooling = 0.02 + 0.02 * (1 - e01)
+    jitter = 4.0 + 6.0 * e01
 
     src = np.zeros(L, dtype=np.float32)
     c = ctx.CENTER
-    inj = (120 + 220 * e01) * (1.3 if beat_flag else 1.0)
-    src[c-2:c+3] += inj
+    inj = (140 + 260 * e01) * (1.5 if beat_flag else 1.0)
+    src[c-3:c+4] += inj
 
     h = _fire_heat_center_v4
     padded = np.pad(h, (1, 1), mode='edge')
-    kernel = np.array([0.15, 0.7, 0.15])
+    kernel = np.array([0.2, 0.6, 0.2])
     adv = np.convolve(padded, kernel, mode='valid')
 
     noise = (np.random.rand(L) - 0.5) * jitter
@@ -115,22 +114,21 @@ def effect_clean_fire_center_v4(ctx, bands_u8, beat_flag, active):
     h_new = np.clip(h_new * (1 - cooling), 0, 255)
     _fire_heat_center_v4 = h_new
 
-    if beat_flag and len(_fire_sparks_center) < 8:
+    if beat_flag and len(_fire_sparks_center) < 6:
         for _ in range(3):
-            pos = c + np.random.randint(-5, 6)
-            _fire_sparks_center.append([pos, 0.95])
+            pos = c + np.random.randint(-6, 7)
+            _fire_sparks_center.append([pos, 0.9])
 
     for sp in _fire_sparks_center[:]:
-        sp[1] *= 0.9
+        sp[1] *= 0.88
         if sp[1] < 0.1:
             _fire_sparks_center.remove(sp)
             continue
         i = sp[0]
         if 0 <= i < L:
-            h_new[i] = min(255, h_new[i] + 70 * sp[1])
+            h_new[i] = min(255, h_new[i] + 80 * sp[1])
 
     v = np.clip(h_new, 0, 255).astype(np.uint8)
     v = ctx.apply_floor_vec(v, active, None)
     rgb = _apply_palette(ctx, v)
     ctx.to_pixels_and_show(rgb)
-
