@@ -173,7 +173,7 @@ def effect_full_strip_pulse(ctx, bands_u8, beat_flag, active):
     ctx.to_pixels_and_show(rgb)
 
 
-# ===== Waterfall reativo (com paleta) — como no seu arquivo =====
+# ===== Waterfall reativo (com paleta) =====
 _water = None
 def effect_waterfall(ctx, bands_u8, beat_flag, active):
     """
@@ -215,6 +215,7 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
     low_boost = np.linspace(1.4, 1.0, ctx.LED_COUNT)  # graves reforçados na esquerda
     v_row = np.clip(v_row.astype(np.float32) * low_boost, 0, 255).astype(np.uint16)
     v_u8 = v_row.astype(np.uint8)
+
     # ===== 2) Gerar "linha" de cores a partir da paleta (ou fallback HSV) =====
     pal = getattr(ctx, "current_palette", None)
     new_row = None
@@ -257,16 +258,17 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
             dtype=np.uint8
         )
         new_row = ctx.hsv_to_rgb_bytes_vec(hue_row, sat_row, v_u8)
+
     # ===== 3) Composição no buffer waterfall com decay + soma =====
-    global _water
     _water = (_water.astype(np.float32) * 0.75).astype(np.uint8)  # decay rápido
     _water = np.clip(_water.astype(np.uint16) + new_row.astype(np.uint16), 0, 255).astype(np.uint8)
+
     # ===== 4) Floor dinâmico + render =====
     _water_out = ctx.apply_floor_vec(_water.astype(np.uint16), active, None).astype(np.uint8)
     ctx.to_pixels_and_show(_water_out)
 
 
-# ===== Bass Ripple Pulse v2 — como no seu arquivo =====
+# ===== Bass Ripple Pulse v2 (anel gaussiano, anti-flick) =====
 class _Ripple:
     __slots__ = ("r", "v", "spd", "thick", "hue_shift")
     def __init__(self, r, v, spd, thick, hue_shift):
@@ -403,11 +405,12 @@ def effect_bass_ripple_pulse_v2(ctx, bands_u8, beat_flag, active):
         rgb_acc *= 0.85
 
     # Suavização temporal (EMA)
-    if st["ema"] is None or st["ema"].shape != (L, 3):
+    st_ema = st.get("ema")
+    if st_ema is None or st_ema.shape != (L, 3):
         st["ema"] = rgb_acc.copy()
     else:
         beta = 0.55 if active else 0.45
-        st["ema"] = st["ema"] * (1.0 - beta) + rgb_acc * beta
+        st["ema"] = st_ema * (1.0 - beta) + rgb_acc * beta
     rgb_smooth = st["ema"]
     rgb_smooth = np.clip(rgb_smooth, 0, 235).astype(np.uint8)
 
@@ -415,3 +418,4 @@ def effect_bass_ripple_pulse_v2(ctx, bands_u8, beat_flag, active):
     if f > 0:
         rgb_smooth = np.maximum(rgb_smooth, f).astype(np.uint8)
 
+    ctx.to_pixels_and_show(rgb_smooth)
