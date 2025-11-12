@@ -1152,8 +1152,7 @@ def main():
 
     
     # Listar dispositivos disponíveis
-    print("
-[INFO] Dispositivos disponíveis (sounddevice):")
+    print("[INFO] Dispositivos disponíveis (sounddevice):")
     devs = sd.query_devices()
     for i, d in enumerate(devs):
         print(f"  {i}: {d.get('name')} (in={d.get('max_input_channels',0)}, out={d.get('max_output_channels',0)})")
