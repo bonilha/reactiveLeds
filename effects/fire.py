@@ -46,9 +46,9 @@ def effect_clean_fire_edge_v4(ctx, bands_u8, beat_flag, active):
     h01 = np.clip(high_mean / 255, 0, 1)
 
     speed = 1.5 + 4.5 * e01 + 2.0 * d01 + 1.8 * m01
-    decay = 0.93 - 0.06 * e01
-    cooling = 0.015 + 0.05 * (1 - e01) - 0.03 * m01
-    jitter = (12 + 30 * (low_std / 64) + 20 * h01) * (1.5 if beat_flag else 1.0)
+    decay = (0.93 - 0.06 * e01) + 0.02
+    cooling = (0.015 + 0.05 * (1 - e01) - 0.03 * m01) * 0.7
+    jitter = ((12 + 30 * (low_std / 64) + 20 * h01) * (1.5 if beat_flag else 1.0)) * 0.6
 
     src = np.zeros(L, dtype=np.float32)
     base_inj = (70 + 230 * e01 + 140 * d01) * (1.5 if beat_flag else 1.0)
@@ -75,7 +75,7 @@ def effect_clean_fire_edge_v4(ctx, bands_u8, beat_flag, active):
         for _ in range(2 + int(4 * m01)):
             pos = np.random.choice([0, L-1]) + np.random.uniform(-8, 8)
             vel = 100 + 150 * e01
-            life = 1.0
+            life = 0.7
             _fire_sparks_edge.append([pos, vel, life])
 
     for sp in _fire_sparks_edge[:]:
@@ -95,7 +95,7 @@ def effect_clean_fire_edge_v4(ctx, bands_u8, beat_flag, active):
     if pal and len(pal) >= 3:
         pal_arr = np.asarray(pal, dtype=np.uint8)
         m = len(pal_arr)
-        idx = (np.power(v / 255.0, 0.7) * (m - 1)).astype(int) % m
+        idx = (np.power(v / 255.0, 0.85) * (m - 1)).astype(int) % m
         rgb = pal_arr[idx]
     else:
         hue = (5 + 45 * (v / 255.0)**0.6 + 10 * h01).astype(np.uint8)
@@ -142,9 +142,9 @@ def effect_clean_fire_center_v4(ctx, bands_u8, beat_flag, active):
     h01 = np.clip(high_mean / 255, 0, 1)
 
     speed = 1.0 + 3.8 * e01 + 1.8 * d01 + 2.0 * m01
-    decay = 0.92 - 0.05 * e01
-    cooling = 0.02 + 0.06 * (1 - e01) - 0.02 * m01
-    jitter = (10 + 28 * (low_std / 64) + 18 * h01) * (1.4 if beat_flag else 1.0)
+    decay = (0.92 - 0.05 * e01) + 0.02
+    cooling = (0.02 + 0.06 * (1 - e01) - 0.02 * m01) * 0.7
+    jitter = ((10 + 28 * (low_std / 64) + 18 * h01) * (1.4 if beat_flag else 1.0)) * 0.6
 
     src = np.zeros(L, dtype=np.float32)
     base_inj = (80 + 210 * e01 + 130 * d01) * (1.4 if beat_flag else 1.0)
@@ -172,7 +172,7 @@ def effect_clean_fire_center_v4(ctx, bands_u8, beat_flag, active):
         for _ in range(3 + int(5 * m01)):
             pos = c + np.random.uniform(-10, 10)
             vel = 90 + 140 * e01
-            life = 1.0
+            life = 0.7
             _fire_sparks_center.append([pos, vel, life])
 
     for sp in _fire_sparks_center[:]:
@@ -192,7 +192,7 @@ def effect_clean_fire_center_v4(ctx, bands_u8, beat_flag, active):
     if pal and len(pal) >= 3:
         pal_arr = np.asarray(pal, dtype=np.uint8)
         m = len(pal_arr)
-        idx = (np.power(v / 255.0, 0.75) * (m - 1)).astype(int) % m
+        idx = (np.power(v / 255.0, 0.85) * (m - 1)).astype(int) % m
         rgb = pal_arr[idx]
     else:
         hue = (8 + 42 * (v / 255.0)**0.6 + 12 * h01).astype(np.uint8)
