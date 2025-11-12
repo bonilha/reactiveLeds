@@ -42,7 +42,8 @@ DEFAULT_NUM_BANDS = 150
 BLOCK_SIZE = 1024  # samples
 NFFT = 4096        # zero-padding
 
-FMIN, FMAX = 20.0, 16000.0
+# FMIN, FMAX = 20.0, 16000.0
+FMIN, FMAX = 20.0, 4000.0
 
 EMA_ALPHA = 0.75
 PEAK_EMA_DEFAULT = 0.10
@@ -65,20 +66,387 @@ PKT_CFG = 0xB0
 PKT_RESET = 0xB1
 
 # ============================= HTML (Frontend) =============================
-# (mesmo HTML completo que te enviei; mantive igual)
 HTML = r"""<!doctype html>
-<html lang="pt-br">
+<html lang="pt-BR">
 <head>
-  <meta charset="utf-8" />
-  <title>Reactive LEDs — Monitor</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>/* ... (CSS idêntico ao anterior) ... */</style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Reactive LEDs — Monitor</title>
+<style>
+  :root{
+    --bg:#0b0f14;--panel:#121923;--elev:#0f141c;--text:#e6edf3;--muted:#9fb1c7;
+    --brand:#6ee7ff;--brand-2:#22d3ee;--ok:#22c55e;--warn:#f59e0b;--err:#ef4444;
+    --card:#0e141c;--chip:#0b1520;--border:#1f2a37;--accent:#1b2531;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:linear-gradient(180deg,var(--bg),#0a1016 45%,#0a0f15);
+    color:var(--text);font:500 15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial;
+    letter-spacing:.2px;
+  }
+  .shell{max-width:1100px;margin:auto;padding:20px;display:flex;flex-direction:column;gap:16px}
+  header{
+    display:flex;gap:16px;align-items:center;justify-content:space-between;
+    padding:14px 16px;border:1px solid var(--border);border-radius:14px;background:linear-gradient(180deg,var(--panel),#0f1720);
+    box-shadow:0 10px 30px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.03);
+  }
+  .brand{display:flex;gap:12px;align-items:center}
+  .logo{
+    width:34px;height:34px;border-radius:10px;background:
+      radial-gradient(60% 60% at 30% 30%, var(--brand) 0%, transparent 60%),
+      radial-gradient(80% 80% at 70% 70%, var(--brand-2) 0%, transparent 70%),
+      linear-gradient(135deg,#0b1f2c,#06141e);
+    border:1px solid var(--border);box-shadow:0 2px 8px rgba(0,0,0,.4), inset 0 0 0 1px rgba(255,255,255,.04);
+  }
+  h1{font-size:18px;margin:0;letter-spacing:.3px}
+  .status-line{display:flex;flex-wrap:wrap;gap:10px;color:var(--muted);font-size:13px}
+  .chip{
+    background:var(--chip);border:1px solid var(--border);padding:6px 10px;border-radius:999px;
+  }
+  .chip.ok{border-color:rgba(34,197,94,.35);color:#a7f3d0}
+  .chip.bad{border-color:rgba(239,68,68,.35);color:#fecaca}
+  .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}
+  @media (max-width:900px){.grid{grid-template-columns:1fr}}
+  .panel{
+    border:1px solid var(--border);border-radius:14px;background:linear-gradient(180deg,var(--panel),#0e1620);
+    box-shadow:0 8px 24px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.03);
+    padding:14px;
+  }
+  .panel h2{margin:0 0 10px 0;font-size:14px;font-weight:600;color:#c7d2fe;letter-spacing:.4px}
+  .controls{display:flex;flex-wrap:wrap;gap:10px}
+  button, .btn{
+    appearance:none;border:1px solid var(--border);background:linear-gradient(180deg,#162231,#0f1a26);
+    color:var(--text);padding:10px 12px;border-radius:10px;cursor:pointer;font-weight:600;
+    transition:.15s transform,.15s background,.15s border-color;
+  }
+  button:hover{transform:translateY(-1px);border-color:#334155}
+  button:active{transform:translateY(0)}
+  .btn-primary{background:linear-gradient(180deg,#0ea5b1,#097c8a);border-color:#0ea5b1}
+  .btn-danger{background:linear-gradient(180deg,#b91c1c,#991b1b);border-color:#7f1d1d}
+  .btn-ghost{background:transparent}
+  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  label{font-size:13px;color:var(--muted)}
+  input[type="number"],select{
+    background:#0c131b;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:8px 10px;min-width:80px
+  }
+  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:8px}
+  @media(max-width:700px){.kpis{grid-template-columns:repeat(2,1fr)}}
+  .card{
+    background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px;
+  }
+  .card .title{color:#9fb1c7;font-size:12px}
+  .card .value{font-size:22px;font-weight:700;margin-top:2px}
+  .bar-wrap{height:8px;background:#0a131b;border:1px solid var(--border);border-radius:999px;overflow:hidden;margin-top:8px}
+  .bar{height:100%;background:linear-gradient(90deg,var(--brand),#60a5fa);width:0%}
+  canvas{width:100%;height:260px;display:block;background:
+    repeating-linear-gradient(to right, transparent 0 6px, rgba(255,255,255,.02) 6px 7px),
+    linear-gradient(180deg,#0a121a,#0a121a)}
+  .legend{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:6px}
+  .beat{
+    width:10px;height:10px;border-radius:3px;background:#1f2937;border:1px solid var(--border);box-shadow:0 0 0 0 rgba(34,197,94,.0);
+    transition:.1s box-shadow,.1s background;
+  }
+  .beat.on{background:#16a34a;box-shadow:0 0 0 6px rgba(34,197,94,.12)}
+  .toast{
+    position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:10
+  }
+  .toast .t{
+    background:#0d1620;border:1px solid var(--border);padding:10px 12px;border-radius:10px;color:#cce2ff;box-shadow:0 8px 24px rgba(0,0,0,.35)
+  }
+  .progress{
+    height:8px;background:#0b131b;border:1px solid var(--border);border-radius:999px;overflow:hidden
+  }
+  .progress .p{height:100%;width:0;background:linear-gradient(90deg,#22d3ee,#38bdf8)}
+  .split{display:flex;align-items:center;gap:10px;justify-content:space-between;flex-wrap:wrap}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;font-size:12px;color:#9fb1c7}
+</style>
 </head>
 <body>
-  <!-- ... (mesmo corpo/JS do arquivo anterior) ... -->
+  <div class="shell">
+    <header>
+      <div class="brand">
+        <div class="logo" aria-hidden="true"></div>
+        <div>
+          <h1>Reactive LEDs — Monitor</h1>
+          <div class="status-line">
+            <span id="conn" class="chip bad">Desconectado</span>
+            <span id="fps" class="chip">FPS: —</span>
+            <span id="dev" class="chip">Dispositivo: —</span>
+            <span id="srch" class="chip">SR/CH: —</span>
+            <span id="tx" class="chip">TX: 0</span>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <div class="beat" id="beat" title="Beat"></div>
+      </div>
+    </header>
+
+    <div class="grid">
+      <!-- Visualização -->
+      <section class="panel">
+        <div class="split">
+          <h2>Visualização de Bandas</h2>
+          <div class="row mono" id="bandsMeta">Bandas: — • Silêncio: —</div>
+        </div>
+        <canvas id="viz" height="260"></canvas>
+        <div class="legend">
+          <span>grave</span><span>agudo</span>
+        </div>
+      </section>
+
+      <!-- Controles + KPIs -->
+      <section class="panel">
+        <h2>Controles</h2>
+        <div class="controls">
+          <button id="btnAuto" class="btn-primary">AUTO: OFF</button>
+          <div class="row">
+            <label for="dur">Calibrar Silêncio</label>
+            <input id="dur" type="number" min="1" max="15" value="5" /> 
+            <button id="btnCalib">Iniciar</button>
+          </div>
+          <button id="btnSilence" class="btn-ghost">Forçar Silêncio</button>
+          <button id="btnReset" class="btn-danger" title="Enviar B1">Reset (B1)</button>
+        </div>
+
+        <div id="calibBox" style="margin-top:12px;display:none">
+          <div class="row split">
+            <label>Calibrando silêncio… <span id="calibEta" class="mono">(—s)</span></label>
+            <span class="mono">Coletando amostras</span>
+          </div>
+          <div class="progress" style="margin-top:6px"><div class="p" id="calibProg"></div></div>
+        </div>
+
+        <div class="kpis">
+          <div class="card"><div class="title">AVG</div><div class="value" id="avg">—</div><div class="bar-wrap"><div class="bar" id="avgBar"></div></div></div>
+          <div class="card"><div class="title">RMS</div><div class="value" id="rms">—</div><div class="bar-wrap"><div class="bar" id="rmsBar"></div></div></div>
+          <div class="card"><div class="title">TH (Silence Bands)</div><div class="value" id="thBands">—</div></div>
+          <div class="card"><div class="title">TH (Silence RMS)</div><div class="value" id="thRms">—</div></div>
+        </div>
+
+        <div class="kpis" style="margin-top:10px">
+          <div class="card"><div class="title">Resume ×</div><div class="value" id="resumeX">—</div></div>
+          <div class="card"><div class="title">Estado</div><div class="value" id="state">—</div></div>
+          <div class="card"><div class="title">Calibração</div><div class="value" id="calibState">—</div></div>
+          <div class="card"><div class="title">Pacotes TX</div><div class="value" id="txCount">0</div></div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+<script>
+(function(){
+  const el = id => document.getElementById(id);
+  const fmt = (n, p=1) => (Number.isFinite(n)? n.toFixed(p) : "—");
+
+  const st = {
+    connected:false, auto:false, lastBandsLen:0, lastSilence:false,
+    calib:false, calibUntil:0, calibEta:0, calibDur:5,
+  };
+
+  // --- UI refs
+  const conn=el("conn"), fps=el("fps"), dev=el("dev"), srch=el("srch"), tx=el("tx");
+  const avg=el("avg"), rms=el("rms"), avgBar=el("avgBar"), rmsBar=el("rmsBar");
+  const thBands=el("thBands"), thRms=el("thRms"), resumeX=el("resumeX"), state=el("state");
+  const txCount=el("txCount"), bandsMeta=el("bandsMeta"), beatEl=el("beat");
+  const btnAuto=el("btnAuto"), btnCalib=el("btnCalib"), btnSilence=el("btnSilence"), btnReset=el("btnReset"), dur=el("dur");
+  const calibBox=el("calibBox"), calibProg=el("calibProg"), calibEta=el("calibEta");
+  const viz = el("viz"); const g = viz.getContext("2d");
+  let W, H, DPR=window.devicePixelRatio||1;
+
+  function resize(){
+    const cssW = viz.clientWidth, cssH = viz.clientHeight;
+    viz.width = Math.floor(cssW*DPR); viz.height = Math.floor(cssH*DPR);
+    W = viz.width; H = viz.height;
+  }
+  resize(); window.addEventListener("resize", resize);
+
+  function toast(msg, type="info"){
+    const holder = el("toast");
+    const t = document.createElement("div");
+    t.className = "t";
+    t.style.borderColor = (type==="error")?"rgba(239,68,68,.35)":(type==="warn"?"rgba(245,158,11,.35)":"#334155");
+    t.textContent = msg;
+    holder.appendChild(t);
+    setTimeout(()=>{t.style.opacity=".0"; t.style.transform="translateY(4px)";}, 2400);
+    setTimeout(()=>holder.removeChild(t), 3000);
+  }
+
+  // --- Drawing
+  function drawBands(arr, beat=false, silence=false){
+    g.clearRect(0,0,W,H);
+    const n = arr.length||0;
+    if(!n){ return; }
+    const pad = 6*DPR;
+    const w = (W - pad*2)/n;
+    const base = H-8*DPR;
+    const maxH = H - 16*DPR;
+
+    // gradient fill
+    const grad = g.createLinearGradient(0,0,0,H);
+    grad.addColorStop(0, "#6ee7ff");
+    grad.addColorStop(.55, "#60a5fa");
+    grad.addColorStop(1, "#3b82f6");
+
+    for(let i=0;i<n;i++){
+      const v = arr[i] / 255;
+      const h = Math.max(2, v * maxH);
+      const x = Math.floor(pad + i*w);
+      const y = Math.floor(base - h);
+      g.fillStyle = grad;
+      g.fillRect(x, y, Math.max(1, w*0.9), h);
+    }
+
+    // baseline and overlay
+    g.strokeStyle = "rgba(255,255,255,.06)";
+    g.beginPath();
+    g.moveTo(pad, base+.5); g.lineTo(W-pad, base+.5); g.stroke();
+
+    // beat overlay
+    if(beat){
+      g.fillStyle = "rgba(34,197,94,.08)";
+      g.fillRect(0,0,W,H);
+    }
+    // silence overlay
+    if(silence){
+      g.fillStyle = "rgba(148,163,184,.06)";
+      g.fillRect(0,0,W,H);
+    }
+  }
+
+  function setConn(ok){
+    st.connected = ok;
+    conn.textContent = ok ? "Conectado" : "Desconectado";
+    conn.classList.toggle("ok", ok);
+    conn.classList.toggle("bad", !ok);
+  }
+
+  // --- Actions
+  btnAuto.onclick = async ()=>{
+    const target = st.auto ? "auto_off" : "auto_on";
+    try{
+      await fetch("/api/mode",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode:target})});
+      st.auto = !st.auto; btnAuto.textContent = "AUTO: " + (st.auto?"ON":"OFF");
+      btnAuto.classList.toggle("btn-primary", st.auto);
+      toast(st.auto?"Modo AUTO ligado":"Modo AUTO desligado");
+    }catch(e){ toast("Falha ao alternar AUTO","error"); }
+  };
+
+  btnCalib.onclick = async()=>{
+    const seconds = Math.max(1, Math.min(15, Number(dur.value)||5));
+    try{
+      await fetch("/api/mode",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({mode:"calibrate_silence", duration_sec:seconds})});
+      st.calib = true; st.calibDur = seconds;
+      calibBox.style.display="block";
+      calibProg.style.width="0%";
+      calibEta.textContent = `(${seconds.toFixed(0)}s)`;
+      toast(`Calibração iniciada por ${seconds}s`);
+    }catch(e){ toast("Falha ao iniciar calibração","error"); }
+  };
+
+  btnSilence.onclick = async()=>{
+    try{
+      await fetch("/api/mode",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({mode:"true_silence"})});
+      toast("Silêncio forçado enviado");
+    }catch(e){ toast("Falha ao forçar silêncio","error"); }
+  };
+
+  btnReset.onclick = async()=>{
+    try{
+      const res = await fetch("/api/reset",{method:"POST"});
+      const j = await res.json();
+      toast(j.status==="ok"?"Reset B1 enviado":"Falha no reset", j.status==="ok"?"info":"error");
+    }catch(e){ toast("Erro ao enviar reset","error"); }
+  };
+
+  // --- WS + status polling
+  let ws;
+  function connectWS(){
+    ws = new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/ws");
+    ws.onopen = ()=> setConn(true);
+    ws.onclose = ()=> { setConn(false); setTimeout(connectWS, 800); };
+    ws.onerror = ()=> { setConn(false); };
+    ws.onmessage = ev =>{
+      try{
+        const d = JSON.parse(ev.data);
+        // Header stats
+        fps.textContent = "FPS: " + (d.fps??"—");
+        dev.textContent = "Dispositivo: " + (d.device || "—");
+        srch.textContent = "SR/CH: " + (d.sr_ch || "—");
+        tx.textContent = "TX: " + (d.tx_count ?? 0);
+        txCount.textContent = (d.tx_count ?? 0);
+
+        // KPIs
+        avg.textContent = fmt(d.avg,1);
+        rms.textContent = fmt(d.rms,5);
+        avgBar.style.width = Math.min(100, (Number(d.avg)||0)) + "%";
+        rmsBar.style.width = Math.min(100, (Number(d.rms||0)*4000)) + "%"; // escala visual
+
+        thBands.textContent = fmt(d.th_silence_bands,1);
+        thRms.textContent = fmt(d.th_silence_rms,6);
+        resumeX.textContent = fmt(d.th_resume_factor,2);
+
+        // Estados
+        state.textContent = d.silence ? "Silencioso" : "Ativo";
+        bandsMeta.textContent = `Bandas: ${d.bands?.length ?? "—"} • Silêncio: ${d.silence?"sim":"não"}`;
+
+        // AUTO/calib visuais
+        st.auto = !!d.auto_mode;
+        btnAuto.textContent = "AUTO: " + (st.auto?"ON":"OFF");
+        btnAuto.classList.toggle("btn-primary", st.auto);
+
+        const isCalib = !!d.calibrating;
+        calibBox.style.display = isCalib ? "block" : "none";
+        if(isCalib){
+          const eta = Math.max(0, Number(d.calib_eta||0));
+          const total = st.calibDur || 5;
+          const prog = Math.min(1, (total - eta)/Math.max(1,total));
+          calibProg.style.width = (prog*100).toFixed(1)+"%";
+          calibEta.textContent = `(${eta.toFixed(1)}s)`;
+        }else if(st.calib){ // terminou
+          st.calib=false; calibProg.style.width="100%";
+          setTimeout(()=>{calibBox.style.display="none"; calibProg.style.width="0%"}, 500);
+          toast("Calibração concluída");
+        }
+
+        // Beat
+        beatEl.classList.toggle("on", !!d.beat);
+
+        // Bands
+        const bands = (d.bands||[]).map(x=>+x||0);
+        if (bands.length) drawBands(bands, !!d.beat, !!d.silence);
+      }catch(e){}
+    }
+  }
+  connectWS();
+
+  // Poll de /api/status para manter headers saudáveis caso WS reconecte e para exibir info inicial
+  async function pollStatus(){
+    try{
+      const r = await fetch("/api/status"); const s = await r.json();
+      dev.textContent = "Dispositivo: " + (s.device || "—");
+      srch.textContent = "SR/CH: " + (s.samplerate? `${s.samplerate} / ${s.channels}` : "—");
+      thBands.textContent = fmt(s.th_silence_bands,1);
+      thRms.textContent = fmt(s.th_silence_rms,6);
+      resumeX.textContent = fmt(s.th_resume_factor,2);
+      state.textContent = s.active ? "Ativo" : "Silencioso";
+      bandsMeta.textContent = `Bandas: ${s.bands_len ?? "—"} • Silêncio: ${s.active? "não":"sim"}`;
+    }catch(e){}
+    setTimeout(pollStatus, 1200);
+  }
+  pollStatus();
+
+})();
+</script>
 </body>
 </html>
 """
+
 
 # ============================= Helpers de Device (Windows loopback) =============================
 def resolve_device_index(name_or_index: Optional[Union[str, int]]):
