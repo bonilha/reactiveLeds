@@ -188,7 +188,7 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
     - utilitários do ctx: amplify_quad, apply_floor_vec, to_pixels_and_show
     """
     import numpy as np
-    global _water
+    # global _water
     if _water is None or _water.shape[0] != ctx.LED_COUNT:
         _water = np.zeros((ctx.LED_COUNT, 3), dtype=np.uint8)
         print("[INFO] Waterfall init: buffers para {} LEDs WS2812B".format(ctx.LED_COUNT))
