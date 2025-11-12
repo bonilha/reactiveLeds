@@ -230,7 +230,6 @@ def key_listener():
     try:
         old = termios.tcgetattr(sys.stdin)
     except Exception:
-        # sem TTY (systemd), apenas retorna
         return
     try:
         tty.setcbreak(sys.stdin.fileno())
@@ -301,15 +300,12 @@ def udp_receiver():
                 rx_count += 1
                 continue
             if hdr == PKT_CFG and n == LEN_CFG:
-                nb = data[2] \
-                (data[3] << 8)
-                fps = data[4] \
-                (data[5] << 8)
-                hold = data[6] \
-                (data[7] << 8)
-                vis = data[8] \
-                (data[9] << 8)
-                if nb > 0: EXPECTED_BANDS = int(nb)
+                # le16 helper explícito
+                nb   = data[2] | (data[3] << 8)
+                fps  = data[4] | (data[5] << 8)
+                hold = data[6] | (data[7] << 8)
+                vis  = data[8] | (data[9] << 8)
+                if nb  > 0: EXPECTED_BANDS = int(nb)
                 if fps > 0: CFG_FPS = int(fps)
                 if hold>=0: SIGNAL_HOLD_MS = int(hold)
                 if vis > 0: CFG_VIS_FPS = int(vis)
@@ -357,7 +353,6 @@ def hardware_smoke_test(ctx, seconds=0.6):
 # -------------------- Main --------------------
 def main():
     global stop_flag, latency_ms_ema, latest_packet, _band_idx, _band_idx_for, reset_flag, LOG_MODE_SINGLE_LINE
-    # argparse para --log-mode
     ap = argparse.ArgumentParser()
     ap.add_argument('--log-mode', choices=['single','multi'], default='single')
     args, _unknown = ap.parse_known_args()
@@ -431,7 +426,15 @@ def main():
                 last_effect_change = now
                 log_event_inline("[RST] reset aplicado")
 
-            if (now - last_rx_ts) > 2.0:
+            # ----------------------------------------------------------------
+            # PATCH #1: Antes de concluir "2s sem pacotes", veja se há pacote pendente.
+            pkt = None
+            with latest_lock:
+                if latest_packet is not None:
+                    pkt = latest_packet
+                    latest_packet = None
+
+            if (now - last_rx_ts) > 2.0 and pkt is None:
                 if not already_off:
                     pixels.fill((0,0,0)); pixels.show()
                     already_off = True
@@ -441,49 +444,41 @@ def main():
                 if sl > 0: time.sleep(sl)
                 else: next_frame = time.time()
                 continue
-
-            pkt = None
-            with latest_lock:
-                if latest_packet is not None:
-                    pkt = latest_packet
-                    latest_packet = None
+            # ----------------------------------------------------------------
 
             if pkt is not None:
                 bands_u8, beat_flag, transition_flag, ts_pc_ns, dyn_floor, kick_intensity = pkt
                 last_rx_ts = now
                 if already_off:
                     already_off = False
-                # Estende janela de atividade por padrão somente em pacotes "ativos"
+
                 if time_sync_ready and ts_pc_ns is not None:
                     now_ns = time.monotonic_ns()
                     one_way_ns = now_ns - (ts_pc_ns + time_offset_ns)
                     if -5_000_000 <= one_way_ns <= 5_000_000_000:
-                        lat_ms = one_way_ns / 1e3 / 1e3
+                        lat_ms = one_way_ns / 1e6
                         global latency_ms_ema
                         latency_ms_ema = lat_ms if latency_ms_ema is None else 0.85 * latency_ms_ema + 0.15 * lat_ms
 
                 avg_raw = float(np.mean(bands_u8))
 
-                # -------------------- PATCH: histerese de transição silenciosa --------------------
-                # Se transition==1 e média quase zero, NÃO derruba o hold (não zera signal_active_until).
-                # Apenas não o estende nesta iteração e zera bands/beat para o render.
+                # -------------------- PATCH #2: histerese de transição silenciosa --------------------
                 if transition_flag == 1 and avg_raw < 0.5:
                     if last_bands.size != bands_u8.size:
                         last_bands = np.zeros(bands_u8.size, dtype=np.uint8)
                     else:
                         last_bands[:] = 0
                     last_beat = 0
-                    # (não altera signal_active_until aqui)
+                    # não altera signal_active_until aqui (não derruba hold)
                 else:
-                    # Qualquer pacote "ativo" (ou transition com média > 0) reestende o hold
                     signal_active_until = now + (SIGNAL_HOLD_MS / 1000.0)
                     if last_bands.size != bands_u8.size:
                         last_bands = np.zeros(bands_u8.size, dtype=np.uint8)
                     last_bands[:] = bands_u8
                     last_beat = int(beat_flag)
-                # -------------------- /PATCH --------------------
+                # -------------------- /PATCH #2 --------------------
 
-                # Roda troca automática de efeito em transição ou por timeout
+                # troca automática de efeito
                 time_up = (now - last_effect_change) > effect_max_interval
                 if transition_flag == 1 or time_up:
                     current_effect = (current_effect + 1) % len(effects)
