@@ -8,67 +8,91 @@ _pm_state = {"peaks": None, "last_t": None, "band_count": 0}
 def effect_peak_hold_columns(ctx, bands_u8, beat_flag, active):
     """
     Peak Hold Columns — colunas por banda com marcador de pico.
-    - Divide a fita em n colunas (n = len(bands_u8)).
+    - Agrega bandas em um número menor de colunas (TARGET_COLS) para cada coluna ter altura visível.
     - Altura da coluna baseada na energia da banda (amplify_quad).
-    - Marcador de pico por banda com hold + decay temporal estável.
-    - Cores em HSV: hue varia por banda; beat dá leve shift.
+    - Marcador de pico por banda com hold + decay temporal estável (independe de FPS).
+    - Cores em HSV: hue varia por coluna; beat dá leve shift.
     Assinatura compatível com build_effects(ctx).
     """
     L = int(getattr(ctx, "LED_COUNT", 0))
     if L <= 0:
         return
 
-    n = int(len(bands_u8))
+    bands_u8 = np.asarray(bands_u8, dtype=np.uint8)
+    n = int(bands_u8.size)
     if n <= 0:
         ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.uint8))
         return
 
     now = time.time()
+
+    # ---------- 1) Entrada e agregação para reduzir colunas ----------
+    # Objetivo: ter colunas com altura de ~8+ LEDs para um visual legível.
+    TARGET_COLS = 32  # ajuste: 24/32/40
+    m = int(max(1, min(TARGET_COLS, L // 8)))  # garante ~>=8 LEDs por coluna
+
+    if m >= n:
+        # Poucas bandas: sem agregação
+        agg = bands_u8
+        m = n
+    else:
+        # Agrega por média (troque para np.max(...) se preferir "max hold" por grupo)
+        idx = (np.arange(m + 1, dtype=np.int32) * n) // m  # limites por coluna
+        agg = np.empty(m, dtype=np.uint8)
+        for i in range(m):
+            a, b = idx[i], idx[i + 1]
+            if b <= a:
+                agg[i] = 0
+            else:
+                agg[i] = int(np.mean(bands_u8[a:b]))
+
+    # Estado do peak-hold acompanha a quantidade de colunas m
     st = _pm_state
-    if (st["last_t"] is None) or (st["band_count"] != n):
-        st["peaks"] = np.zeros(n, dtype=np.float32)
+    if (st["last_t"] is None) or (st["band_count"] != m):
+        st["peaks"] = np.zeros(m, dtype=np.float32)
         st["last_t"] = now
-        st["band_count"] = n
+        st["band_count"] = m
 
     dt = float(now - st["last_t"])
     dt = 0.0 if dt < 0 else (0.04 if dt > 0.04 else dt)  # clamp 0..40ms
     st["last_t"] = now
 
-    # 1) Energia -> altura alvo por coluna
-    bands_u8 = np.asarray(bands_u8, dtype=np.uint8)
-    v16 = ctx.amplify_quad(bands_u8.astype(np.uint16))  # 0..255 u8
+    # Amplificação e clamp
+    v16 = ctx.amplify_quad(agg.astype(np.uint16))  # 0..255
     v = np.clip(v16, 0, 255).astype(np.uint8)
 
-    # Colunas (quase) uniformes ao longo do strip
-    base = (np.arange(n + 1, dtype=np.int32) * L) // n
+    # ---------- 2) Layout das colunas ao longo do strip ----------
+    base = (np.arange(m + 1, dtype=np.int32) * L) // m
     starts = base[:-1]
     ends = np.maximum(starts + 1, base[1:])
-    col_len = np.maximum(1, ends - starts)
+    col_len = np.maximum(1, ends - starts)  # LEDs por coluna (>=1)
 
+    # Altura alvo por coluna (0..col_len[i])
     height_target = (v.astype(np.float32) / 255.0) * col_len.astype(np.float32)
 
-    # 2) Pico por banda (hold + decay temporal)
+    # ---------- 3) Pico por coluna (hold + decay temporal) ----------
     peaks = st["peaks"]  # float32 (0..col_len)
-    peaks = np.minimum(peaks, col_len.astype(np.float32))     # clamp se layout mudou
-    peaks = np.maximum(peaks, height_target)                  # sobe imediato
-    fall_per_sec = 12.0 if not beat_flag else 8.0             # LEDs/seg
+    peaks = np.minimum(peaks, col_len.astype(np.float32))  # clamp se layout mudou
+    peaks = np.maximum(peaks, height_target)               # sobe imediato
+    # LEDs/seg: mais lento no beat para destacar
+    fall_per_sec = 12.0 if not beat_flag else 8.0
     if dt > 0:
         peaks = np.maximum(0.0, peaks - fall_per_sec * dt)
     st["peaks"] = peaks
 
-    # 3) Render: preenchimento + glow fracionário + marcador de pico
+    # ---------- 4) Render: preenchimento + glow fracionário + marcador de pico ----------
     rgb = np.zeros((L, 3), dtype=np.uint8)
 
-    band_ids = np.arange(n, dtype=np.int32)
+    band_ids = np.arange(m, dtype=np.int32)
     hue_band = (int(getattr(ctx, "base_hue_offset", 0)) +
-                ((band_ids * 7) % 256) +
+                ((band_ids * 11) % 256) +          # passo um pouco maior para diferenciar colunas
                 (int(getattr(ctx, "hue_seed", 0)) & 0x3F)) % 256
     if beat_flag:
         hue_band = (hue_band + 18) % 256
 
     sat_base = int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255))
 
-    for i in range(n):
+    for i in range(m):
         s = int(starts[i]); e = int(ends[i]); length = int(col_len[i])
         if length <= 0:
             continue
@@ -77,8 +101,9 @@ def effect_peak_hold_columns(ctx, bands_u8, beat_flag, active):
         h_int = int(np.clip(np.floor(h_col + 1e-3), 0, length))
         p_led_pos = int(np.clip(int(np.floor(peaks[i])), 0, length - 1))
 
-        # Preenchimento da coluna (gradiente de V)
+        # Preenchimento (gradiente de V)
         if h_int > 0:
+            # gradiente leve: 40% -> 100% de V
             grad = np.linspace(0.40, 1.00, h_int, dtype=np.float32)
             vals = (grad * 255.0).astype(np.uint8)
             hue_vec = np.full(h_int, hue_band[i], dtype=np.uint8)
@@ -108,7 +133,7 @@ def effect_peak_hold_columns(ctx, bands_u8, beat_flag, active):
         )[0]
         rgb[s + p_led_pos] = np.maximum(rgb[s + p_led_pos], peak_px)
 
-    # 4) Envio (piso dinâmico opcional pode ser aplicado externamente)
+    # ---------- 5) Envio ----------
     ctx.to_pixels_and_show(rgb)
 
 
@@ -130,6 +155,7 @@ def effect_full_strip_pulse(ctx, bands_u8, beat_flag, active):
         lvl = int(min(255, lvl * 1.35))  # leve boost no beat
     v = np.full(ctx.LED_COUNT, min(255, lvl), dtype=np.uint8)
     v = ctx.apply_floor_vec(v, active, None)  # aplica piso dinâmico
+
     # ---- 2) Caminho A: usar paleta (se houver) ----
     pal = getattr(ctx, "current_palette", None)
     if isinstance(pal, (list, tuple)) and len(pal) >= 2:
@@ -151,15 +177,13 @@ def effect_full_strip_pulse(ctx, bands_u8, beat_flag, active):
         sat_base = int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255))
         s = sat_base / 255.0
         v_fac = (v.astype(np.float32) / 255.0)[:, None]
-        # cor "pura" pela paleta escalada por V
-        colored = base_rgb * v_fac
-        # cinza correspondente ao V (mesmo V em RGB)
-        gray = (v.astype(np.float32))[:, None]
-        # mistura para respeitar saturação base
+        colored = base_rgb * v_fac   # cor pela paleta * V
+        gray = (v.astype(np.float32))[:, None]  # V em cinza
         out = gray * (1.0 - s) + colored * s
         rgb = np.clip(out, 0, 255).astype(np.uint8)
         ctx.to_pixels_and_show(rgb)
         return
+
     # ---- 3) Caminho B (fallback): HSV com sweep de hue ----
     # Sweep temporal + gradiente espacial para evitar "monocromia"
     t = time.time()
@@ -198,6 +222,7 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
         _water = (_water.astype(np.float32) * 0.92).astype(np.uint8)
         ctx.to_pixels_and_show(_water)
         return
+
     # ===== 1) Mapear bandas -> LEDs (valor/brilho por posição) =====
     arr = np.asarray(bands_u8, dtype=np.float32)
     if n < 2:
@@ -206,6 +231,7 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
         band_pos = np.linspace(0, ctx.LED_COUNT - 1, n, dtype=np.float32)
         led_pos = np.arange(ctx.LED_COUNT, dtype=np.float32)
         v_row = np.interp(led_pos, band_pos, arr)
+
     # Ganhos/boosts (mantidos do seu efeito atual)
     v_row *= 2.0  # base
     if beat_flag:
@@ -244,6 +270,7 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
         gray_rgb = (v_u8[:, None]).astype(np.float32)  # mesma V em RGB (cinza)
         colored = gray_rgb * (1.0 - s) + colored * s
         new_row = np.clip(colored, 0, 255).astype(np.uint8)
+
     if new_row is None:
         # ---- 2B) FALLBACK HSV clássico (gradiente procedural) ----
         hue_base = (np.arange(ctx.LED_COUNT, dtype=np.float32) / ctx.LED_COUNT) * 200.0
