@@ -175,7 +175,89 @@ def effect_full_strip_pulse(ctx, bands_u8, beat_flag, active):
 
 # ===== Waterfall reativo (com paleta) — como no seu arquivo =====
 _water = None
+
+_water = None
 def effect_waterfall(ctx, bands_u8, beat_flag, active):
+    """
+    Waterfall que usa a current_palette (lista de 3-tuplas RGB em 0..255) se presente em ctx.current_palette.
+    - Interpola suavemente as cores da paleta ao longo do strip.
+    - Modula o brilho por banda (v_row) como antes.
+    - Em beat, aplica um pequeno deslocamento de fase na paleta para "respirar".
+    - Se ctx.current_palette não existir, cai no gradiente HSV clássico (fallback).
+    Requer:
+    - numpy como np
+    - buffer global _water (np.uint8 [LED_COUNT x 3])
+    - utilitários do ctx: amplify_quad, apply_floor_vec, to_pixels_and_show
+    """
+    import numpy as np
+    global _water
+    if _water is None or _water.shape[0] != ctx.LED_COUNT:
+        _water = np.zeros((ctx.LED_COUNT, 3), dtype=np.uint8)
+        print("[INFO] Waterfall init: buffers para {} LEDs WS2812B".format(ctx.LED_COUNT))
+    n = len(bands_u8)
+    if n == 0:
+        # decay suave se não há sinal
+        _water = (_water.astype(np.float32) * 0.92).astype(np.uint8)
+        ctx.to_pixels_and_show(_water)
+        return
+    # ===== 1) Mapear bandas -> LEDs (valor/brilho por posição) =====
+    arr = np.asarray(bands_u8, dtype=np.float32)
+    if n < 2:
+        v_row = np.full(ctx.LED_COUNT, arr[0] if n else 0, dtype=np.float32)
+    else:
+        band_pos = np.linspace(0, ctx.LED_COUNT - 1, n, dtype=np.float32)
+        led_pos = np.arange(ctx.LED_COUNT, dtype=np.float32)
+        v_row = np.interp(led_pos, band_pos, arr)
+    v_row *= 2.0
+    if beat_flag:
+        v_row *= 1.8
+    v_row = np.clip(v_row, 0, 255).astype(np.uint16)
+    v_row = ctx.amplify_quad(v_row)
+    low_boost = np.linspace(1.4, 1.0, ctx.LED_COUNT)
+    v_row = np.clip(v_row.astype(np.float32) * low_boost, 0, 255).astype(np.uint16)
+    v_u8 = v_row.astype(np.uint8)
+
+    # ===== 2) Cores pela paleta (ou HSV fallback) =====
+    pal = getattr(ctx, "current_palette", None)
+    new_row = None
+    if isinstance(pal, (list, tuple)) and len(pal) >= 2:
+        pal_arr = np.asarray(pal, dtype=np.uint8)
+        m = pal_arr.shape[0]
+        pos = (np.arange(ctx.LED_COUNT, dtype=np.float32) / max(1, float(ctx.LED_COUNT))) * m
+        if beat_flag:
+            pos = (pos + 0.35) % m
+        idx0 = np.floor(pos).astype(np.int32)
+        idx1 = (idx0 + 1) % m
+        t = (pos - idx0).astype(np.float32)
+        t_col = t[:, None]
+        c0 = pal_arr[idx0].astype(np.float32)
+        c1 = pal_arr[idx1].astype(np.float32)
+        base_rgb = (c0 * (1.0 - t_col) + c1 * t_col)
+        v_fac = (v_u8.astype(np.float32) / 255.0)[:, None]
+        colored = base_rgb * v_fac
+        sat_base = int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255))
+        s = sat_base / 255.0
+        gray_rgb = (v_u8[:, None]).astype(np.float32)
+        colored = gray_rgb * (1.0 - s) + colored * s
+        new_row = np.clip(colored, 0, 255).astype(np.uint8)
+
+    if new_row is None:
+        hue_base = (np.arange(ctx.LED_COUNT, dtype=np.float32) / ctx.LED_COUNT) * 200.0
+        hue_row = (ctx.base_hue_offset + hue_base.astype(np.int32) + (ctx.hue_seed >> 2)) % 256
+        if beat_flag:
+            hue_row = (hue_row + 20) % 256
+        hue_row = hue_row.astype(np.uint8)
+        sat_base = int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255))
+        sat_row = np.full(ctx.LED_COUNT, sat_base if active else max(100, sat_base - 60), dtype=np.uint8)
+        new_row = ctx.hsv_to_rgb_bytes_vec(hue_row, sat_row, v_u8)
+
+    # ===== 3) Composição com decay + soma =====
+    _water = (_water.astype(np.float32) * 0.75).astype(np.uint8)
+    _water = np.clip(_water.astype(np.uint16) + new_row.astype(np.uint16), 0, 255).astype(np.uint8)
+
+    # ===== 4) Floor dinâmico + render =====
+    _water_out = ctx.apply_floor_vec(_water.astype(np.uint16), active, None).astype(np.uint8)
+    ctx.to_pixels_and_show(_water_out)
     """
     Waterfall que usa a current_palette (lista de 3-tuplas RGB em 0..255) se presente em ctx.current_palette.
     - Interpola suavemente as cores da paleta ao longo do strip.
