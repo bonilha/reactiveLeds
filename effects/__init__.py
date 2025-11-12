@@ -29,7 +29,6 @@ def build_effects(ctx):
         ("Mirror Spectrum (HSV)",               _wrap(ctx, effect_mirror_spectrum)),
         ("Rainbow Wave (HSV)",                  _wrap(ctx, effect_rainbow_wave)),
 
-        ("Peak Hold Columns (HSV)",             _wrap(ctx, effect_peak_hold_columns)),
         ("Full Strip Pulse (Palette)",          _wrap(ctx, effect_full_strip_pulse)),
         ("Waterfall (Palette)",                 _wrap(ctx, effect_waterfall)),
         ("Bass Ripple Pulse v2",                _wrap(ctx, effect_bass_ripple_pulse_v2)),
