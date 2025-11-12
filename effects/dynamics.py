@@ -9,9 +9,10 @@ def effect_peak_hold_columns(ctx, bands_u8, beat_flag, active):
     """
     Peak Hold Columns — colunas por banda com marcador de pico.
     - Agrega bandas em um número menor de colunas (TARGET_COLS) para cada coluna ter altura visível.
-    - Altura da coluna baseada na energia da banda (amplify_quad).
+    - Altura da coluna baseada na energia da banda (amplify_quad com boost).
     - Marcador de pico por banda com hold + decay temporal estável (independe de FPS).
     - Cores em HSV: hue varia por coluna; beat dá leve shift.
+    - Correção: Marcador colorido (não branco), decaimento mais rápido para reatividade.
     Assinatura compatível com build_effects(ctx).
     """
     L = int(getattr(ctx, "LED_COUNT", 0))
@@ -57,8 +58,9 @@ def effect_peak_hold_columns(ctx, bands_u8, beat_flag, active):
     dt = 0.0 if dt < 0 else (0.04 if dt > 0.04 else dt)  # clamp 0..40ms
     st["last_t"] = now
 
-    # Amplificação e clamp
+    # Amplificação e clamp (com boost leve para reatividade em lows)
     v16 = ctx.amplify_quad(agg.astype(np.uint16))  # 0..255
+    v16 = np.clip(v16 * 1.2, 0, 255).astype(np.uint8)  # Boost para maior sensibilidade
     v = np.clip(v16, 0, 255).astype(np.uint8)
 
     # ---------- 2) Layout das colunas ao longo do strip ----------
@@ -74,8 +76,8 @@ def effect_peak_hold_columns(ctx, bands_u8, beat_flag, active):
     peaks = st["peaks"]  # float32 (0..col_len)
     peaks = np.minimum(peaks, col_len.astype(np.float32))  # clamp se layout mudou
     peaks = np.maximum(peaks, height_target)               # sobe imediato
-    # LEDs/seg: mais lento no beat para destacar
-    fall_per_sec = 12.0 if not beat_flag else 8.0
+    # LEDs/seg: mais rápido para maior reatividade (ajustado)
+    fall_per_sec = 18.0 if not beat_flag else 12.0
     if dt > 0:
         peaks = np.maximum(0.0, peaks - fall_per_sec * dt)
     st["peaks"] = peaks
@@ -120,23 +122,24 @@ def effect_peak_hold_columns(ctx, bands_u8, beat_flag, active):
                 np.array([np.uint8(sat_base)], dtype=np.uint8),
                 np.array([np.uint8(frac_v)], dtype=np.uint8)
             )[0]
-            rgb[s + h_int] = np.maximum(rgb[s + h_int], glow)
+            rgb[s + h_int] = glow
 
-        # Peak marker (1 LED) – menos saturado, bem brilhante
-        hue_p = np.uint8(hue_band[i])
-        sat_p = np.uint8(max(80, sat_base - 90))
-        val_p = np.uint8(240 if active else 200)
-        peak_px = ctx.hsv_to_rgb_bytes_vec(
-            np.array([hue_p], dtype=np.uint8),
-            np.array([sat_p], dtype=np.uint8),
-            np.array([val_p], dtype=np.uint8)
-        )[0]
-        rgb[s + p_led_pos] = np.maximum(rgb[s + p_led_pos], peak_px)
+        # Marcador de pico (colorido, baseado na cor da coluna)
+        if p_led_pos >= 0:
+            p_pos = s + p_led_pos
+            if p_pos < e:
+                if p_led_pos >= h_int:
+                    # Pico acima: colorido forte (não branco)
+                    rgb[p_pos] = ctx.hsv_to_rgb_bytes_vec(
+                        np.array([hue_band[i]], dtype=np.uint8),
+                        np.array([sat_base], dtype=np.uint8),
+                        np.array([240], dtype=np.uint8)
+                    )[0]
+                else:
+                    # Dentro da coluna: boost V (limitado a 255)
+                    rgb[p_pos] = np.minimum(255, rgb[p_pos] * 1.25).astype(np.uint8)
 
-    # ---------- 5) Envio ----------
     ctx.to_pixels_and_show(rgb)
-
-
 # ===== Full Strip Pulse (com paleta) — como no seu arquivo =====
 def effect_full_strip_pulse(ctx, bands_u8, beat_flag, active):
     """
