@@ -61,14 +61,15 @@ def effect_full_strip_pulse(ctx, bands_u8, beat_flag, active):
     rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v.astype(np.uint8))
     ctx.to_pixels_and_show(rgb)
 
+# ===== Waterfall reativo (com paleta) — v5: linear + sem faixa + limiter por zona =====
 _water = None
 def effect_waterfall(ctx, bands_u8, beat_flag, active):
     """
-    Waterfall v4 — foco em reatividade e respeito estrito ao orçamento:
-      - "Waterfall de verdade": shift do buffer + injeta linha nova no topo (sem soma pesada)
-      - Trail curto controlado por fator (decay) -> resposta muito mais rápida
-      - Hard power limiter por frame (considera brilho do NeoPixel) + headroom
-      - Mantém suporte a current_palette e fallback HSV
+    Waterfall v5 — corrige excesso no 1º terço e melhora reatividade:
+      - Mapeamento linear de bandas -> LEDs (remove pré-ênfase espacial)
+      - Waterfall real (shift) sem faixa de topo extra (sem "hot zone" inicial)
+      - Soft-clip por LED + limiter por zona (terços) antes do cap global
+      - Hard power cap global pós-brilho (headroom), depois FXContext faz failsafe
     """
     import numpy as np
     global _water
@@ -78,53 +79,50 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
         _water = np.zeros((L, 3), dtype=np.uint8)
 
     n = len(bands_u8)
+    # --- SHIFT rápido (rastro curto -> mais reativo) ---
+    trail_decay = 0.80 if active else 0.70
+    if beat_flag:
+        trail_decay = min(0.83, trail_decay + 0.01)
+
+    if L > 1:
+        _water[1:] = (_water[:-1].astype(np.float32) * trail_decay).astype(np.uint8)
+
     if n == 0:
-        # Sem sinal: desce a cascata rapidamente para preto (baixa energia)
-        # Shift + atenua a trilha
-        if L > 1:
-            _water[1:] = (_water[:-1].astype(np.float32) * 0.70).astype(np.uint8)
+        if L > 0:
             _water[0] = 0
-        else:
-            _water[:] = (_water.astype(np.float32) * 0.70).astype(np.uint8)
         ctx.to_pixels_and_show(_water)
         return
 
-    # ---------- 1) Mapear bandas -> "linha nova" (sem boosts agressivos) ----------
+    # ---------- 1) Mapeamento linear (sem pré-ênfase) ----------
     arr = np.asarray(bands_u8, dtype=np.float32)
+    band_pos = np.linspace(0.0, max(1.0, float(n - 1)), L, dtype=np.float32)
+    v_row = np.interp(band_pos, np.arange(n, dtype=np.float32), arr).astype(np.float32)
 
-    # Remapeamento levemente log (dá um pouco mais de espaço para graves, sem exagero)
-    x_led = np.linspace(0.0, 1.0, L, dtype=np.float32)
-    alfa = 0.12
-    pos_bands = (np.log1p(alfa * x_led) / np.log1p(alfa)) if L > 1 else np.array([0.0], dtype=np.float32)
-    idx_bands = pos_bands * max(1, n - 1)
-    band_pos = np.arange(n, dtype=np.float32)
-    v_row = np.interp(idx_bands, band_pos, arr).astype(np.float32)
-
-    # Empurrão muito leve no beat (nada que faça “abrir brilho” demais)
+    # Leve empurrão no beat (mantém dinâmica, sem saturar)
     if beat_flag:
-        v_row *= 1.08
+        v_row *= 1.06
 
-    # Soft-knee bem suave (expande baixos, comprime picos) — evita estourar LEDs
+    # Soft-knee suave (expande baixos, comprime picos)
     v01 = np.clip(v_row / 255.0, 0.0, 1.0)
-    e = 0.50
-    v01 = (v01 * (1.0 + e)) / (1.0 + e * v01)
+    e = 0.45
+    v01 = (v01 * (1.0 + e)) / (1.0 + e * v01)  # 0..1
     v_u8 = np.clip(v01 * 255.0, 0, 255).astype(np.uint8)
 
-    # ---------- 2) Linha de cores (paleta -> topo da cascata) ----------
+    # ---------- 2) Linha de cores (sem "faixa" de topo) ----------
     pal = getattr(ctx, "current_palette", None)
     if isinstance(pal, (list, tuple)) and len(pal) >= 2:
         pal_arr = np.asarray(pal, dtype=np.uint8)
         m = pal_arr.shape[0]
         pos = (np.arange(L, dtype=np.float32) / max(1.0, float(L))) * m
         if beat_flag:
-            pos = (pos + 0.12) % m  # deslocamento sutil a cada beat
+            pos = (pos + 0.10) % m
         idx0 = np.floor(pos).astype(np.int32)
         idx1 = (idx0 + 1) % m
         t = (pos - idx0).astype(np.float32)[:, None]
 
         c0 = pal_arr[idx0].astype(np.float32)
         c1 = pal_arr[idx1].astype(np.float32)
-        base_rgb = c0 * (1.0 - t) + c1 * t  # [L,3] float32
+        base_rgb = c0 * (1.0 - t) + c1 * t  # [L,3]
 
         sat_base = int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255))
         s = sat_base / 255.0
@@ -136,63 +134,67 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
         hue_base = (np.arange(L, dtype=np.float32) / max(1, L)) * 200.0
         hue_row = (ctx.base_hue_offset + hue_base.astype(np.int32) + (ctx.hue_seed >> 2)) % 256
         if beat_flag:
-            hue_row = (hue_row + 8) % 256
+            hue_row = (hue_row + 6) % 256
         hue_row = hue_row.astype(np.uint8)
         sat_base = int(np.clip(getattr(ctx, "base_saturation", 220), 0, 255))
         sat_row = np.full(L, sat_base if active else max(100, sat_base - 60), dtype=np.uint8)
         new_row = ctx.hsv_to_rgb_bytes_vec(hue_row, sat_row, v_u8)
 
-    # ---------- 3) Waterfall real: shift + linha nova no topo ----------
-    # Trail curto => mais reativo. Você pode ajustar "trail_decay".
-    trail_decay = 0.78 if active else 0.70
-    if beat_flag:
-        trail_decay = min(0.82, trail_decay + 0.02)
+    # Injeta a linha NOVA no topo (apenas um LED; sem faixa adicional)
+    if L > 0:
+        _water[0] = new_row[0]
 
-    if L > 1:
-        _water[1:] = (_water[:-1].astype(np.float32) * trail_decay).astype(np.uint8)
-        _water[0] = new_row[0]  # topo recebe o primeiro pixel da linha
-        # Para manter o gradiente “descendo”, injeta a linha em uma pequena faixa do topo:
-        top_span = min(L // 12, 8)  # 1/12 da fita ou 8 LEDs, o que for menor
-        if top_span > 1:
-            # Mistura progressiva do topo com a linha inteira
-            mix = np.linspace(1.0, 0.0, top_span, dtype=np.float32)[:, None]
-            _water[:top_span] = np.clip(
-                _water[:top_span].astype(np.float32) * (1.0 - mix) +
-                new_row[:top_span].astype(np.float32) * mix,
-                0, 255
-            ).astype(np.uint8)
-    else:
-        _water[:] = new_row
+    # ---------- 3) Soft-clip por LED (limite local de pico) ----------
+    # Limita cada LED para evitar saturar visualmente (e manter "respiração")
+    # y = 255 * tanh(x/255 * g) / tanh(g)
+    g = 1.2  # ganho do soft-clip; maior = mais "duro"
+    sc = np.tanh((_water.astype(np.float32) / 255.0) * g) / np.tanh(g)
+    out = np.clip(sc * 255.0, 0, 255).astype(np.uint8)
 
-    # ---------- 4) Piso dinâmico ----------
-    out = ctx.apply_floor_vec(_water.astype(np.uint16), active, None).astype(np.uint8)
-
-    # ---------- 5) HARD POWER CAP (considera brilho do NeoPixel) ----------
-    # Modelo: ~20 mA por canal @ 255 + ~1 mA/LED em idle (igual ao FXContext)
-    ma_per_channel = float(ctx.WS2812B_MA_PER_CHANNEL)      # ~20.0
-    idle_mA_total = float(ctx.WS2812B_IDLE_MA_PER_LED) * float(L)  # ~1.0 * L
-    budget_mA = float(ctx.CURRENT_BUDGET_A) * 1000.0        # ex.: 18A -> 18000 mA
-
-    # Considerar brilho global do NeoPixel (pós-brilho)
+    # ---------- 4) Limiter por zona (terços) ----------
+    # Cap por terço evita que Q1 (primeiro terço) roube todo o orçamento
+    ma_per_channel = float(ctx.WS2812B_MA_PER_CHANNEL)             # ~20 mA
+    idle_mA_total = float(ctx.WS2812B_IDLE_MA_PER_LED) * float(L)  # ~1 mA * L
+    budget_mA = float(ctx.CURRENT_BUDGET_A) * 1000.0               # A -> mA
     brightness = float(getattr(ctx.pixels, "brightness", 1.0) or 1.0)
-    # Soma RGB pretendida (pré-brilho)
-    sum_rgb = float(np.sum(out, dtype=np.uint64))
-    # Corrige para consumo pós-brilho
-    need_mA_post = (ma_per_channel / 255.0) * sum_rgb * brightness
-    # Headroom (utilização alvo) — evita bater no teto visualmente
-    util = 0.60  # ajuste típico 0.50..0.70
+
+    # Headroom global alvo; depois repartimos por zona
+    util = 0.60
     max_color_mA_post = max(0.0, budget_mA * util - idle_mA_total)
 
-    scale = 1.0
-    if need_mA_post > 0.0 and max_color_mA_post > 0.0:
-        scale = min(1.0, max_color_mA_post / need_mA_post)
+    # Particiona em 3 zonas iguais
+    thirds = [
+        slice(0, L//3),
+        slice(L//3, 2*L//3),
+        slice(2*L//3, L)
+    ]
+    # Peso igual por zona (pode ajustar: p1 menor se quiser)
+    weights = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    weights = weights / np.sum(weights)
+    zone_caps = max_color_mA_post * weights  # alvo por zona
 
-    if scale < 0.999:
-        out = np.clip(out.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+    for zi, s in enumerate(thirds):
+        seg = out[s]
+        if seg.size == 0:
+            continue
+        sum_rgb = float(np.sum(seg, dtype=np.uint64))
+        need_mA_post = (ma_per_channel / 255.0) * sum_rgb * brightness
+        cap_mA = float(zone_caps[zi])
+        if need_mA_post > cap_mA and need_mA_post > 0.0:
+            zscale = cap_mA / need_mA_post
+            if zscale < 0.999:
+                out[s] = np.clip(seg.astype(np.float32) * zscale, 0, 255).astype(np.uint8)
 
-    # Envio (FXContext ainda faz o cap interno como segunda camada de proteção)
+    # ---------- 5) Hard power cap global (camada final, ainda antes do FXContext) ----------
+    sum_rgb_total = float(np.sum(out, dtype=np.uint64))
+    need_mA_post_total = (ma_per_channel / 255.0) * sum_rgb_total * brightness
+    if need_mA_post_total > max_color_mA_post and need_mA_post_total > 0.0:
+        scale = max_color_mA_post / need_mA_post_total
+        if scale < 0.999:
+            out = np.clip(out.astype(np.float32) * scale, 0, 255).astype(np.uint8)
+
+    # ---------- 6) Envio (FXContext ainda faz o cap interno como failsafe) ----------
     ctx.to_pixels_and_show(out)
-
 # ===== Bass Ripple Pulse v2 (anel gaussiano, anti-flick) =====
 class _Ripple:
     __slots__ = ("r", "v", "spd", "thick", "hue_shift")
