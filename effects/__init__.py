@@ -5,7 +5,6 @@ from .basics import (
     effect_rainbow_wave,
 )
 from .dynamics import (
-    effect_peak_hold_columns,
     effect_full_strip_pulse,
     effect_waterfall,
     effect_bass_ripple_pulse_v2,
