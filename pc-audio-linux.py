@@ -973,7 +973,8 @@ def main():
     parser.add_argument('--no-pyaudio-fallback', action='store_true',
                         help='Desativa fallback para PyAudio quando sounddevice falhar.')
     parser.add_argument('--device', type=str, default=None)
-    parser.add_argument('--usb-linein', action='store_true', help='Captura automática da entrada line-in de uma placa de som USB (Linux)')
+    parser.add_argument('--usb-linein', action='store_true', help='Força usar primeiro dispositivo com entrada (PipeWire/Linux)')
+    parser.add_argument('--device-index', type=int, default=None, help='Seleciona dispositivo pelo índice (veja lista)')
     parser.add_argument('--allow-mic', action='store_true',
                         help='Permite capturar microfone quando explicitamente solicitado (nunca usado por padrão).')
     parser.add_argument('--mic-device', type=str, default=None,
@@ -1150,31 +1151,50 @@ def main():
             shared.bands = np.zeros(n_b, dtype=np.uint8)
 
     
-    # Se --usb-linein estiver ativo, tentar localizar dispositivo USB com entrada
-    usb_linein_idx = None
-    if args.usb_linein:
-        try:
-            devs = sd.query_devices()
-            for i, d in enumerate(devs):
-                if d.get("max_input_channels", 0) > 0 and "usb" in d.get("name", "").lower():
-                    usb_linein_idx = i
-                    break
-            if usb_linein_idx is None:
-                raise RuntimeError("Nenhum dispositivo USB com entrada encontrado.")
-            print(f"[INFO] Dispositivo USB line-in detectado: {devs[usb_linein_idx]['name']}")
+    # Listar dispositivos disponíveis
+    print("
+[INFO] Dispositivos disponíveis (sounddevice):")
+    devs = sd.query_devices()
+    for i, d in enumerate(devs):
+        print(f"  {i}: {d.get('name')} (in={d.get('max_input_channels',0)}, out={d.get('max_output_channels',0)})")
+
+    # Se --device-index foi informado
+    if args.device_index is not None:
+        if 0 <= args.device_index < len(devs):
+            print(f"[INFO] Usando índice {args.device_index}: {devs[args.device_index]['name']}")
             audio_cb = make_audio_cb()
-            s = sd.InputStream(channels=max(1, int(devs[usb_linein_idx].get('max_input_channels', 2))),
-                               samplerate=int(devs[usb_linein_idx].get('default_samplerate', 44100)),
-                               dtype='float32', blocksize=BLOCK_SIZE, device=usb_linein_idx,
+            s = sd.InputStream(channels=max(1, int(devs[args.device_index].get('max_input_channels', 1))),
+                               samplerate=int(devs[args.device_index].get('default_samplerate', 44100)),
+                               dtype='float32', blocksize=BLOCK_SIZE, device=args.device_index,
                                callback=lambda b, *_: audio_cb(b.astype(np.float32)))
-            _build_compute(int(devs[usb_linein_idx].get('default_samplerate', 44100)))
-            stream = s
-            stream.start()
-            shared.samplerate = int(devs[usb_linein_idx].get('default_samplerate', 44100))
-            shared.channels = int(devs[usb_linein_idx].get('max_input_channels', 2))
-            backend_used = f"sounddevice (USB line-in): '{devs[usb_linein_idx]['name']}'"
-        except Exception as e:
-            print(f"[WARN] Falha ao abrir USB line-in: {e}")
+            _build_compute(int(devs[args.device_index].get('default_samplerate', 44100)))
+            stream = s; stream.start()
+            shared.samplerate = int(devs[args.device_index].get('default_samplerate', 44100))
+            shared.channels = int(devs[args.device_index].get('max_input_channels', 1))
+            backend_used = f"sounddevice (índice {args.device_index}): '{devs[args.device_index]['name']}'"
+        else:
+            print(f"[FATAL] Índice inválido: {args.device_index}"); sys.exit(1)
+
+    # Se --usb-linein foi informado e nenhum índice foi passado
+    elif args.usb_linein:
+        usb_idx = None
+        for i, d in enumerate(devs):
+            if d.get('max_input_channels',0) > 0:
+                usb_idx = i; break
+        if usb_idx is not None:
+            print(f"[INFO] Usando dispositivo com entrada: {devs[usb_idx]['name']} (índice {usb_idx})")
+            audio_cb = make_audio_cb()
+            s = sd.InputStream(channels=max(1, int(devs[usb_idx].get('max_input_channels', 1))),
+                               samplerate=int(devs[usb_idx].get('default_samplerate', 44100)),
+                               dtype='float32', blocksize=BLOCK_SIZE, device=usb_idx,
+                               callback=lambda b, *_: audio_cb(b.astype(np.float32)))
+            _build_compute(int(devs[usb_idx].get('default_samplerate', 44100)))
+            stream = s; stream.start()
+            shared.samplerate = int(devs[usb_idx].get('default_samplerate', 44100))
+            shared.channels = int(devs[usb_idx].get('max_input_channels', 1))
+            backend_used = f"sounddevice (usb-linein): '{devs[usb_idx]['name']}'"
+        else:
+            print("[FATAL] Nenhum dispositivo com entrada encontrado."); sys.exit(1)
 
     # tentativa 1: sounddevice (se backend=auto ou sd)
     if args.backend in ("auto","sd"):
