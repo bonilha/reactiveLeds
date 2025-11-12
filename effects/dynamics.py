@@ -175,8 +175,6 @@ def effect_full_strip_pulse(ctx, bands_u8, beat_flag, active):
 
 # ===== Waterfall reativo (com paleta) — como no seu arquivo =====
 _water = None
-
-_water = None
 def effect_waterfall(ctx, bands_u8, beat_flag, active):
     """
     Waterfall que usa a current_palette (lista de 3-tuplas RGB em 0..255) se presente em ctx.current_palette.
