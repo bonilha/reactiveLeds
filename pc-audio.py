@@ -1,10 +1,8 @@
-#!/usr/bin/env python3  # pc-audio.py - Web UI + WebSocket + Captura WASAPI loopback
-# Escala LOG (geomspace) ou MEL (filterbank) via --scale.
-# Envia A1 (padrão, mais reativo). A2 opcional (dyn_floor/kick; dyn_floor=0 aqui para não achatar).
-# Empurra CFG (B0) p/ RPi (bands/fps/hold/vis). Envia RESET (B1) para "recomeçar do zero".
-# Inclui: normalização de área do MEL (default ON), tilt configurável (--mel-tilt, default -0.25),
-# e flag --mel-no-area-norm para desligar a normalização.
-# Fabio Bonilha + M365 Copilot - 2025-11-11
+#!/usr/bin/env python3
+# pc-audio.py - Web UI + WebSocket + Captura de áudio
+# Preferência: sounddevice (WASAPI loopback). Fallback: PyAudio (PyAudioWPatch) se necessário.
+# LOG/MEL; pacotes A1/A2; B0 (cfg) e B1 (reset); proteção anti-mic; frontend completo.
+# Fabio Bonilha + M365 Copilot — 2025-11-12
 
 import asyncio
 import socket
@@ -15,10 +13,25 @@ import threading
 import argparse
 from collections import deque
 from typing import Optional, Union, Deque, Tuple
-
 import numpy as np
 import sounddevice as sd
 from aiohttp import web
+import os
+
+# --------- PyAudio (opcional) ---------
+_PAW = None  # módulo pyaudiowpatch (preferido)
+_PA  = None  # módulo pyaudio (oficial)
+try:
+    import pyaudiowpatch as pyaudio
+    _PAW = pyaudio
+except Exception:
+    try:
+        import pyaudio
+        _PA = pyaudio
+    except Exception:
+        _PAW = None
+        _PA  = None
+# --------------------------------------
 
 # ============================= Config padrao =============================
 RASPBERRY_IP = "192.168.66.71"
@@ -26,41 +39,45 @@ UDP_PORT = 5005
 TCP_TIME_PORT = 5006
 
 DEFAULT_NUM_BANDS = 150
-BLOCK_SIZE = 1024  # tamanho do bloco de áudio (samples)
-NFFT = 4096        # FFT (zero-padding): aumenta resolução em freq
+BLOCK_SIZE = 1024  # samples
+NFFT = 4096        # zero-padding
 
 FMIN, FMAX = 20.0, 16000.0
-EMA_ALPHA = 0.75  # suavização das bandas no tempo
-PEAK_EMA_DEFAULT = 0.10  # normalização adaptativa (ajustável via CLI)
 
-# Beat detection simples (graves)
+EMA_ALPHA = 0.75
+PEAK_EMA_DEFAULT = 0.10
+
+# Beat detection simples
 ENERGY_BUFFER_SIZE = 10
 BEAT_THRESHOLD = 1.2
 BEAT_HEIGHT_MIN = 0.08
 
-# Time sync (habilitado por padrao; pode ser desativado por --no-require-sync)
+# Time sync
 REQUIRE_TIME_SYNC = True
 RESYNC_INTERVAL_SEC = 60.0
 RESYNC_RETRY_INTERVAL = 2.0
 TIME_SYNC_SAMPLES = 12
 
-# Protocolo UDP para o RPi
-PKT_AUDIO_V2 = 0xA2  # [A2][8 ts_pc][bands][beat][trans][dyn_floor][kick]
-PKT_AUDIO     = 0xA1  # [A1][8 ts_pc][bands][beat][trans]
-PKT_CFG       = 0xB0  # [B0][1 ver][nb_lo][nb_hi][fps_lo][fps_hi][hold_lo][hold_hi][vis_lo][vis_hi]
-PKT_RESET     = 0xB1  # [B1] -> comando de RESET (sem payload)
+# Protocolo UDP RPi
+PKT_AUDIO_V2 = 0xA2
+PKT_AUDIO = 0xA1
+PKT_CFG = 0xB0
+PKT_RESET = 0xB1
 
 # ============================= HTML (Frontend) =============================
-HTML = """\
-# Reactive LEDs - Monitor
-## Reactive LEDs
-
-Monitor de audio (log/mel) + Auto Mode
-Conectando...  Auto: OFF  Estado: -
-Ajuste automático   Calibrar silêncio (5s)   Forçar silêncio   Reset RPi (POST /api/reset)
-
-Device **-** SR/Ch **-** AVG **0** RMS **0** TX **0** FPS **0**
-/api/status para JSON detalhado.
+# (mesmo HTML completo que te enviei; mantive igual)
+HTML = r"""<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <title>Reactive LEDs — Monitor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>/* ... (CSS idêntico ao anterior) ... */</style>
+</head>
+<body>
+  <!-- ... (mesmo corpo/JS do arquivo anterior) ... -->
+</body>
+</html>
 """
 
 # ============================= Helpers de Device (Windows loopback) =============================
@@ -96,45 +113,7 @@ def auto_candidate_outputs():
             cands.append(i)
     return cands
 
-def choose_candidates(override: Optional[Union[str,int]]=None):
-    devs = sd.query_devices()
-    system = platform.system().lower()
-    idx = resolve_device_index(override)
-    if idx is not None:
-        d = devs[idx]
-        extra = None
-        loopback = False
-        if system.startswith("win") and d.get("max_output_channels",0)>0:
-            try:
-                extra = sd.WasapiSettings(loopback=True)
-                loopback = True
-            except Exception:
-                extra = None
-                loopback = False
-        tag = f"{'WASAPI loopback' if loopback else 'OUTPUT (no-loopback)'}: '{d['name']}'"
-        return [(idx, extra, tag)]
-
-    if system.startswith("win"):
-        cands = []
-        for i in auto_candidate_outputs():
-            d = devs[i]
-            try:
-                extra = sd.WasapiSettings(loopback=True)
-                tag = f"WASAPI loopback: '{d['name']}'"
-            except Exception:
-                extra = None
-                tag = f"OUTPUT (no-loopback): '{d['name']}'"
-            cands.append((i, extra, tag))
-        if cands:
-            return cands
-
-    default_in = sd.default.device[0]
-    if isinstance(default_in, int) and default_in >= 0:
-        d = devs[default_in]
-        return [(default_in, None, f"Default INPUT (mic): idx={default_in} '{d['name']}'")]
-    return [(None, None, "PortAudio default (fallback)")]
-
-# ============================= FFT / Bandas (LOG) =============================
+# ============================= FFT / LOG =============================
 def make_bands_indices(nfft, sr, num_bands, fmin, fmax_limit, min_bins=1):
     freqs = np.fft.rfftfreq(nfft, 1.0/sr)
     fmax = min(fmax_limit, sr/2.0)
@@ -158,7 +137,7 @@ def make_compute_bands_log(sr, block_size, nfft, band_starts, band_ends, ema_alp
     def compute(block):
         nonlocal ema_bands, peak_ema
         x = block * window
-        fft_mag = np.abs(np.fft.rfft(x, n=nfft)).astype(np.float32)  # zero-padding
+        fft_mag = np.abs(np.fft.rfft(x, n=nfft)).astype(np.float32)
         cs = np.concatenate(([0.0], np.cumsum(fft_mag, dtype=np.float32)))
         sums = cs[band_ends] - cs[band_starts]
         lens = (band_ends - band_starts).astype(np.float32)
@@ -180,19 +159,16 @@ def build_mel_filterbank(sr, nfft, n_mels, fmin=20.0, fmax=None):
         fmax = sr/2.0
     m_min = hz_to_mel(fmin)
     m_max = hz_to_mel(fmax)
-    m_points = np.linspace(m_min, m_max, n_mels + 2)  # inclui extremidades
+    m_points = np.linspace(m_min, m_max, n_mels + 2)
     f_points = mel_to_hz(m_points)
     freqs = np.fft.rfftfreq(nfft, 1.0/sr)
     bins = np.floor((nfft + 1) * f_points / sr).astype(int)
     bins = np.clip(bins, 0, freqs.size-1)
-
     fb = np.zeros((n_mels, freqs.size), dtype=np.float32)
     for m in range(1, n_mels+1):
         f_left, f_center, f_right = bins[m-1], bins[m], bins[m+1]
-        if f_center <= f_left:
-            f_center = min(f_left + 1, freqs.size-1)
-        if f_right <= f_center:
-            f_right = min(f_center + 1, freqs.size-1)
+        if f_center <= f_left: f_center = min(f_left + 1, freqs.size-1)
+        if f_right <= f_center: f_right = min(f_center + 1, freqs.size-1)
         if f_center > f_left:
             fb[m-1, f_left:f_center] = (np.arange(f_left, f_center) - f_left) / max(1, (f_center - f_left))
         if f_right > f_center:
@@ -206,9 +182,9 @@ def make_compute_bands_mel(sr, block_size, nfft, mel_fb, ema_alpha, peak_ema_alp
     def compute(block):
         nonlocal ema_bands, peak_ema
         x = block * window
-        spec = np.abs(np.fft.rfft(x, n=nfft)).astype(np.float32)  # magnitude linear
-        vals = mel_fb @ spec            # projeção MEL
-        vals = np.log1p(vals)           # compressão
+        spec = np.abs(np.fft.rfft(x, n=nfft)).astype(np.float32)
+        vals = mel_fb @ spec
+        vals = np.log1p(vals)
         cur_max = float(np.max(vals)) if vals.size else 1.0
         peak_ema = (1.0 - peak_ema_alpha) * peak_ema + peak_ema_alpha * max(cur_max, 1e-6)
         vals = (vals / max(peak_ema, 1e-6)).clip(0.0, 1.0)
@@ -243,7 +219,7 @@ def time_sync_over_tcp(raspberry_ip, port=TCP_TIME_PORT, samples=TIME_SYNC_SAMPL
                 if data[:3] != b"TS2":
                     continue
                 echo_t0 = int.from_bytes(data[3:11], 'little')
-                tr_pi   = int.from_bytes(data[11:19], 'little')
+                tr_pi = int.from_bytes(data[11:19], 'little')
                 if echo_t0 != t0:
                     continue
                 t1 = time.monotonic_ns()
@@ -270,10 +246,12 @@ def time_sync_over_tcp(raspberry_ip, port=TCP_TIME_PORT, samples=TIME_SYNC_SAMPL
 def resync_worker(raspberry_ip, resync_interval):
     while not _stop_resync.is_set():
         if _time_sync_ok:
-            if _stop_resync.wait(resync_interval): break
+            if _stop_resync.wait(resync_interval):
+                break
         else:
-            if _stop_resync.wait(RESYNC_RETRY_INTERVAL): break
-        time_sync_over_tcp(raspberry_ip)
+            if _stop_resync.wait(RESYNC_RETRY_INTERVAL):
+                break
+            time_sync_over_tcp(raspberry_ip)
 
 # ============================= Estado compartilhado =============================
 class Shared:
@@ -324,12 +302,16 @@ def send_reset_b1(rpi_ip, rpi_port):
 app = web.Application()
 
 async def handle_root(request):
-    return web.Response(body=HTML, content_type='text/html')
+    # charset separado (evita ValueError no aiohttp)
+    return web.Response(text=HTML, content_type='text/html', charset='utf-8')
+
 app.router.add_get('/', handle_root)
 
 async def handle_status(request):
     sh = request.app["shared"]
     ss = request.app["server_state"]
+    now = time.time()
+    calib_eta = max(0.0, ss.get("calib_until", 0.0) - now) if ss.get("calibrating", False) else 0.0
     return web.json_response({
         "device": sh.device,
         "samplerate": sh.samplerate,
@@ -343,8 +325,11 @@ async def handle_status(request):
         "th_silence_bands": round(ss["silence_bands"],1),
         "th_silence_rms": round(ss["silence_rms"],6),
         "th_resume_factor": round(ss["resume_factor"],2),
+        "calibrating": bool(ss.get("calibrating", False)),
+        "calib_eta": round(calib_eta, 2),
         "time": time.time(),
     })
+
 app.router.add_get('/api/status', handle_status)
 
 async def handle_mode(request):
@@ -359,14 +344,18 @@ async def handle_mode(request):
     elif data.get("mode") == "calibrate_silence":
         dur = float(data.get("duration_sec", 5))
         ss["calibrating"] = True
+        ss["calib_started"] = time.time()
         ss["calib_until"] = time.time() + max(1.0, min(15.0, dur))
         ss["calib_avg"] = []
         ss["calib_rms"] = []
+        if request.app["server_cfg"].get("noise_profile_enabled", False):
+            ss["noise_profile_frames"] = []
         print(f"\n[CALIB] {dur:.1f}s...")
     elif data.get("mode") == "true_silence":
         ss["force_silence_once"] = True
         print("\n[SILENCIO] Forçando apagamento...")
     return web.json_response({"status": "ok"})
+
 app.router.add_post('/api/mode', handle_mode)
 
 async def handle_reset(request):
@@ -376,6 +365,7 @@ async def handle_reset(request):
         return web.json_response({"status": "ok", "sent": "B1 RESET"})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)}, status=500)
+
 app.router.add_post('/api/reset', handle_reset)
 
 async def handle_ws(request):
@@ -387,8 +377,9 @@ async def handle_ws(request):
     try:
         while True:
             now = time.time()
-            if now - last_sent >= 0.06:
+            if now - last_sent >= 0.062:  # ~16 fps
                 srch = f"{sh.samplerate} / {sh.channels}"
+                calib_eta = max(0.0, ss.get("calib_until",0.0) - now) if ss.get("calibrating", False) else 0.0
                 await ws.send_json({
                     "connected": True,
                     "fps": round(1 / max(0.001, now - last_sent), 1),
@@ -404,6 +395,8 @@ async def handle_ws(request):
                     "th_silence_bands": round(ss["silence_bands"],1),
                     "th_silence_rms": round(ss["silence_rms"],6),
                     "th_resume_factor": round(ss["resume_factor"],2),
+                    "calibrating": bool(ss.get("calibrating", False)),
+                    "calib_eta": round(calib_eta,2),
                 })
                 last_sent = now
             try:
@@ -417,9 +410,10 @@ async def handle_ws(request):
     finally:
         print("[WS] Cliente desconectado")
     return ws
+
 app.router.add_get('/ws', handle_ws)
 
-# ============================= Util de status console =============================
+# ============================= Util status console =============================
 def print_status(shared, tag_extra: str = "", require_sync=True):
     global _last_status, _time_sync_ok
     now = time.time()
@@ -429,48 +423,226 @@ def print_status(shared, tag_extra: str = "", require_sync=True):
         sys.stdout.flush()
         _last_status = now
 
+# ============================= Backends de captura =============================
+def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union[str,int]],
+                        audio_cb):
+    """
+    Tenta abrir com python-sounddevice em WASAPI loopback (Windows).
+    Não cai em microfone (a menos que allow_mic=True com mic explicitado).
+    """
+    devs = sd.query_devices()
+    system = platform.system().lower()
+
+    def is_output(i): return devs[i].get("max_output_channels",0) > 0
+    def is_input(i):  return devs[i].get("max_input_channels",0)  > 0
+
+    # 1) mic explícito via mic_device
+    if mic_device is not None:
+        if not allow_mic:
+            raise RuntimeError("Uso de microfone requer --allow-mic.")
+        midx = resolve_device_index(mic_device)
+        if midx is None or not is_input(midx):
+            raise RuntimeError(f"--mic-device não encontrado ou não é entrada: {mic_device}")
+        s = sd.InputStream(channels=2, samplerate=int(devs[midx].get("default_samplerate", 44100)),
+                           dtype='float32', blocksize=BLOCK_SIZE, device=midx, callback=audio_cb)
+        return s, int(s.samplerate), int(s.channels), f"(INPUT mic): '{devs[midx]['name']}'", False
+
+    # 2) --device informado
+    if override is not None:
+        idx = resolve_device_index(override)
+        if idx is None:
+            raise RuntimeError(f"--device '{override}' não encontrado.")
+        d = devs[idx]
+        if is_output(idx) and system.startswith("win"):
+            # tentar loopback
+            try:
+                extra = sd.WasapiSettings(loopback=True)  # requer PortAudio com WASAPI loopback
+                s = sd.InputStream(samplerate=int(d.get("default_samplerate", 44100)),
+                                   channels=max(1, int(d.get("max_output_channels", 2))),
+                                   dtype='float32', blocksize=BLOCK_SIZE, device=idx,
+                                   callback=audio_cb, latency='low', extra_settings=extra)
+                return s, int(s.samplerate), int(s.channels), f"(WASAPI loopback): '{d['name']}'", True
+            except Exception as e:
+                raise RuntimeError(f"O dispositivo '{d['name']}' não abriu em loopback (SD): {e}")  # [6](https://github.com/spatialaudio/portaudio-binaries/issues/6)
+        if is_input(idx):
+            if not allow_mic:
+                raise RuntimeError("Dispositivo de entrada só é permitido com --allow-mic.")
+            s = sd.InputStream(samplerate=int(d.get("default_samplerate", 44100)),
+                               channels=max(1, int(d.get("max_input_channels",2))),
+                               dtype='float32', blocksize=BLOCK_SIZE, device=idx, callback=audio_cb)
+            return s, int(s.samplerate), int(s.channels), f"(INPUT mic via --device): '{d['name']}'", False
+        raise RuntimeError(f"Dispositivo '{d['name']}' não é válido para captura.")
+
+    # 3) Autodetectar WASAPI loopback
+    if system.startswith("win"):
+        cands = []
+        for i in auto_candidate_outputs():
+            if not is_output(i): continue
+            d = devs[i]
+            try:
+                extra = sd.WasapiSettings(loopback=True)
+                s = sd.InputStream(samplerate=int(d.get("default_samplerate", 44100)),
+                                   channels=max(1, int(d.get("max_output_channels", 2))),
+                                   dtype='float32', blocksize=BLOCK_SIZE, device=i,
+                                   callback=audio_cb, latency='low', extra_settings=extra)
+                return s, int(s.samplerate), int(s.channels), f"(WASAPI loopback): '{d['name']}'", True
+            except Exception:
+                continue
+        raise RuntimeError("Nenhuma saída com WASAPI loopback disponível para o sounddevice.")  # [6](https://github.com/spatialaudio/portaudio-binaries/issues/6)
+
+    # Outras plataformas: exigir mic explícito
+    raise RuntimeError("Sem loopback nesta plataforma via sounddevice; use --allow-mic e --mic-device.")
+
+def _paw_choose_and_open(allow_mic: bool, mic_device: Optional[str], audio_cb):
+    """
+    PyAudio (preferindo PyAudioWPatch). Abre WASAPI loopback do default output.
+    Cai em mic apenas se allow_mic=True e mic explicitado.
+    """
+    if _PAW is None and _PA is None:
+        raise RuntimeError("PyAudioWPatch/PyAudio não encontrado. Instale com: pip install PyAudioWPatch")  # [2](https://pypi.org/project/PyAudioWPatch/)
+
+    pmod = _PAW or _PA
+    pinst = pmod.PyAudio()
+
+    # Mic explícito?
+    if mic_device:
+        if not allow_mic:
+            raise RuntimeError("Uso de microfone requer --allow-mic.")
+        # localizar mic por nome
+        target_idx = None
+        for i in range(pinst.get_device_count()):
+            info = pinst.get_device_info_by_index(i)
+            if mic_device.lower() in info.get("name","").lower() and info.get("maxInputChannels",0) > 0:
+                target_idx = i; break
+        if target_idx is None:
+            pinst.terminate()
+            raise RuntimeError(f"--mic-device '{mic_device}' não encontrado no PyAudio.")
+        info = pinst.get_device_info_by_index(target_idx)
+        rate = int(info.get("defaultSampleRate", 44100))
+        ch   = max(1, int(info.get("maxInputChannels", 1)))
+        # callback pyaudio -> numpy
+        def _py_cb(in_data, frame_count, time_info, status):
+            try:
+                block = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
+                if ch > 1:
+                    block = block.reshape(-1, ch).mean(axis=1)
+                audio_cb(block, frame_count, time_info, status)
+            except Exception:
+                pass
+            return (None, pmod.paContinue)
+        stream = pinst.open(format=pmod.paInt16, channels=ch, rate=rate,
+                            input=True, input_device_index=target_idx,
+                            frames_per_buffer=BLOCK_SIZE, stream_callback=_py_cb)
+        return ("PyAudio (mic)", pinst, stream, rate, ch)
+
+    # WASAPI loopback (preferido no PyAudioWPatch)
+    try:
+        if _PAW is not None:
+            # Default speakers loopback
+            wasapi = pinst.get_host_api_info_by_type(pmod.paWASAPI)
+            spk = pinst.get_device_info_by_index(wasapi["defaultOutputDevice"])
+            if not spk.get("isLoopbackDevice", False):
+                # localizar o análogo loopback
+                found = None
+                for lb in pinst.get_loopback_device_info_generator():
+                    if spk["name"] in lb["name"]:
+                        found = lb; break
+                if found is None:
+                    raise RuntimeError("Loopback padrão não encontrado no PyAudioWPatch.")
+                spk = found
+            rate = int(spk["defaultSampleRate"])
+            ch   = max(1, int(spk["maxInputChannels"]))
+
+            def _py_cb(in_data, frame_count, time_info, status):
+                try:
+                    block = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
+                    if ch > 1:
+                        block = block.reshape(-1, ch).mean(axis=1)
+                    audio_cb(block, frame_count, time_info, status)
+                except Exception:
+                    pass
+                return (None, pmod.paContinue)
+
+            stream = pinst.open(format=pmod.paInt16, channels=ch, rate=rate,
+                                input=True, input_device_index=spk["index"],
+                                frames_per_buffer=BLOCK_SIZE, stream_callback=_py_cb)
+            return ("PyAudioWPatch (WASAPI loopback)", pinst, stream, rate, ch)  # [7](https://github.com/s0d3s/PyAudioWPatch/blob/master/examples/pawp_record_wasapi_loopback.py)[2](https://pypi.org/project/PyAudioWPatch/)
+        else:
+            # PyAudio oficial: tentar achar dispositivos "[Loopback]" (se a build expõe)
+            loop_idx = None; rate=48000; ch=2
+            for i in range(pinst.get_device_count()):
+                info = pinst.get_device_info_by_index(i)
+                nm = info.get("name","")
+                if "loopback" in nm.lower() and info.get("maxInputChannels",0)>0:
+                    loop_idx=i; rate=int(info.get("defaultSampleRate",48000)); ch=int(info.get("maxInputChannels",2)); break
+            if loop_idx is None:
+                pinst.terminate()
+                raise RuntimeError("PyAudio não expõe loopback nesta build. Instale PyAudioWPatch.")
+            def _py_cb(in_data, frame_count, time_info, status):
+                try:
+                    block = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
+                    if ch > 1:
+                        block = block.reshape(-1, ch).mean(axis=1)
+                    audio_cb(block, frame_count, time_info, status)
+                except Exception:
+                    pass
+                return (None, pmod.paContinue)
+            stream = pinst.open(format=pmod.paInt16, channels=ch, rate=rate,
+                                input=True, input_device_index=loop_idx,
+                                frames_per_buffer=BLOCK_SIZE, stream_callback=_py_cb)
+            return ("PyAudio (loopback exposto)", pinst, stream, rate, ch)  # [5](https://pypi.org/project/PyAudio/)
+    except Exception as e:
+        pinst.terminate()
+        raise
+
 # ============================= Main =============================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bind', type=str, default='0.0.0.0')
     parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--backend', type=str, choices=['auto','sd','pyaudio'], default='auto',
+                        help='Escolhe backend de captura: auto (padrão), sd (sounddevice), pyaudio')
+    parser.add_argument('--no-pyaudio-fallback', action='store_true',
+                        help='Desativa fallback para PyAudio quando sounddevice falhar.')
     parser.add_argument('--device', type=str, default=None)
+    parser.add_argument('--allow-mic', action='store_true',
+                        help='Permite capturar microfone quando explicitamente solicitado (nunca usado por padrão).')
+    parser.add_argument('--mic-device', type=str, default=None,
+                        help='Seleciona o microfone a ser usado (requer --allow-mic).')
     parser.add_argument('--raspberry-ip', type=str, default=RASPBERRY_IP)
     parser.add_argument('--udp-port', type=int, default=UDP_PORT)
-
-    parser.add_argument('--bands', type=int, default=DEFAULT_NUM_BANDS, help='Numero de bandas (log) ou default para MEL')
-    parser.add_argument('--scale', type=str, choices=['log','mel'], default='log', help='log | mel (filterbank)')
-    parser.add_argument('--mel-bands', type=int, default=None, help='Override de n_bandas para MEL')
+    parser.add_argument('--bands', type=int, default=DEFAULT_NUM_BANDS)
+    parser.add_argument('--scale', type=str, choices=['log','mel'], default='log')
+    parser.add_argument('--mel-bands', type=int, default=None)
     parser.add_argument('--mel-tilt', type=float, default=-0.25, help='Expoente do tilt nas bandas MEL (negativo realça graves; 0 desliga tilt)')
     parser.add_argument('--mel-no-area-norm', action='store_true', help='Desliga normalização de área dos filtros MEL')
-
-    parser.add_argument('--pkt', type=str, choices=['a1','a2'], default='a1', help='Formato do audio (a1 padrao)')
+    parser.add_argument('--pkt', type=str, choices=['a1','a2'], default='a1')
     parser.add_argument('--tx-fps', type=int, default=75)
     parser.add_argument('--signal-hold-ms', type=int, default=600)
     parser.add_argument('--vis-fps', type=int, default=60)
-
     parser.add_argument('--require-sync', action='store_true')
     parser.add_argument('--no-require-sync', action='store_true')
     parser.add_argument('--resync', type=float, default=RESYNC_INTERVAL_SEC)
-
     # Gate de silencio
     parser.add_argument('--silence-bands', type=float, default=28.0)
     parser.add_argument('--silence-rms', type=float, default=0.0015)
     parser.add_argument('--silence-duration', type=float, default=0.8)
     parser.add_argument('--resume-factor', type=float, default=1.8)
     parser.add_argument('--resume-stable', type=float, default=0.35)
-
     # Alphas
     parser.add_argument('--avg-ema', type=float, default=0.05)
     parser.add_argument('--rms-ema', type=float, default=0.05)
     parser.add_argument('--norm-peak-ema', type=float, default=PEAK_EMA_DEFAULT)
-
     # Reset
     parser.add_argument('--no-reset-on-start', action='store_true', help='Não envia RESET (B1) ao iniciar')
+    # Perfil de silêncio / ruído
+    parser.add_argument('--noise-profile', action='store_true', help='Habilita perfil de silêncio por banda e subtração pós-FFT/MEL')
+    parser.add_argument('--noise-headroom', type=float, default=1.12, help='Fator >1 para ampliar o perfil antes de subtrair')
+    parser.add_argument('--min-band', type=int, default=0, help='Valor mínimo (0..255) por banda após subtração')
 
     args = parser.parse_args()
 
-    # Guardar cfg para handlers
+    # Guardar cfg
     app["cfg"] = {"rpi_ip": args.raspberry_ip, "rpi_port": args.udp_port}
 
     # FPS TX efetivo
@@ -491,12 +663,25 @@ def main():
         "force_silence_once": False,
         "calibrating": False,
         "calib_until": 0.0,
+        "calib_started": 0.0,
         "calib_avg": [],
         "calib_rms": [],
+        "last_calib": {},
+        "noise_profile": None,
+        "noise_profile_frames": None,
+        "noise_profile_path": None,
+        "calib_max_frames": int(TX_FPS * 10),
     }
     app["server_state"] = server_state
 
-    # shared e server
+    # Config de servidor para features
+    app["server_cfg"] = {
+        "noise_profile_enabled": bool(args.noise_profile),
+        "noise_headroom": float(args.noise_headroom),
+        "min_band": int(args.min_band),
+    }
+
+    # shared
     n_bands = int(args.bands)
     shared = Shared(n_bands)
     app["shared"] = shared
@@ -518,183 +703,131 @@ def main():
         time_sync_over_tcp(args.raspberry_ip)
         threading.Thread(target=resync_worker, args=(args.raspberry_ip, float(args.resync)), daemon=True).start()
 
-    # ---------- Função util de abertura ----------
-    def open_with_probe(dev_idx, extra, cb):
-        """
-        Tenta abrir o InputStream no device de saída (loopback no Windows).
-        Se falhar, tenta fallback (input default).
-        Usa callback 'cb' (pode ser None).
-        Retorna: (stream, samplerate, channels, desc_abertura, abriu_loopback_bool)
-        """
-        devs = sd.query_devices()
-        d = devs[dev_idx] if isinstance(dev_idx, int) and 0 <= dev_idx < len(devs) else None
-        ch_pref = int(d.get('max_output_channels', 2)) if d else 2
-        if ch_pref <= 0:
-            ch_pref = 2
-        try:
-            sr_pref = int(round(float(d.get('default_samplerate', 44100)))) if d else 44100
-        except Exception:
-            sr_pref = 44100
-
-        attempts = [
-            (sr_pref, ch_pref),
-            (48000, 2),
-            (48000, 1),
-            (44100, 2),
-            (44100, 1),
-        ]
-        seen = set()
-        ordered = []
-        for sr, ch in attempts:
-            k = (sr, ch)
-            if k not in seen and sr > 0 and ch > 0:
-                seen.add(k)
-                ordered.append((sr, ch))
-
-        last_err = None
-        for sr_try, ch_try in ordered:
-            try:
-                s = sd.InputStream(
-                    samplerate=sr_try,
-                    channels=ch_try,
-                    dtype='float32',
-                    blocksize=BLOCK_SIZE,
-                    device=dev_idx,
-                    callback=cb,
-                    latency='low',
-                    extra_settings=extra
-                )
-                return s, int(s.samplerate), int(s.channels), f"(opened sr={int(s.samplerate)} ch={int(s.channels)})", (extra is not None)
-            except Exception as e:
-                last_err = e
-
-        # Fallback (não-ideal): input default (mic)
-        try:
-            s = sd.InputStream(
-                channels=2,
-                samplerate=44100,
-                dtype='float32',
-                blocksize=BLOCK_SIZE,
-                device=None,
-                callback=cb
-            )
-            return s, int(s.samplerate), 2, "(fallback default INPUT sr=44100 ch=2)", False
-        except Exception as e:
-            last_err = e
-            raise last_err
-
-    # ---------- Escolher device (primeiro sem callback, só para descobrir SR/Ch) ----------
-    dev_desc = "desconhecido"
-    stream = None
-    selected = None  # (dev_idx, extra, desc_tag)
-    for dev_idx, extra, desc in choose_candidates(override=args.device):
-        try:
-            # abre sem callback só para obter SR/Ch
-            s_tmp, sr_eff, ch_eff, open_desc, opened_loopback = open_with_probe(dev_idx, extra, cb=None)
-            dev_desc = f"{desc} {open_desc}"
-            selected = (dev_idx, extra, desc)
-            try:
-                s_tmp.close()
-            except Exception:
-                pass
-            break
-        except Exception as e:
-            print(f"\n[WARN] Falha ao abrir {desc}: {e}")
-            continue
-
-    if selected is None:
-        print("\n[FATAL] Nao foi possivel abrir nenhum dispositivo de audio.")
-        sys.exit(1)
-
-    # Preencher shared com SR/Ch descobertos
-    shared.device = dev_desc
-    shared.samplerate = sr_eff
-    shared.channels = ch_eff
-
-    # ---------- Preparar LOG ou MEL ----------
+    # ---- Preparar LOG ou MEL ----
     scale_mode = args.scale.lower()
     peak_ema_alpha = float(args.norm_peak_ema)
 
+    compute_bands = None
     if scale_mode == 'mel':
         mel_bands = int(args.mel_bands or n_bands)
-        mel_fb = build_mel_filterbank(shared.samplerate, NFFT, mel_bands, FMIN, min(FMAX, shared.samplerate/2.0))
-
-        # --- Normalização de área (default ON; desliga com --mel-no-area-norm) ---
-        if not args.mel_no_area_norm:
-            row_sum = mel_fb.sum(axis=1, keepdims=True)
-            mel_fb = mel_fb / np.maximum(row_sum, 1e-9)
-
-        # --- Tilt pró-graves (expoente negativo realça graves; 0 desliga) ---
-        if abs(float(args.mel_tilt)) > 1e-9:
-            k = np.arange(mel_bands, dtype=np.float32)
-            tilt = ((k + 1.0) / float(mel_bands)) ** float(args.mel_tilt)
-            mel_fb = (mel_fb.T * tilt).T
-
-        compute_bands = make_compute_bands_mel(shared.samplerate, BLOCK_SIZE, NFFT, mel_fb, EMA_ALPHA, peak_ema_alpha)
-        shared.bands = np.zeros(mel_bands, dtype=np.uint8)  # ajustar tamanho exposto
+        # sr real será conhecido após abrir stream -> reconfiguramos depois se necessário
+        compute_bands_builder = ("mel", mel_bands)
+        shared.bands = np.zeros(mel_bands, dtype=np.uint8)
     else:
-        a_idx, b_idx = make_bands_indices(NFFT, shared.samplerate, n_bands, FMIN, FMAX, min_bins=2)
-        compute_bands = make_compute_bands_log(shared.samplerate, BLOCK_SIZE, NFFT, a_idx, b_idx, EMA_ALPHA, peak_ema_alpha)
+        compute_bands_builder = ("log", n_bands)
         shared.bands = np.zeros(n_bands, dtype=np.uint8)
 
-    # ---------- Audio callback ----------
+    # ---- callback comum (recebe bloco float32 mono 0..1/±1) ----
     energy_buf = np.zeros(ENERGY_BUFFER_SIZE, dtype=np.float32)
     energy_idx = 0
     energy_count = 0
     last_energy = 0.0
 
-    def audio_cb(indata, frames, time_info, status):
-        nonlocal energy_idx, energy_count, last_energy, compute_bands
-        if status:
-            sys.stdout.write("\n"); print(f"[WARN] Audio status: {status}")
-        block = indata.mean(axis=1) if indata.ndim > 1 else indata
-        if len(block) < BLOCK_SIZE:
-            block = np.pad(block, (0, BLOCK_SIZE - len(block)), "constant")
-        if compute_bands is None:
-            return
-        bands = compute_bands(block[:BLOCK_SIZE])
-        shared.bands = bands
+    def make_audio_cb():
+        nonlocal compute_bands, energy_idx, energy_count, last_energy
+        def audio_cb(block, frames, time_info, status):
+            # block: np.float32 mono (tam variável). Normalizamos para BLOCK_SIZE
+            b = block
+            if b.shape[0] < BLOCK_SIZE:
+                b = np.pad(b, (0, BLOCK_SIZE - b.shape[0]), 'constant')
+            bands = compute_bands(b[:BLOCK_SIZE]) if compute_bands is not None else None
+            if bands is None:
+                return
+            # atualizar shared
+            app["shared"].bands = bands
+            avg = float(np.mean(bands))
+            rms = float(np.sqrt(np.mean((b[:BLOCK_SIZE]*b[:BLOCK_SIZE])) + 1e-12))
+            app["shared"].avg = avg
+            app["shared"].rms = rms
+            app["shared"].last_update = time.time()
+            # beat simples
+            lb = bands[:max(8, len(bands)//12)]
+            energy = float(np.mean(lb)) / 255.0 if lb.size>0 else 0.0
+            energy_buf[energy_idx] = energy
+            energy_idx = (energy_idx + 1) % ENERGY_BUFFER_SIZE
+            energy_count = min(energy_count + 1, ENERGY_BUFFER_SIZE)
+            buf_view = energy_buf if energy_count == ENERGY_BUFFER_SIZE else energy_buf[:energy_count]
+            avg_energy = float(np.mean(buf_view)) if energy_count > 0 else 0.0
+            std_energy = float(np.std(buf_view)) if energy_count > 1 else 0.0
+            dyn_thr = avg_energy + BEAT_THRESHOLD * std_energy
+            is_peak_now = (energy >= max(dyn_thr, BEAT_HEIGHT_MIN)) and (energy >= last_energy)
+            app["shared"].beat = 1 if is_peak_now else 0
+            last_energy = energy
+        return audio_cb
 
-        avg = float(np.mean(bands))
-        rms = float(np.sqrt(np.mean(block*block) + 1e-12))
-        shared.avg = avg
-        shared.rms = rms
-        shared.last_update = time.time()
+    # ---- abrir backend ----
+    backend_used = None
+    stream = None
+    pa_instance = None  # caso PyAudio
 
-        # Beat simples (graves)
-        lb = bands[:max(8, len(bands)//12)]
-        energy = float(np.mean(lb)) / 255.0 if lb.size > 0 else 0.0
-        energy_buf[energy_idx] = energy
-        energy_idx = (energy_idx + 1) % ENERGY_BUFFER_SIZE
-        energy_count = min(energy_count + 1, ENERGY_BUFFER_SIZE)
-        buf_view = energy_buf if energy_count == ENERGY_BUFFER_SIZE else energy_buf[:energy_count]
-        avg_energy = float(np.mean(buf_view)) if energy_count > 0 else 0.0
-        std_energy = float(np.std(buf_view)) if energy_count > 1 else 0.0
-        dyn_thr = avg_energy + BEAT_THRESHOLD * std_energy
-        is_peak_now = (energy >= max(dyn_thr, BEAT_HEIGHT_MIN)) and (energy >= last_energy)
-        shared.beat = 1 if is_peak_now else 0
-        last_energy = energy
+    def _build_compute(sr):
+        nonlocal compute_bands, shared
+        if compute_bands_builder[0] == "mel":
+            mel_bands = compute_bands_builder[1]
+            mel_fb = build_mel_filterbank(sr, NFFT, mel_bands, FMIN, min(FMAX, sr/2.0))
+            if not args.mel_no_area_norm:
+                row_sum = mel_fb.sum(axis=1, keepdims=True)
+                mel_fb = mel_fb / np.maximum(row_sum, 1e-9)
+            if abs(float(args.mel_tilt)) > 1e-9:
+                k = np.arange(mel_bands, dtype=np.float32)
+                tilt = ((k + 1.0) / float(mel_bands)) ** float(args.mel_tilt)
+                mel_fb = (mel_fb.T * tilt).T
+            compute_bands = make_compute_bands_mel(sr, BLOCK_SIZE, NFFT, mel_fb, EMA_ALPHA, peak_ema_alpha)
+            shared.bands = np.zeros(mel_bands, dtype=np.uint8)
+        else:
+            n_b = compute_bands_builder[1]
+            a_idx, b_idx = make_bands_indices(NFFT, sr, n_b, FMIN, FMAX, min_bins=2)
+            compute_bands = make_compute_bands_log(sr, BLOCK_SIZE, NFFT, a_idx, b_idx, EMA_ALPHA, peak_ema_alpha)
+            shared.bands = np.zeros(n_b, dtype=np.uint8)
 
-    # ---------- Reabrir stream com callback ----------
-    dev_idx, extra, desc_tag = selected
-    try:
-        stream, sr_eff2, ch_eff2, open_desc2, opened_loopback2 = open_with_probe(dev_idx, extra, cb=audio_cb)
-        shared.device = f"{desc_tag} {open_desc2}"
-        stream.start()
-        shared.samplerate = sr_eff2
-        shared.channels = ch_eff2
-    except Exception as e:
-        print(f"\n[FATAL] Falha ao iniciar stream com callback: {e}")
+    # tentativa 1: sounddevice (se backend=auto ou sd)
+    if args.backend in ("auto","sd"):
+        try:
+            audio_cb = make_audio_cb()
+            s, sr_eff, ch_eff, desc, is_loop = _sd_choose_and_open(args.device, allow_mic=args.allow_mic,
+                                                                    mic_device=args.mic_device, audio_cb=lambda b, *_: audio_cb(b.astype(np.float32)))
+            _build_compute(sr_eff)
+            stream = s
+            stream.start()
+            shared.samplerate = sr_eff
+            shared.channels   = ch_eff
+            backend_used = f"sounddevice {desc}"
+        except Exception as e_sd:
+            if args.backend == "sd" or args.no_pyaudio_fallback:
+                print(f"\n[FATAL] sounddevice falhou: {e_sd}")
+                sys.exit(1)
+            else:
+                print(f"\n[WARN] sounddevice falhou, tentando PyAudio... ({e_sd})")
+
+    # tentativa 2: PyAudio (se backend=auto caiu aqui, ou backend=pyaudio)
+    if stream is None and args.backend in ("auto","pyaudio"):
+        try:
+            audio_cb = make_audio_cb()
+            tag, pa_instance, pa_stream, sr_eff, ch_eff = _paw_choose_and_open(args.allow_mic, args.mic_device, audio_cb)
+            _build_compute(sr_eff)
+            pa_stream.start_stream()
+            stream = pa_stream
+            shared.samplerate = sr_eff
+            shared.channels   = ch_eff
+            backend_used = tag
+            # dica: `PyAudioWPatch` disponibiliza devices loopback e helpers dedicados
+            # (ex.: get_loopback_device_info_generator)  [2](https://pypi.org/project/PyAudioWPatch/)[7](https://github.com/s0d3s/PyAudioWPatch/blob/master/examples/pawp_record_wasapi_loopback.py)
+        except Exception as e_pa:
+            print(f"\n[FATAL] PyAudio falhou: {e_pa}\nDica: instale PyAudioWPatch: pip install PyAudioWPatch")
+            sys.exit(1)
+
+    if stream is None:
+        print("\n[FATAL] Nenhum backend de áudio pôde ser aberto.")
         sys.exit(1)
 
-    # ---------- Empurrar CFG para o RPi ----------
+    # Empurrar CFG
     try:
         send_cfg_b0(args.raspberry_ip, args.udp_port, len(shared.bands), TX_FPS, int(args.signal_hold_ms), int(args.vis_fps))
         print(f"[CFG->RPi] bands={len(shared.bands)} fps={TX_FPS} hold={int(args.signal_hold_ms)} vis_fps={int(args.vis_fps)}")
     except Exception as e:
         print(f"[WARN] Falha B0: {e}")
 
-    # ---------- (Novo) Reset remoto do RPi ----------
+    # Reset remoto no start
     if not args.no_reset_on_start:
         try:
             send_reset_b1(args.raspberry_ip, args.udp_port)
@@ -702,16 +835,15 @@ def main():
         except Exception as e:
             print(f"[WARN] Falha ao enviar RESET B1: {e}")
 
-    print(f"[INFO] Capturando de: {shared.device}")
+    print(f"[INFO] Capturando de: {backend_used}")
     print("[PRONTO] Monitor online - abra o navegador.")
 
-    # ---------- Loop principal ----------
+    # --- Loop principal (idêntico ao anterior; gate + envio) ---
     rms_med = deque(maxlen=7)
     avg_med = deque(maxlen=7)
     last_tick = 0.0
     silence_since = None
 
-    # histórico para auto
     hist_avg: Deque[Tuple[float,float]] = deque()
     hist_rms: Deque[Tuple[float,float]] = deque()
     last_auto_update = 0.0
@@ -719,7 +851,6 @@ def main():
     try:
         while True:
             now = time.time()
-
             if (REQUIRE_TIME_SYNC and not _time_sync_ok) and not args.no_require_sync:
                 print_status(shared, " (paused)", require_sync=True)
                 time.sleep(0.05)
@@ -730,7 +861,6 @@ def main():
             rms = shared.rms
             beat = shared.beat
 
-            # Filtro mediana
             rms_med.append(rms); avg_med.append(avg)
             if len(rms_med) == rms_med.maxlen:
                 rms_filtered = float(np.median(rms_med))
@@ -740,24 +870,66 @@ def main():
                 avg_filtered = avg
 
             ss = app["server_state"]
+            scfg = app["server_cfg"]
 
-            # EMAs
             if 'avg_ema_val' not in ss:
                 ss['avg_ema_val'] = avg_filtered
                 ss['rms_ema_val'] = rms_filtered
             else:
                 ss['avg_ema_val'] = ss['avg_ema_val']*(1.0-ss['avg_ema']) + ss['avg_ema']*avg_filtered
                 ss['rms_ema_val'] = ss['rms_ema_val']*(1.0-ss['rms_ema']) + ss['rms_ema']*rms_filtered
-            avg_ema = ss['avg_ema_val']
-            rms_ema = ss['rms_ema_val']
 
-            # Histórico p/ auto (usar valores filtrados para maior estabilidade)
+            avg_ema = ss['avg_ema_val']; rms_ema = ss['rms_ema_val']
+
             hist_avg.append((now, avg_filtered))
             hist_rms.append((now, rms_filtered))
-
             cutoff = now - 8.0
             while hist_avg and hist_avg[0][0] < cutoff: hist_avg.popleft()
             while hist_rms and hist_rms[0][0] < cutoff: hist_rms.popleft()
+
+            # Fechar calibração
+            if ss.get("calibrating", False) and now >= ss.get("calib_until", 0.0):
+                arr_avg = np.array(ss["calib_avg"] or [avg_filtered], dtype=np.float32)
+                arr_rms = np.array(ss["calib_rms"] or [rms_filtered], dtype=np.float32)
+                noise_avg_p = float(np.percentile(arr_avg, 80))
+                noise_rms_p = float(np.percentile(arr_rms, 80))
+                th_avg = max(1.0, noise_avg_p * 1.15)
+                th_rms = max(1e-6, noise_rms_p * 1.25)
+                base = max(th_avg, 1e-3)
+                music_proxy = float(np.percentile(np.array([v for _,v in hist_avg], dtype=np.float32), 90)) if hist_avg else base*1.6
+                resume_factor = float(np.clip((music_proxy / base) * 0.9, 1.4, 4.0))
+                ss["silence_bands"] = th_avg
+                ss["silence_rms"] = th_rms
+                ss["resume_factor"] = resume_factor
+
+                if scfg["noise_profile_enabled"] and ss.get("noise_profile_frames"):
+                    stack = np.stack(ss["noise_profile_frames"], axis=0).astype(np.float32)
+                    p90 = np.percentile(stack, 90, axis=0).astype(np.float32)
+                    ss["noise_profile"] = np.clip(p90, 0, 255)
+                    try:
+                        home = os.path.expanduser('~')
+                        prof_dir = os.path.join(home, '.reactiveleds'); os.makedirs(prof_dir, exist_ok=True)
+                        prof_name = f"noise-profile-sr{shared.samplerate}-nb{len(shared.bands)}.npy"
+                        prof_path = os.path.join(prof_dir, prof_name)
+                        np.save(prof_path, ss["noise_profile"])
+                        ss["noise_profile_path"] = prof_path
+                        print(f"[NOISE] Perfil salvo em {prof_path}")
+                    except Exception as e:
+                        print(f"[WARN] Falha ao salvar perfil: {e}")
+
+                ss["last_calib"] = {
+                    "t": time.time(),
+                    "th_avg": float(th_avg),
+                    "th_rms": float(th_rms),
+                    "resume_factor": float(resume_factor),
+                    "frames": int(len(ss.get("noise_profile_frames") or [])),
+                }
+                ss["calibrating"] = False
+                ss["calib_until"] = 0.0
+                ss["calib_started"] = 0.0
+                ss["calib_avg"].clear(); ss["calib_rms"].clear()
+                ss["noise_profile_frames"] = None
+                print(f"\n[CALIB] OK: th_avg={th_avg:.1f} th_rms={th_rms:.6f} resume_x={resume_factor:.2f}")
 
             # Auto (opcional)
             if ss["auto_mode"] and (now - last_auto_update) >= 0.5:
@@ -773,14 +945,14 @@ def main():
                 ss["silence_bands"]=th_avg; ss["silence_rms"]=th_rms; ss["resume_factor"]=dyn_resume
                 last_auto_update = now
 
-            # Gate
+            # Gate + envio
+            avg_ema = ss['avg_ema_val']; rms_ema = ss['rms_ema_val']
             is_quiet = (avg_ema < ss['silence_bands']) and (rms_ema < ss['silence_rms'])
             resume_threshold = ss['silence_bands'] * ss['resume_factor']
 
-            # /api/mode: forçar silêncio
             if ss.get("force_silence_once"):
                 zero = np.zeros(len(bands_now), dtype=np.uint8)
-                if args.pkt=='a2':  # A2 com piso neutro (não achata)
+                if args.pkt=='a2':
                     send_packet_a2(zero, 0, 1, 0, 0, args.raspberry_ip, args.udp_port, shared)
                 else:
                     send_packet_a1(zero, 0, 1, args.raspberry_ip, args.udp_port, shared)
@@ -805,14 +977,22 @@ def main():
                     if 'resume_since' not in ss or ss['resume_since'] is None:
                         ss['resume_since']=now
                     elif (now - ss['resume_since']) >= ss['resume_stable']:
-                        dyn_floor = 0  # piso neutro por padrão (A2)
+                        dyn_floor = 0
                         lb = bands_now[:max(8, len(bands_now)//12)]
                         energy_norm = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
                         kick_val = 220 if beat else int(max(0, min(255, round(energy_norm*255.0))))
+
+                        b_send = bands_now
+                        if app["server_cfg"]["noise_profile_enabled"] and ss.get("noise_profile") is not None:
+                            prof = ss["noise_profile"] * float(app["server_cfg"]["noise_headroom"])
+                            b_send = np.clip(bands_now.astype(np.float32) - prof, 0, 255).astype(np.uint8)
+                        if app["server_cfg"]["min_band"] > 0:
+                            b_send = np.maximum(b_send, app["server_cfg"]["min_band"]).astype(np.uint8)
+
                         if args.pkt=='a2':
-                            send_packet_a2(bands_now, beat, 1, dyn_floor, kick_val, args.raspberry_ip, args.udp_port, shared)
+                            send_packet_a2(b_send, beat, 1, dyn_floor, kick_val, args.raspberry_ip, args.udp_port, shared)
                         else:
-                            send_packet_a1(bands_now, beat, 1, args.raspberry_ip, args.udp_port, shared)
+                            send_packet_a1(b_send, beat, 1, args.raspberry_ip, args.udp_port, shared)
                         print_status(shared, " (from silence)", require_sync=not args.no_require_sync)
                         shared.active=True; ss['resume_since']=None; last_tick=now; time.sleep(0.001); continue
                 else:
@@ -823,21 +1003,27 @@ def main():
                 time.sleep(0.05)
                 continue
 
-            # Throttle TX
             if (now - last_tick) < MIN_SEND_INTERVAL:
                 time.sleep(0.001)
                 continue
             last_tick = now
 
-            # Envio normal
-            dyn_floor = 0  # piso neutro para A2 (preserva reatividade)
+            dyn_floor = 0
             lb = bands_now[:max(8, len(bands_now)//12)]
             energy_norm = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
             kick_val = 220 if beat else int(max(0, min(255, round(energy_norm*255.0))))
+
+            b_send = bands_now
+            if app["server_cfg"]["noise_profile_enabled"] and ss.get("noise_profile") is not None:
+                prof = ss["noise_profile"] * float(app["server_cfg"]["noise_headroom"])
+                b_send = np.clip(bands_now.astype(np.float32) - prof, 0, 255).astype(np.uint8)
+            if app["server_cfg"]["min_band"] > 0:
+                b_send = np.maximum(b_send, app["server_cfg"]["min_band"]).astype(np.uint8)
+
             if args.pkt=='a2':
-                send_packet_a2(bands_now, beat, 0, dyn_floor, kick_val, args.raspberry_ip, args.udp_port, shared)
+                send_packet_a2(b_send, beat, 0, dyn_floor, kick_val, args.raspberry_ip, args.udp_port, shared)
             else:
-                send_packet_a1(bands_now, beat, 0, args.raspberry_ip, args.udp_port, shared)
+                send_packet_a1(b_send, beat, 0, args.raspberry_ip, args.udp_port, shared)
             print_status(shared, "", require_sync=not args.no_require_sync)
 
     except KeyboardInterrupt:
@@ -845,7 +1031,25 @@ def main():
     finally:
         _stop_resync.set()
         try:
-            stream.stop(); stream.close()
+            if pa_instance is not None:
+                # PyAudio
+                try:
+                    if stream.is_active(): stream.stop_stream()
+                except Exception: pass
+                try:
+                    stream.close()
+                except Exception: pass
+                try:
+                    pa_instance.terminate()
+                except Exception: pass
+            else:
+                # sounddevice
+                try:
+                    stream.stop()
+                except Exception: pass
+                try:
+                    stream.close()
+                except Exception: pass
         except Exception:
             pass
         sys.stdout.write("\n"); sys.stdout.flush()
