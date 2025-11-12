@@ -16,10 +16,10 @@ from .clean import (
     effect_peak_dots_expanded,
     effect_bass_impact_wave,
 )
-from .fire import (
-    effect_clean_fire_edge_v4,
-    effect_clean_fire_center_v4,
-)
+# from .fire import (
+#     effect_clean_fire_edge_v4,
+#     effect_clean_fire_center_v4,
+# )
 
 def _wrap(ctx, fn):
     return lambda bands, beat, active, _f=fn: _f(ctx, bands, beat, active)
@@ -40,6 +40,6 @@ def build_effects(ctx):
         ("Peak Dots Expanded",                  _wrap(ctx, effect_peak_dots_expanded)),
         ("Beat Impact Wave",                    _wrap(ctx, effect_bass_impact_wave)),
 
-        ("Fire Edge Forge v4 (Palette + Sparks)", _wrap(ctx, effect_clean_fire_edge_v4)),
-        ("Fire Center Vent v4 (Palette + Sparks)", _wrap(ctx, effect_clean_fire_center_v4)),
+        # ("Fire Edge Forge v4 (Palette + Sparks)", _wrap(ctx, effect_clean_fire_edge_v4)),
+        # ("Fire Center Vent v4 (Palette + Sparks)", _wrap(ctx, effect_clean_fire_center_v4)),
     ]
