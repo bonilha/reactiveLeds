@@ -15,10 +15,10 @@ from .clean import (
     effect_peak_dots_expanded,
     effect_bass_impact_wave,
 )
-# from .fire import (
-#     effect_clean_fire_edge_v4,
-#     effect_clean_fire_center_v4,
-# )
+from .waterfall_v6 import (
+     effect_chromatic_cascade,
+    # effect_clean_fire_center_v4,
+)
 
 def _wrap(ctx, fn):
     return lambda bands, beat, active, _f=fn: _f(ctx, bands, beat, active)
@@ -30,7 +30,8 @@ def build_effects(ctx):
         ("Rainbow Wave (HSV)",                  _wrap(ctx, effect_rainbow_wave)),
 
         ("Full Strip Pulse (Palette)",          _wrap(ctx, effect_full_strip_pulse)),
-        ("Waterfall (Palette)",                 _wrap(ctx, effect_waterfall)),
+        # ("Waterfall (Palette)",                 _wrap(ctx, effect_waterfall)),
+        ("Chromatic Cascade (Palette)", _wrap(ctx, effect_chromatic_cascade)),
         ("Bass Ripple Pulse v2",                _wrap(ctx, effect_bass_ripple_pulse_v2)),
 
         ("Spectral Blade (Clean)",              _wrap(ctx, effect_spectral_blade)),
