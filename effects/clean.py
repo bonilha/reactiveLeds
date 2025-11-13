@@ -739,4 +739,110 @@ def effect_bass_impact_wave(ctx, bands_u8, beat_flag, active):
     # Envia (o FXContext aplicará o cap global já considerando o brightness)
     ctx.to_pixels_and_show(rgb)
 
+
+# ==== WAVELENGTH REACTIVE (1D) — compatível com paletas, floor e cap global ====
+def effect_wavelength_reactive(ctx, bands_u8, beat_flag, active):
+    """
+    Gradiente que percorre a fita com velocidade/fase guiadas pelo áudio.
+    - Velocidade: energia total (com ênfase nos graves) + kick no beat
+    - Fase/Hue: centroide espectral e seed de cor
+    - Paleta se ctx.current_palette existir; senão HSV
+    - AGC pré-cap leve para reduzir consumo médio (folga antes do cap global)
+    - Zero imports extras; tudo vetorizado
+    """
+    import numpy as np
+
+    L = ctx.LED_COUNT
+    n = int(len(bands_u8))
+    if L == 0 or n == 0:
+        ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.uint8))
+        return
+
+    # ---------- 1) Medidas de áudio (ênfase em graves + centroide) ----------
+    x = np.asarray(bands_u8, dtype=np.float32)  # 0..255
+    # pesos pró-grave (de 1.35 no grave até ~0.9 no agudo)
+    f = np.arange(n, dtype=np.float32) / max(1, n - 1)
+    w = 1.35 - 0.45 * (f ** 0.8)
+    xw = x * w
+    # normaliza para não inflar energia média
+    xw *= (np.mean(x) + 1e-6) / (np.mean(xw) + 1e-6)
+
+    energy = float(np.mean(xw)) / 255.0  # 0..1
+    energy = np.clip(energy, 0.0, 1.0)
+    low_n = max(8, n // 6)
+    low_energy = float(np.mean(xw[:low_n])) / 255.0
+    low_energy = np.clip(low_energy, 0.0, 1.0)
+
+    # centroide (0..1)
+    s = float(np.sum(xw)) + 1e-6
+    centroid_band = float(np.sum(np.arange(n, dtype=np.float32) * xw)) / s
+    centroid = centroid_band / max(1.0, n - 1.0)  # 0..1
+
+    # ---------- 2) Estado persistente (fase, agc) ----------
+    if not hasattr(ctx, "_wl_phase"):
+        ctx._wl_phase = 0.0
+    if not hasattr(ctx, "_wl_agc_ema"):
+        ctx._wl_agc_ema = 1.0
+
+    # ---------- 3) Velocidade da onda (frames são uniformes no sync) ----------
+    # base + ganho por energia + ganho por graves + kick no beat
+    speed = 0.35 + 0.70 * energy + 0.55 * low_energy
+    if beat_flag:
+        speed += 0.35
+    # direcionalidade sutil pelo centroide (mais agudo → um pouco mais rápido)
+    speed *= (0.90 + 0.20 * centroid)
+    ctx._wl_phase = (ctx._wl_phase + speed) % (L * 4.0)
+
+    # ---------- 4) Envelope de brilho (Value), antes de cor ----------
+    # leito baixo para manter fita cheia + ondulação leve pela fase
+    t = ctx.I_ALL.astype(np.float32) / max(1.0, float(L - 1))
+    bed_level = (energy ** 0.7) * 70.0 + (low_energy ** 0.9) * 55.0  # mais grave → mais bed
+    ripple = 0.25 + 0.75 * np.sin(2.0 * np.pi * (t + ctx._wl_phase * 0.004 + centroid * 0.15))
+    v_pre = np.clip(bed_level * (0.45 + 0.55 * ripple), 0.0, 255.0)  # float 0..255
+
+    # ---------- 5) AGC PRÉ-CAP (leve) ----------
+    # estima corrente = (mA/canal / 255) * sum(v) * 3 + idle
+    ma_per_ch = float(ctx.WS2812B_MA_PER_CHANNEL)  # ~20
+    idle_ma   = float(ctx.WS2812B_IDLE_MA_PER_LED) * float(L)
+    budget_ma = float(ctx.CURRENT_BUDGET_A) * 1000.0
+    target_ma = max(0.0, (budget_ma - idle_ma) * 0.84)  # ~16% de folga
+    i_color_ma = (ma_per_ch / 255.0) * float(np.sum(v_pre)) * 3.0
+    pre_scale_raw = 1.0 if i_color_ma <= 1e-6 else min(1.0, target_ma / i_color_ma)
+    # estabiliza entre frames
+    ctx._wl_agc_ema = 0.70 * ctx._wl_agc_ema + 0.30 * pre_scale_raw
+    pre_scale = min(pre_scale_raw, ctx._wl_agc_ema)
+    # reduz um pouco mais se o cap global já vinha atuando
+    if ctx.last_cap_scale is not None and ctx.last_cap_scale < 0.92:
+        pre_scale *= (0.92 + 0.08 * ctx.last_cap_scale)  # 0.85→~0.93
+
+    v_raw = np.clip(v_pre * pre_scale, 0.0, 255.0).astype(np.uint8)
+    v = ctx.apply_floor_vec(v_raw, active, None)
+
+    # ---------- 6) Cor: paleta (se houver) → HSV fallback ----------
+    pal = getattr(ctx, "current_palette", None)
+    if isinstance(pal, (list, tuple)) and len(pal) >= 2:
+        pal_arr = np.asarray(pal, dtype=np.float32)   # (m,3)
+        m = pal_arr.shape[0]
+        # mapeia gradiente da paleta ao longo da fita com fase móvel
+        # índice pal = (posição + fase normalizada + leve “tilt” pelo centroide)
+        pal_phase = (ctx._wl_phase * 0.003 + centroid * 0.35) % 1.0
+        g = (t + pal_phase) % 1.0
+        g *= (m - 1)
+        j = np.clip(np.floor(g).astype(np.int32), 0, m - 1)
+        j2 = np.clip(j + 1, 0, m - 1)
+        frac = (g - j).reshape(-1, 1)
+        base_rgb = pal_arr[j] * (1.0 - frac) + pal_arr[j2] * frac  # (L,3)
+        # aplica envelope v (Value)
+        rgb = np.clip(base_rgb * (v[:, None].astype(np.float32) / 255.0), 0, 255).astype(np.uint8)
+    else:
+        # HSV contínuo, hue avança com a fase e levemente com o centroide
+        hue_base = (int(ctx.base_hue_offset) + (int(ctx.hue_seed) >> 2)) % 256
+        hue_shift = ((ctx._wl_phase * 0.6) + centroid * 96.0) % 256
+        hue = (hue_base + ((t * 160.0).astype(np.int32)) + int(hue_shift)) % 256
+        sat = np.full(L, max(170, int(ctx.base_saturation)), dtype=np.uint8)
+        rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
+
+    # ---------- 7) Envio (cap global do FXContext ainda protege) ----------
+    ctx.to_pixels_and_show(rgb)
+
 # ==== FIM DO ARQUIVO effects/clean.py ====

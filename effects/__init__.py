@@ -14,6 +14,7 @@ from .clean import (
     effect_bass_pulse_core,
     effect_peak_dots_expanded,
     effect_bass_impact_wave,
+    effect_wavelength_reactive,
 )
 from .waterfall_v6 import (
      effect_chromatic_cascade,
@@ -38,6 +39,7 @@ def build_effects(ctx):
         ("Bass Pulse Core (NEW)",               _wrap(ctx, effect_bass_pulse_core)),
         ("Peak Dots Expanded",                  _wrap(ctx, effect_peak_dots_expanded)),
         ("Beat Impact Wave",                    _wrap(ctx, effect_bass_impact_wave)),
+        ("Wavelenght Reactive",                    _wrap(ctx, effect_wavelength_reactive)),
 
         # ("Fire Edge Forge v4 (Palette + Sparks)", _wrap(ctx, effect_clean_fire_edge_v4)),
         # ("Fire Center Vent v4 (Palette + Sparks)", _wrap(ctx, effect_clean_fire_center_v4)),
