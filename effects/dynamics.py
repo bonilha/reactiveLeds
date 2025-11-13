@@ -99,7 +99,8 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
 
     # ---------- 2) TAPER: atenua início da fita progressivamente ----------
     # Curva suave: início em ~0.45, cresce até 1.0 no meio/fim
-    taper = np.clip(0.45 + 0.55 * (x_led ** 0.8), 0.45, 1.0).astype(np.float32)
+    # taper = np.clip(0.45 + 0.55 * (x_led ** 0.8), 0.45, 1.0).astype(np.float32)
+    taper = np.clip(0.30 + 0.70 * (x_led ** 0.8), 0.30, 1.0).astype(np.float32)
     v_row *= taper  # <-- CHAVE: graves ficam ~45% do valor original
 
     # ---------- 3) Soft-knee (igual antes) ----------
