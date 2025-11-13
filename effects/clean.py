@@ -904,18 +904,29 @@ def effect_strobe_reactive(ctx, bands_u8, beat_flag, active):
         return
 
     # -------------------- Knobs --------------------
-    # Duração do flash (frames on)
-    ON_BASE, ON_E, ON_L, ON_T, ON_BEAT = 1.0, 1.4, 2.0, 2.8, 2.5
-    # Brilho do flash
-    V_BASE, V_E, V_L, V_T, V_BEAT = 90.0, 120.0, 140.0, 180.0, 110.0
-    # Brilho do "leito" (bed) — mantém a fita ocupada
-    BED_E, BED_L = 12.0, 10.0
-    # Mistura de branco no flash (0..1)
-    WHITE_MIX_BASE, WHITE_MIX_T, WHITE_MIX_BEAT = 0.28, 0.40, 0.22
-    # Quantas faixas por flash (2 = par/ímpar; 3 = 1/3)
-    STRIPES = 2
-    # Folga alvo do AGC pré-cap: menor = mais folga (menos brilho médio)
-    F_TARGET = 0.80
+    # Sensibilidade (logo após calcular 'trans' e 'low_energy')
+    trans_thr = 0.05     # era 0.08
+    grave_thr = 0.28     # era 0.35
+
+    # Duração do flash (ON_*)
+    ON_BASE, ON_E, ON_L, ON_T, ON_BEAT = 0.8, 0.9, 1.2, 1.6, 1.3  # curtíssimos
+
+    # Brilho do flash (V_*)
+    V_BASE, V_E, V_L, V_T, V_BEAT = 90.0, 120.0, 140.0, 210.0, 130.0
+
+    # Branco misturado no flash
+    WHITE_MIX_BASE, WHITE_MIX_T, WHITE_MIX_BEAT = 0.28, 0.50, 0.22
+
+    # Leito
+    BED_E, BED_L = 10.0, 8.0
+
+    # Faixas por flash
+    STRIPES = 3  # 1/3 dos LEDs por frame
+
+    # Folga do AGC pré-cap
+    F_TARGET = 0.78  # era 0.80
+
+# Cooldown (substitua a linha do cooldown original)
 
     # -------------------- 1) Métricas de áudio --------------------
     x = np.asarray(bands_u8, dtype=np.float32)  # 0..255
