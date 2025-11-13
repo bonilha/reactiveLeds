@@ -152,9 +152,9 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
     # Divide a fita em 3 regiões e limita cada uma individualmente
     third = L // 3
     regions = [
-        (0, third, 0.50),           # início: 50% do normal
-        (third, 2*third, 0.72),     # meio: 72%
-        (2*third, L, 1.0)           # fim: 100%
+        (0, third, 0.40),           # início: 50% do normal
+        (third, 2*third, 0.60),     # meio: 72%
+        (2*third, L, 0.85)           # fim: 100%
     ]
     
     for start, end, scale in regions:
@@ -173,7 +173,7 @@ def effect_waterfall(ctx, bands_u8, beat_flag, active):
     ma_per_channel = float(ctx.WS2812B_MA_PER_CHANNEL)
     idle_mA = float(ctx.WS2812B_IDLE_MA_PER_LED) * float(L)
     budget_mA = float(ctx.CURRENT_BUDGET_A) * 1000.0
-    target_util = 0.55
+    target_util = 0.45
     max_color_mA = max(0.0, budget_mA * target_util - idle_mA)
 
     sum_rgb = float(np.sum(out, dtype=np.uint64))
