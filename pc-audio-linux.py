@@ -173,29 +173,19 @@ HTML = r"""
   new ResizeObserver(resize).observe(els.canvas);
 
   function drawBands(arr) {
-  if (!arr || !arr.length) { ctx.clearRect(0,0,W,H); return; }
-  ctx.clearRect(0,0,W,H);
-  const n = arr.length;
-  const totalWidth = W;
-  const barWidth = Math.max(1, Math.floor(totalWidth / n));
-  const remainder = totalWidth - barWidth * n;   // pixels sobrando
-
-  let x = 0;
-  for (let i = 0; i < n; i++) {
-    const v = arr[i] / 255.0;
-    const h = Math.max(1, Math.floor(v * H));
-    const y = H - h;
-
-    // distribui os pixels extras nas primeiras barras
-    const extra = (i < remainder) ? 1 : 0;
-    const w = barWidth + extra;
-
-    const hue = Math.floor(210 - 210 * (i / (n - 1)));
-    ctx.fillStyle = `hsl(${hue} 80% 60%)`;
-    ctx.fillRect(x, y, w, h);
-    x += w;
-  }
-}
+    if (!arr || !arr.length) { ctx.clearRect(0,0,W,H); return; }
+    ctx.clearRect(0,0,W,H);
+    const n = arr.length;
+    const bar = Math.max(1, Math.floor(W / n));
+    for (let i=0;i<n;i++){
+      const v = arr[i]/255.0;
+      const x = i*bar;
+      const h = Math.max(1, Math.floor(v*H));
+      const y = H - h;
+      const hue = Math.floor(210 - 210*(i/(n-1))); // blue->cyan range
+      ctx.fillStyle = `hsl(${hue} 80% 60%)`;
+      ctx.fillRect(x,y, Math.max(1, bar-1), h);
+    }
   }
 
   // WebSocket live
