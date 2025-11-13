@@ -1177,9 +1177,15 @@ def main():
     # Se --usb-linein foi informado e nenhum índice foi passado
     elif args.usb_linein:
         usb_idx = None
+        # Preferir dispositivos com 'USB' no nome
         for i, d in enumerate(devs):
-            if d.get('max_input_channels',0) > 0:
+            if d.get('max_input_channels',0) > 0 and 'usb' in d.get('name','').lower():
                 usb_idx = i; break
+        # Se não achou por nome, pegar primeiro com entrada
+        if usb_idx is None:
+            for i, d in enumerate(devs):
+                if d.get('max_input_channels',0) > 0:
+                    usb_idx = i; break
         if usb_idx is not None:
             print(f"[INFO] Usando dispositivo com entrada: {devs[usb_idx]['name']} (índice {usb_idx})")
             audio_cb = make_audio_cb()
