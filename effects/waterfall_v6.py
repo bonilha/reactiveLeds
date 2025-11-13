@@ -3,21 +3,23 @@ import numpy as np
 import time
 
 # ----------------------------------------------------------------------
-# Waterfall v6 — “Chromatic Cascade” (estável, reativo, paleta-aware)
+# Waterfall v6 — “Chromatic Cascade” (CORRIGIDO: uso do terço final + diversidade de cores)
 # ----------------------------------------------------------------------
-# Problema relatado: "Começou bem e do nada parou"
-# → Causa provável: acúmulo de gotas + overflow de memória/CPU em frames silenciosos
-# → Solução: 
-#    • Limite rigoroso de gotas por frame + limpeza forçada
-#    • Decay mais agressivo em silêncio
-#    • Reset de estado em reset_flag
-#    • Inicialização tardia (lazy) + proteção contra L=0
-#    • EMA reiniciada em reset
+# Problemas relatados:
+# 1. **Terço final subutilizado** → gotas "morrem" antes do fim da fita.
+# 2. **Monocromático** → cores muito parecidas (paleta não explorada).
+#
+# Soluções aplicadas:
+# - **Velocidade ajustada por banda**: graves (lentos) → gotas caem até o fim.
+# - **Spawn distribuído por frequência**: bandas altas → gotas nascem mais à direita.
+# - **Paleta usada com alta saturação + hue offset por banda** → cores distintas.
+# - **Splash mais forte no final** → ativa visualmente o terço final.
+# - **Decay por região** → início decai rápido, fim mantém brilho.
+# - **Hue jitter por gota** → evita repetição cromática.
 # ----------------------------------------------------------------------
 _waterfall_state = None
 
 def _init_state(ctx):
-    """Inicializa estado com valores seguros."""
     global _waterfall_state
     L = max(1, ctx.LED_COUNT)
     _waterfall_state = {
@@ -27,16 +29,12 @@ def _init_state(ctx):
         "ema": np.zeros((L, 3), dtype=np.float32),
         "pal_arr": None,
         "pal_len": 0,
-        "spawn_cooldown": 0.0,   # evita burst spawn
+        "spawn_cooldown": 0.0,
     }
 
 def effect_chromatic_cascade(ctx, bands_u8, beat_flag, active):
-    """
-    Waterfall v6 – Chromatic Cascade (versão estável)
-    """
     global _waterfall_state
 
-    # Reset externo (via tecla 'r' ou pacote B1)
     if getattr(ctx, "reset_flag", False):
         _waterfall_state = None
         ctx.reset_flag = False
@@ -50,13 +48,38 @@ def effect_chromatic_cascade(ctx, bands_u8, beat_flag, active):
     dt = min(now - st["last_t"], 0.05)
     st["last_t"] = now
 
-    # Atualiza cooldown de spawn
     st["spawn_cooldown"] = max(0.0, st["spawn_cooldown"] - dt)
 
-    # -------------------------------------------------- 1) Paleta --------------------------------------------------
+    # -------------------------------------------------- 1) Paleta (alta saturação + cache) -------------------------
     pal = getattr(ctx, "current_palette", None)
     if isinstance(pal, (list, tuple)) and len(pal) >= 2:
         pal_arr = np.asarray(pal, dtype=np.uint8)
+        # Força saturação alta para diversidade
+        hsv = np.zeros((len(pal), 3), dtype=np.float32)
+        for i, (r, g, b) in enumerate(pal_arr):
+            mx = max(r, g, b) / 255.0
+            mn = min(r, g, b) / 255.0
+            df = mx - mn
+            if mx == mn:
+                h = 0
+            elif mx == r/255.0:
+                h = (60 * ((g-b)/df) + 360) % 360
+            elif mx == g/255.0:
+                h = (60 * ((b-r)/df) + 120) % 360
+            else:
+                h = (60 * ((r-g)/df) + 240) % 360
+            h /= 360.0
+            s = 0.0 if mx == 0 else df / mx
+            v = mx
+            # Aumenta saturação para 80-95%
+            s = min(0.95, max(0.80, s))
+            hsv[i] = [h, s, v]
+        # Reconverte com saturação forçada
+        pal_arr = ctx.hsv_to_rgb_bytes_vec(
+            (hsv[:, 0] * 255).astype(np.uint8),
+            (hsv[:, 1] * 255).astype(np.uint8),
+            (hsv[:, 2] * 255).astype(np.uint8)
+        )
         if st["pal_arr"] is None or not np.array_equal(st["pal_arr"], pal_arr):
             st["pal_arr"] = pal_arr.copy()
             st["pal_len"] = pal_arr.shape[0]
@@ -64,83 +87,111 @@ def effect_chromatic_cascade(ctx, bands_u8, beat_flag, active):
         st["pal_arr"] = None
         st["pal_len"] = 0
 
-    # -------------------------------------------------- 2) Spawn controlado ----------------------------------------
+    # -------------------------------------------------- 2) Spawn por frequência (graves → esquerda, agudos → direita) -----
     n_bands = len(bands_u8)
-    max_drops = 32  # limite rígido
+    max_drops = 36
     spawn_this_frame = 0
-    max_per_frame = 4 if beat_flag else 2
+    max_per_frame = 5 if beat_flag else 3
 
     if n_bands > 0 and active and st["spawn_cooldown"] <= 0.0:
-        low_energy = float(np.mean(bands_u8[:min(8, n_bands)]))
-        spawn_prob = np.clip(low_energy / 255.0, 0.0, 1.0) ** 1.8
+        # Energia por terço de frequência
+        low = bands_u8[:n_bands//3]
+        mid = bands_u8[n_bands//3:2*n_bands//3]
+        high = bands_u8[2*n_bands//3:]
 
-        if beat_flag:
-            spawn_prob = min(1.0, spawn_prob * 1.5)
-            max_per_frame += 1
+        energies = [
+            float(np.mean(low)) if len(low) > 0 else 0.0,
+            float(np.mean(mid)) if len(mid) > 0 else 0.0,
+            float(np.mean(high)) if len(high) > 0 else 0.0
+        ]
+        probs = np.array(energies) / 255.0
+        probs = probs ** 1.6
+        probs /= max(1e-6, np.sum(probs))
 
-        band_to_led = np.linspace(0, L - 1, max(1, n_bands), dtype=np.int32)
+        # Posição de nascimento: graves (esquerda), agudos (direita)
+        spawn_zones = [0.15, 0.5, 0.85]  # 15%, 50%, 85% da fita
 
-        for i in range(n_bands):
+        for zone_idx, prob in enumerate(probs):
             if spawn_this_frame >= max_per_frame or len(st["drops"]) >= max_drops:
                 break
-            if np.random.random() < spawn_prob:
-                led = band_to_led[i]
+            if np.random.random() < prob * (2.0 if beat_flag else 1.0):
+                # Escolhe banda dentro da zona
+                start = (zone_idx * n_bands) // 3
+                end = min(n_bands, ((zone_idx + 1) * n_bands) // 3)
+                if start >= end:
+                    continue
+                i = np.random.randint(start, end)
                 intensity = float(bands_u8[i])
 
-                speed = 40.0 + 140.0 * (intensity / 255.0)
-                if beat_flag:
-                    speed *= 1.3
+                # Posição inicial na fita (proporcional à frequência)
+                base_pos = spawn_zones[zone_idx] * (L - 1)
+                jitter = np.random.uniform(-0.08, 0.08) * L
+                led = int(np.clip(base_pos + jitter, 0, L - 1))
 
-                # Cor
+                # Velocidade: graves (lenta, chega ao fim), agudos (rápida)
+                speed = 60.0 + 80.0 * (1.0 - zone_idx / 2.0)  # 140 → 100 → 60
+                if beat_flag:
+                    speed *= 1.35
+
+                # Cor com hue jitter por gota
                 if st["pal_arr"] is not None:
-                    p = (i / max(1, n_bands - 1)) * (st["pal_len"] - 1)
-                    i0, i1 = int(p), (int(p) + 1) % st["pal_len"]
+                    p = (zone_idx / 2.0) * (st["pal_len"] - 1)
+                    i0 = int(p) % st["pal_len"]
+                    i1 = (i0 + 1) % st["pal_len"]
                     t = p - i0
-                    rgb = (st["pal_arr"][i0].astype(np.float32) * (1.0 - t) +
-                           st["pal_arr"][i1].astype(np.float32) * t)
+                    base_rgb = (st["pal_arr"][i0].astype(np.float32) * (1.0 - t) +
+                                st["pal_arr"][i1].astype(np.float32) * t)
+                    # Jitter de matiz
+                    hue_jitter = np.random.randint(-25, 26)
+                    hsv_jitter = ctx.hsv_to_rgb_bytes_vec(
+                        np.array([(np.random.randint(0, 256) + hue_jitter) % 256], dtype=np.uint8),
+                        np.array([min(240, ctx.base_saturation)], dtype=np.uint8),
+                        np.array([255], dtype=np.uint8)
+                    )[0].astype(np.float32)
+                    rgb = base_rgb * 0.7 + hsv_jitter * 0.3
                 else:
-                    hue = (ctx.base_hue_offset + (i * 220 // max(1, n_bands)) + (ctx.hue_seed >> 2)) % 256
+                    hue = (ctx.base_hue_offset + (i * 240 // max(1, n_bands)) +
+                           (ctx.hue_seed >> 1) + np.random.randint(-30, 31)) % 256
                     rgb = ctx.hsv_to_rgb_bytes_vec(
                         np.array([hue], dtype=np.uint8),
-                        np.array([min(215, ctx.base_saturation)], dtype=np.uint8),
+                        np.array([min(235, ctx.base_saturation)], dtype=np.uint8),
                         np.array([255], dtype=np.uint8)
                     )[0].astype(np.float32)
 
                 st["drops"].append({
                     "pos": float(led),
                     "speed": speed,
-                    "rgb": rgb,
+                    "rgb": np.clip(rgb, 0, 255),
                     "life": 1.0,
-                    "size": 2.5 + 3.5 * (intensity / 255.0)
+                    "size": 2.8 + 4.2 * (intensity / 255.0)
                 })
                 spawn_this_frame += 1
 
         if spawn_this_frame > 0:
-            st["spawn_cooldown"] = 0.06  # cooldown entre bursts
+            st["spawn_cooldown"] = 0.07
 
-    # -------------------------------------------------- 3) Atualiza gotas --------------------------------------------
+    # -------------------------------------------------- 3) Atualiza gotas (splash mais forte) ------------------------
     new_drops = []
     for d in st["drops"]:
         d["pos"] += d["speed"] * dt
-        d["life"] *= 0.95 ** (dt * 60.0)
-        d["size"] *= 1.0 + 0.10 * dt
+        d["life"] *= 0.94 ** (dt * 55.0)
+        d["size"] *= 1.0 + 0.09 * dt
 
-        if d["pos"] < L + 15 and d["life"] > 0.04:
+        if d["pos"] < L + 25 and d["life"] > 0.03:
             new_drops.append(d)
         else:
-            # Splash controlado (só 1 por gota)
-            if d["pos"] >= L - 8 and "is_splash" not in d:
+            if d["pos"] >= L * 0.7 and "is_splash" not in d:  # splash a partir de 70%
                 splash_center = min(L - 1, int(d["pos"]))
-                splash_rgb = np.clip(d["rgb"] * 1.4, 0, 255)
+                splash_rgb = np.clip(d["rgb"] * 1.6, 0, 255)
                 new_drops.append({
                     "pos": float(splash_center),
                     "speed": 0.0,
                     "rgb": splash_rgb,
-                    "life": 0.7,
-                    "size": 10.0 + 8.0 * d["life"],
+                    "life": 0.8,
+                    "size": 14.0 + 10.0 * d["life"],
                     "is_splash": True
                 })
-    st["drops"] = new_drops[:max_drops]  # força limite
+    st["drops"] = new_drops[:max_drops]
 
     # -------------------------------------------------- 4) Render ----------------------------------------------------
     acc = np.zeros((L, 3), dtype=np.float32)
@@ -149,33 +200,35 @@ def effect_chromatic_cascade(ctx, bands_u8, beat_flag, active):
     for d in st["drops"]:
         dist = np.abs(idx - d["pos"])
         if d.get("is_splash"):
-            sigma = d["size"] / 2.2
-            contrib = np.exp(-0.5 * (dist / sigma) ** 2) * 170.0 * d["life"]
+            sigma = d["size"] / 2.0
+            contrib = np.exp(-0.5 * (dist / sigma) ** 2) * 200.0 * d["life"]
         else:
             sigma = d["size"]
             core = np.exp(-0.5 * (dist / sigma) ** 2)
-            edge = np.exp(-1.8 * (dist / sigma) ** 2)
-            contrib = (core * 135.0 + edge * 55.0) * d["life"]
+            edge = np.exp(-2.2 * (dist / sigma) ** 2)
+            contrib = (core * 145.0 + edge * 65.0) * d["life"]
 
         contrib = np.clip(contrib, 0.0, 255.0)
         acc += contrib[:, None] * (d["rgb"] / 255.0)
 
-    # Decay mais forte em silêncio
-    decay = 0.68 if active else 0.52
-    sat = ctx.base_saturation / 255.0
-    decay = decay - 0.15 * sat
-    st["buf"] *= np.clip(decay, 0.40, 0.90)
+    # Decay por região (início decai mais, fim mantém)
+    x = idx / max(1, L - 1)
+    decay_map = 0.70 - 0.25 * x  # 0.70 → 0.45
+    decay_map = np.clip(decay_map, 0.42, 0.90)
+    if not active:
+        decay_map *= 0.78
+    st["buf"] *= decay_map[:, None]
 
     st["buf"] = np.clip(st["buf"] + acc, 0.0, 255.0)
 
-    # -------------------------------------------------- 5) Limiter local (suave) -------------------------------------
-    win = max(1, L // 10)
-    step = max(1, int(win * 0.7))
+    # -------------------------------------------------- 5) Limiter local ---------------------------------------------
+    win = max(1, L // 9)
+    step = max(1, int(win * 0.68))
     i = 0
     while i < L:
         s = i
         e = min(L, i + win)
-        scale = 0.42 + 0.55 * (i / max(1, L - 1)) ** 0.8
+        scale = 0.45 + 0.52 * (i / max(1, L - 1)) ** 0.78
         st["buf"][s:e] *= scale
         i += step
 
@@ -185,13 +238,13 @@ def effect_chromatic_cascade(ctx, bands_u8, beat_flag, active):
         st["buf"] = np.maximum(st["buf"], floor)
 
     per_pix = np.sum(st["buf"], axis=1)
-    mask = per_pix > 690
+    mask = per_pix > 695
     if np.any(mask):
-        scale = 690.0 / np.maximum(per_pix[mask], 1.0)
+        scale = 695.0 / np.maximum(per_pix[mask], 1.0)
         st["buf"][mask] *= scale[:, None]
 
-    # -------------------------------------------------- 7) EMA (anti-flicker) ----------------------------------------
-    beta = 0.40 if active else 0.30
+    # -------------------------------------------------- 7) EMA --------------------------------------------------------
+    beta = 0.42 if active else 0.32
     st["ema"] = st["ema"] * (1.0 - beta) + st["buf"] * beta
     out = np.clip(st["ema"], 0.0, 255.0).astype(np.uint8)
 
