@@ -278,13 +278,11 @@ def time_sync_over_tcp(raspberry_ip, port=TCP_TIME_PORT, samples=TIME_SYNC_SAMPL
             ack = _recv_exact(s, 3 + 8)
         ok = (ack[:3] == b"TS3" and int.from_bytes(ack[3:11], 'little', signed=True) == int(offset_best))
         _time_sync_ok = bool(ok)
-        print(f"
-[INFO] Time sync TCP: RTT_min={rtt_min/1e6:.2f} ms, offset={offset_best/1e6:.3f} ms, ack={'OK' if ok else 'NOK'}")
+        print(f"[INFO] Time sync TCP: RTT_min={rtt_min/1e6:.2f} ms, offset={offset_best/1e6:.3f} ms, ack={'OK' if ok else 'NOK'}")
         return _time_sync_ok
     except Exception as e:
         _time_sync_ok = False
-        print(f"
-[WARN] Time sync TCP erro: {e}")
+        print(f"[WARN] Time sync TCP erro: {e}")
         return False
 
 def resync_worker(raspberry_ip, resync_interval):
@@ -376,12 +374,10 @@ async def handle_mode(request):
     ss = request.app["server_state"]
     if data.get("mode") == "auto_on":
         ss["auto_mode"] = True
-        print("
-[AUTO] ON")
+        print("[AUTO] ON")
     elif data.get("mode") == "auto_off":
         ss["auto_mode"] = False
-        print("
-[AUTO] OFF")
+        print("[AUTO] OFF")
     elif data.get("mode") == "calibrate_silence":
         dur = float(data.get("duration_sec", 5))
         ss["calibrating"] = True
@@ -391,12 +387,10 @@ async def handle_mode(request):
         ss["calib_rms"] = []
         if request.app["server_cfg"].get("noise_profile_enabled", False):
             ss["noise_profile_frames"] = []
-        print(f"
-[CALIB] {dur:.1f}s...")
+        print(f"[CALIB] {dur:.1f}s...")
     elif data.get("mode") == "true_silence":
         ss["force_silence_once"] = True
-        print("
-[SILENCIO] Forçando apagamento...")
+        print("[SILENCIO] Forçando apagamento...")
     return web.json_response({"status": "ok"})
 app.router.add_post('/api/mode', handle_mode)
 
@@ -458,8 +452,7 @@ def print_status(shared, tag_extra: str = "", require_sync=True):
     now = time.time()
     if (now - _last_status) > 0.25:
         tag = "SYNC✓" if _time_sync_ok else ("SYNC OFF" if not require_sync else "WAITING SYNC")
-        sys.stdout.write(f"
-TX: {shared.tx_count} {tag}{tag_extra}")
+        sys.stdout.write(f"TX: {shared.tx_count} {tag}{tag_extra}")
         sys.stdout.flush()
         _last_status = now
 
@@ -745,8 +738,7 @@ def main():
         asyncio.set_event_loop(loop)
         web.run_app(app, host=args.bind, port=args.port, handle_signals=False)
     threading.Thread(target=start_web, daemon=True).start()
-    print(f"
-[WEB] http://{args.bind}:{args.port}")
+    print(f"[WEB] http://{args.bind}:{args.port}")
 
     require_sync = REQUIRE_TIME_SYNC
     if args.no_require_sync:
@@ -862,16 +854,13 @@ def main():
             except Exception:
                 sr_def = sr_eff; name = desc
             backend_used = f"sounddevice {desc}"
-            print(f"
-[AUDIO] Dispositivo: {name} | SR(default)={sr_def} | SR(abrido)={sr_eff} | CH={ch_eff}")
+            print(f"[AUDIO] Dispositivo: {name} | SR(default)={sr_def} | SR(abrido)={sr_eff} | CH={ch_eff}")
         except Exception as e_sd:
             if args.backend == "sd" or args.no_pyaudio_fallback:
-                print(f"
-[FATAL] sounddevice falhou: {e_sd}")
+                print(f"[FATAL] sounddevice falhou: {e_sd}")
                 sys.exit(1)
             else:
-                print(f"
-[WARN] sounddevice falhou, tentando PyAudio... ({e_sd})")
+                print(f"[WARN] sounddevice falhou, tentando PyAudio... ({e_sd})")
 
     if stream is None and args.backend in ("auto","pyaudio"):
         try:
@@ -884,13 +873,11 @@ def main():
             shared.channels = ch_eff
             backend_used = tag
         except Exception as e_pa:
-            print(f"
-[FATAL] PyAudio falhou: {e_pa}")
+            print(f"[FATAL] PyAudio falhou: {e_pa}")
             sys.exit(1)
 
     if stream is None:
-        print("
-[FATAL] Nenhum backend de áudio pôde ser aberto.")
+        print("[FATAL] Nenhum backend de áudio pôde ser aberto.")
         sys.exit(1)
 
     try:
@@ -993,8 +980,7 @@ def main():
                 ss["calib_started"] = 0.0
                 ss["calib_avg"].clear(); ss["calib_rms"].clear()
                 ss["noise_profile_frames"] = None
-                print(f"
-[CALIB] OK: th_avg={th_avg:.1f} th_rms={th_rms:.6f} resume_x={resume_factor:.2f}")
+                print(f"[CALIB] OK: th_avg={th_avg:.1f} th_rms={th_rms:.6f} resume_x={resume_factor:.2f}")
 
             if ss["auto_mode"] and (now - last_auto_update) >= 0.5:
                 arr_avg = np.array([v for _,v in hist_avg], dtype=np.float32) if hist_avg else np.array([avg_filtered],dtype=np.float32)
@@ -1115,8 +1101,7 @@ def main():
                     pass
         except Exception:
             pass
-        sys.stdout.write("
-"); sys.stdout.flush()
+        sys.stdout.write(""); sys.stdout.flush()
 
 
 if __name__ == '__main__':
