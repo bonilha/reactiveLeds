@@ -195,7 +195,6 @@ HTML = r"""
     ctx.fillRect(x, y, w, h);
     x += w;
   }
-
 }
   }
 
