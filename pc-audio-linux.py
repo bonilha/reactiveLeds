@@ -60,64 +60,197 @@ PKT_CFG = 0xB0
 PKT_RESET = 0xB1
 
 HTML = r"""
-<!doctype html>
-<html>
+<!DOCTYPE html>
+<html lang="pt-br">
 <head>
-<meta charset="utf-8"/>
+<meta charset="utf-8" />
 <title>Reactive LEDs — Monitor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
-body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:20px;color:#222}
-#bands{display:grid;grid-template-columns:repeat(75,1fr);gap:1px;height:120px;background:#eee}
-.bar{background:#4b9fff}
-small{color:#666}
-button{margin-right:8px}
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol"; margin: 16px; line-height: 1.35; background:#0c0d10; color:#e7e9ee; }
+  h1,h2,h3 { margin: 0 0 8px 0; }
+  .muted { color:#a0a4ad; }
+  .row { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-start; }
+  .card { background:#14171f; border:1px solid #222633; border-radius:10px; padding:12px 14px; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.03); }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#1b2030; border:1px solid #2a3347; font-size:12px; color:#cbd3e0; }
+  button { background:#1c2738; color:#e7e9ee; border:1px solid #2a3347; border-radius:8px; padding:8px 10px; cursor:pointer; }
+  button:hover { background:#243146; }
+  button:active { transform: translateY(1px); }
+  .btn-danger { border-color:#4d2a33; background:#341c22; }
+  .btn-danger:hover { background:#3e2229; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+  .kv { display:grid; grid-template-columns: 1fr auto; gap:6px 10px; align-items:center; }
+  canvas { width:100%; height:140px; background:#0b0d12; border:1px solid #20293a; border-radius:8px; }
+  small { color:#98a0ac; }
+  .sp { height:10px; }
 </style>
 </head>
 <body>
-<h2>Reactive LEDs — Monitor</h2>
-<div id="conn">Desconectado</div>
-<div id="info">
-  <small>FPS: <span id="fps">—</span> • Dispositivo: <span id="dev">—</span> • SR/CH: <span id="srch">—</span> • TX: <span id="tx">0</span></small>
+
+<h1>Reactive LEDs — Monitor</h1>
+
+<div class="row">
+  <div class="card" style="flex:1 1 380px;">
+    <h2>Estado</h2>
+    <div class="grid">
+      <div class="kv"><div>Conexão</div><div id="conn" class="pill">Desconectado</div></div>
+      <div class="kv"><div>FPS</div><div id="fps" class="pill">—</div></div>
+      <div class="kv"><div>Dispositivo</div><div id="dev" class="pill">—</div></div>
+      <div class="kv"><div>SR/CH</div><div id="srch" class="pill">—</div></div>
+      <div class="kv"><div>Pacotes TX</div><div id="tx" class="pill">0</div></div>
+    </div>
+    <div class="sp"></div>
+    <h3>Visualização de Bandas</h3>
+    <canvas id="bands"></canvas>
+    <div class="muted"><small>Bandas: <span id="bandsLen">—</span> • Silêncio: <span id="silenceState">—</span></small></div>
+  </div>
+
+  <div class="card" style="flex:1 1 320px;">
+    <h2>Controles</h2>
+    <div class="row" style="gap:8px;">
+      <button id="btnAuto">AUTO: OFF</button>
+      <button id="btnCalib">Calibrar Silêncio</button>
+      <button id="btnSilence">Forçar Silêncio</button>
+      <button id="btnReset" class="btn-danger">Reset (B1)</button>
+    </div>
+
+    <div id="calibBox" style="margin-top:10px; display:none;">
+      <div class="pill">Calibrando silêncio… (<span id="calibEta">—</span>s)</div>
+      <div class="muted" style="margin-top:6px;"><small>Coletando amostras</small></div>
+    </div>
+
+    <div class="sp"></div>
+    <div class="grid">
+      <div class="kv"><div>AVG</div><div id="avg" class="pill">—</div></div>
+      <div class="kv"><div>RMS</div><div id="rms" class="pill">—</div></div>
+      <div class="kv"><div>TH (Silence Bands)</div><div id="thBands" class="pill">—</div></div>
+      <div class="kv"><div>TH (Silence RMS)</div><div id="thRms" class="pill">—</div></div>
+      <div class="kv"><div>Resume ×</div><div id="resumeX" class="pill">—</div></div>
+      <div class="kv"><div>Estado</div><div id="state" class="pill">—</div></div>
+      <div class="kv"><div>Calibração</div><div id="calib" class="pill">—</div></div>
+      <div class="kv"><div>Pacotes TX</div><div id="tx2" class="pill">0</div></div>
+    </div>
+  </div>
 </div>
-<h3>Visualização de Bandas</h3>
-<div id="bands"></div>
-<p><small>Bandas: <span id="nb">—</span> • Silêncio: <span id="sil">—</span></small></p>
-<h3>Controles</h3>
-<button onclick="post('/api/mode',{mode:'auto_on'})">AUTO: ON</button>
-<button onclick="post('/api/mode',{mode:'auto_off'})">AUTO: OFF</button>
-<button onclick="post('/api/mode',{mode:'calibrate_silence',duration_sec:5})">Calibrar Silêncio</button>
-<button onclick="post('/api/mode',{mode:'true_silence'})">Forçar Silêncio</button>
-<button onclick="post('/api/reset',{})">Reset (B1)</button>
 
 <script>
-const bandsDiv = document.getElementById('bands');
-for(let i=0;i<150;i++){const d=document.createElement('div');d.className='bar';d.style.height='1px';bandsDiv.appendChild(d)}
-
-function post(url, data){fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})}
-
-function connect(){
-  const ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
-  ws.onopen=()=>{document.getElementById('conn').textContent='Conectado'};
-  ws.onclose=()=>{document.getElementById('conn').textContent='Desconectado'; setTimeout(connect,1500)};
-  ws.onmessage=(ev)=>{
-    const j=JSON.parse(ev.data);
-    document.getElementById('fps').textContent=j.fps;
-    document.getElementById('dev').textContent=j.device;
-    document.getElementById('srch').textContent=j.sr_ch;
-    document.getElementById('tx').textContent=j.tx_count;
-    document.getElementById('nb').textContent=j.bands.length;
-    document.getElementById('sil').textContent=j.silence?'Sim':'Não';
-    const bars = bandsDiv.children;
-    for(let i=0;i<j.bands.length && i<bars.length;i++){
-      bars[i].style.height=(1+j.bands[i])+'px';
-      bars[i].style.background = j.silence? '#bbb' : '#4b9fff';
-    }
+(function(){
+  const els = {
+    conn: document.getElementById('conn'),
+    fps: document.getElementById('fps'),
+    dev: document.getElementById('dev'),
+    srch: document.getElementById('srch'),
+    tx: document.getElementById('tx'),
+    tx2: document.getElementById('tx2'),
+    bandsLen: document.getElementById('bandsLen'),
+    silenceState: document.getElementById('silenceState'),
+    avg: document.getElementById('avg'),
+    rms: document.getElementById('rms'),
+    thBands: document.getElementById('thBands'),
+    thRms: document.getElementById('thRms'),
+    resumeX: document.getElementById('resumeX'),
+    state: document.getElementById('state'),
+    calib: document.getElementById('calib'),
+    calibEta: document.getElementById('calibEta'),
+    calibBox: document.getElementById('calibBox'),
+    btnAuto: document.getElementById('btnAuto'),
+    btnCalib: document.getElementById('btnCalib'),
+    btnSilence: document.getElementById('btnSilence'),
+    btnReset: document.getElementById('btnReset'),
+    canvas: document.getElementById('bands'),
   };
-}
-connect();
+
+  const ctx = els.canvas.getContext('2d');
+  let W = 0, H = 0;
+  function resize() {
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const rect = els.canvas.getBoundingClientRect();
+    W = Math.max(10, Math.floor(rect.width * dpr));
+    H = Math.max(10, Math.floor(rect.height * dpr));
+    els.canvas.width = W; els.canvas.height = H;
+  }
+  new ResizeObserver(resize).observe(els.canvas);
+
+  function drawBands(arr) {
+    if (!arr || !arr.length) { ctx.clearRect(0,0,W,H); return; }
+    ctx.clearRect(0,0,W,H);
+    const n = arr.length;
+    const bar = Math.max(1, Math.floor(W / n));
+    for (let i=0;i<n;i++){
+      const v = arr[i]/255.0;
+      const x = i*bar;
+      const h = Math.max(1, Math.floor(v*H));
+      const y = H - h;
+      const hue = Math.floor(210 - 210*(i/(n-1))); // blue->cyan range
+      ctx.fillStyle = `hsl(${hue} 80% 60%)`;
+      ctx.fillRect(x,y, Math.max(1, bar-1), h);
+    }
+  }
+
+  // WebSocket live
+  let ws;
+  function connectWS(){
+    try {
+      ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+      ws.onopen = ()=>{ els.conn.textContent='Conectado'; els.conn.style.background='#12371f'; };
+      ws.onclose = ()=>{ els.conn.textContent='Desconectado'; els.conn.style.background='#341c22'; setTimeout(connectWS, 800); };
+      ws.onmessage = (ev)=>{
+        const d = JSON.parse(ev.data);
+        if (!d.connected) return;
+        if (d.fps!=null) els.fps.textContent = d.fps;
+        if (d.device!=null) els.dev.textContent = d.device || '—';
+        if (d.sr_ch!=null) els.srch.textContent = d.sr_ch || '—';
+        if (d.tx_count!=null) els.tx.textContent = els.tx2.textContent = d.tx_count;
+        if (Array.isArray(d.bands)) { drawBands(d.bands); els.bandsLen.textContent=d.bands.length; }
+        els.silenceState.textContent = d.silence ? 'Sim' : 'Não';
+        els.avg.textContent = d.avg ?? '—';
+        els.rms.textContent = d.rms ?? '—';
+        els.state.textContent = d.silence ? 'Silêncio' : (d.beat ? 'Beat' : 'Ativo');
+        els.thBands.textContent = d.th_silence_bands ?? '—';
+        els.thRms.textContent = d.th_silence_rms ?? '—';
+        els.resumeX.textContent = d.th_resume_factor ?? '—';
+        els.calib.textContent = d.calibrating ? 'Coletando' : '—';
+        els.calibBox.style.display = d.calibrating ? '' : 'none';
+        if (d.calibrating) els.calibEta.textContent = d.calib_eta ?? '—';
+      };
+    } catch (e) {
+      console.error(e);
+      setTimeout(connectWS, 1000);
+    }
+  }
+  connectWS();
+
+  // REST helpers
+  async function postJSON(url, body){
+    const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body || {})});
+    return await r.json();
+  }
+
+  // Buttons
+  let autoOn = false;
+  els.btnAuto.addEventListener('click', async ()=>{
+    autoOn = !autoOn;
+    els.btnAuto.textContent = 'AUTO: ' + (autoOn ? 'ON' : 'OFF');
+    await postJSON('/api/mode', {mode: autoOn ? 'auto_on' : 'auto_off'});
+  });
+  els.btnCalib.addEventListener('click', async ()=>{
+    els.calibBox.style.display = '';
+    els.calibEta.textContent = '—';
+    await postJSON('/api/mode', {mode:'calibrate_silence', duration_sec: 6});
+  });
+  els.btnSilence.addEventListener('click', async ()=>{
+    await postJSON('/api/mode', {mode:'true_silence'});
+  });
+  els.btnReset.addEventListener('click', async ()=>{
+    await postJSON('/api/reset', {});
+  });
+})();
 </script>
+
 </body>
 </html>
+
 """
 
 def resolve_device_index(name_or_index: Optional[Union[str, int]]):
