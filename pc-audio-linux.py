@@ -20,8 +20,8 @@ from aiohttp import web
 import os
 
 # --- PyAudio (opcional)
-_PAW = None  # módulo pyaudiowpatch (preferido no Windows)
-_PA = None   # módulo pyaudio (oficial)
+_PAW = None
+_PA = None
 try:
     import pyaudiowpatch as pyaudio
     _PAW = pyaudio
@@ -38,30 +38,26 @@ RASPBERRY_IP = "192.168.66.71"
 UDP_PORT = 5005
 TCP_TIME_PORT = 5006
 DEFAULT_NUM_BANDS = 150
-BLOCK_SIZE = 1024  # samples
-NFFT = 4096        # zero-padding
+BLOCK_SIZE = 1024
+NFFT = 4096
 FMIN, FMAX = 20.0, 4000.0
 EMA_ALPHA = 0.75
 PEAK_EMA_DEFAULT = 0.10
 
-# Beat detection simples
 ENERGY_BUFFER_SIZE = 10
 BEAT_THRESHOLD = 1.2
 BEAT_HEIGHT_MIN = 0.08
 
-# Time sync
 REQUIRE_TIME_SYNC = True
 RESYNC_INTERVAL_SEC = 60.0
 RESYNC_RETRY_INTERVAL = 2.0
 TIME_SYNC_SAMPLES = 12
 
-# Protocolo UDP RPi
 PKT_AUDIO_V2 = 0xA2
 PKT_AUDIO = 0xA1
 PKT_CFG = 0xB0
 PKT_RESET = 0xB1
 
-# ============================= HTML (Frontend) =============================
 HTML = r"""
 <!doctype html>
 <html>
@@ -123,7 +119,6 @@ connect();
 </html>
 """
 
-# ============================= Helpers de Device =============================
 def resolve_device_index(name_or_index: Optional[Union[str, int]]):
     if name_or_index is None:
         return None
@@ -156,7 +151,6 @@ def auto_candidate_outputs():
             cands.append(i)
     return cands
 
-# ============================= FFT / LOG =============================
 def make_bands_indices(nfft, sr, num_bands, fmin, fmax_limit, min_bins=1):
     freqs = np.fft.rfftfreq(nfft, 1.0/sr)
     fmax = min(fmax_limit, sr/2.0)
@@ -193,7 +187,6 @@ def make_compute_bands_log(sr, block_size, nfft, band_starts, band_ends, ema_alp
         return (ema_bands * 255.0).clip(0,255).astype(np.uint8)
     return compute
 
-# ============================= MEL filterbank =============================
 def hz_to_mel(f):
     return 2595.0 * np.log10(1.0 + f / 700.0)
 
@@ -240,7 +233,6 @@ def make_compute_bands_mel(sr, block_size, nfft, mel_fb, ema_alpha, peak_ema_alp
         return (ema_bands * 255.0).clip(0,255).astype(np.uint8)
     return compute
 
-# ============================= Time Sync (TCP cliente) =============================
 def _recv_exact(sock, n):
     buf = b''
     while len(buf) < n:
@@ -277,7 +269,8 @@ def time_sync_over_tcp(raspberry_ip, port=TCP_TIME_PORT, samples=TIME_SYNC_SAMPL
                 results.append((rtt, offset))
         if not results:
             _time_sync_ok = False
-            print("\n[WARN] Time sync TCP falhou (sem amostras validas).")
+            print("
+[WARN] Time sync TCP falhou (sem amostras validas).")
             return False
         rtt_min, offset_best = sorted(results, key=lambda x: x[0])[0]
         with socket.create_connection((raspberry_ip, port), timeout=1.8) as s:
@@ -286,11 +279,13 @@ def time_sync_over_tcp(raspberry_ip, port=TCP_TIME_PORT, samples=TIME_SYNC_SAMPL
             ack = _recv_exact(s, 3 + 8)
         ok = (ack[:3] == b"TS3" and int.from_bytes(ack[3:11], 'little', signed=True) == int(offset_best))
         _time_sync_ok = bool(ok)
-        print(f"\n[INFO] Time sync TCP: RTT_min={rtt_min/1e6:.2f} ms, offset={offset_best/1e6:.3f} ms, ack={'OK' if ok else 'NOK'}")
+        print(f"
+[INFO] Time sync TCP: RTT_min={rtt_min/1e6:.2f} ms, offset={offset_best/1e6:.3f} ms, ack={'OK' if ok else 'NOK'}")
         return _time_sync_ok
     except Exception as e:
         _time_sync_ok = False
-        print(f"\n[WARN] Time sync TCP erro: {e}")
+        print(f"
+[WARN] Time sync TCP erro: {e}")
         return False
 
 def resync_worker(raspberry_ip, resync_interval):
@@ -303,7 +298,6 @@ def resync_worker(raspberry_ip, resync_interval):
                 break
         time_sync_over_tcp(raspberry_ip)
 
-# ============================= Estado compartilhado =============================
 class Shared:
     def __init__(self, n_bands):
         self.bands = np.zeros(n_bands, dtype=np.uint8)
@@ -317,7 +311,6 @@ class Shared:
         self.channels = 0
         self.last_update= 0.0
 
-# ============================= UDP =============================
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
@@ -349,7 +342,6 @@ def send_cfg_b0(rpi_ip, rpi_port, bands, fps, hold_ms, vis_fps):
 def send_reset_b1(rpi_ip, rpi_port):
     udp_sock.sendto(bytes([PKT_RESET]), (rpi_ip, rpi_port))
 
-# ============================= Servidor Web/WS =============================
 app = web.Application()
 
 async def handle_root(request):
@@ -385,10 +377,12 @@ async def handle_mode(request):
     ss = request.app["server_state"]
     if data.get("mode") == "auto_on":
         ss["auto_mode"] = True
-        print("\n[AUTO] ON")
+        print("
+[AUTO] ON")
     elif data.get("mode") == "auto_off":
         ss["auto_mode"] = False
-        print("\n[AUTO] OFF")
+        print("
+[AUTO] OFF")
     elif data.get("mode") == "calibrate_silence":
         dur = float(data.get("duration_sec", 5))
         ss["calibrating"] = True
@@ -398,10 +392,12 @@ async def handle_mode(request):
         ss["calib_rms"] = []
         if request.app["server_cfg"].get("noise_profile_enabled", False):
             ss["noise_profile_frames"] = []
-        print(f"\n[CALIB] {dur:.1f}s...")
+        print(f"
+[CALIB] {dur:.1f}s...")
     elif data.get("mode") == "true_silence":
         ss["force_silence_once"] = True
-        print("\n[SILENCIO] Forçando apagamento...")
+        print("
+[SILENCIO] Forçando apagamento...")
     return web.json_response({"status": "ok"})
 app.router.add_post('/api/mode', handle_mode)
 
@@ -458,25 +454,19 @@ async def handle_ws(request):
     return ws
 app.router.add_get('/ws', handle_ws)
 
-# ============================= Util status console =============================
 def print_status(shared, tag_extra: str = "", require_sync=True):
     global _last_status, _time_sync_ok
     now = time.time()
     if (now - _last_status) > 0.25:
         tag = "SYNC✓" if _time_sync_ok else ("SYNC OFF" if not require_sync else "WAITING SYNC")
-        sys.stdout.write(f"\rTX: {shared.tx_count} {tag}{tag_extra}")
+        sys.stdout.write(f"
+TX: {shared.tx_count} {tag}{tag_extra}")
         sys.stdout.flush()
         _last_status = now
 
 # ============================= Backends de captura =============================
 
 def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union[str,int]], audio_cb, linein_substrings: List[str]):
-    """
-    sounddevice/PortAudio:
-    - Windows: preferir WASAPI loopback de saídas.
-    - Linux/macOS: padrão é LINE-IN. Abrir entrada 'segura' (line-in) SEM exigir --allow-mic.
-      Exigir --allow-mic somente para entradas que não casem com as substrings de line-in.
-    """
     devs = sd.query_devices()
     system = platform.system().lower()
 
@@ -490,7 +480,6 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
                 return True
         return False
 
-    # 1) mic explícito via --mic-device
     if mic_device is not None:
         if not allow_mic:
             raise RuntimeError("Uso de microfone requer --allow-mic.")
@@ -503,7 +492,6 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
                            device=midx, callback=audio_cb)
         return s, int(s.samplerate), int(s.channels), f"(INPUT mic): '{devs[midx]['name']}'", False
 
-    # 2) --device informado
     if override is not None:
         idx = resolve_device_index(override)
         if idx is None:
@@ -530,7 +518,6 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
             return s, int(s.samplerate), int(s.channels), f"(INPUT via --device): '{d['name']}'", False
         raise RuntimeError(f"Dispositivo '{d['name']}' não é válido para captura.")
 
-    # 3) Autodetectar WASAPI loopback (Windows)
     if system.startswith("win"):
         for i in auto_candidate_outputs():
             if not is_output(i):
@@ -548,7 +535,6 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
                 continue
         raise RuntimeError("Nenhuma saída com WASAPI loopback disponível para o sounddevice.")
 
-    # 4) Linux/macOS: AUTO entrada (padrão LINE-IN)
     preferred = None
     for i, d in enumerate(devs):
         if is_input(i) and is_linein_name(d['name']):
@@ -611,7 +597,6 @@ def _paw_choose_and_open(allow_mic: bool, mic_device: Optional[str], audio_cb):
                             stream_callback=_py_cb)
         return ("PyAudio (mic)", pinst, stream, rate, ch)
 
-    # PyAudioWPatch WASAPI (Windows)
     try:
         if _PAW is not None and platform.system().lower().startswith('win'):
             wasapi = pinst.get_host_api_info_by_type(pmod.paWASAPI)
@@ -643,7 +628,6 @@ def _paw_choose_and_open(allow_mic: bool, mic_device: Optional[str], audio_cb):
     except Exception:
         pass
 
-    # PyAudio oficial: pegar primeira entrada disponível
     target_idx = None
     for i in range(pinst.get_device_count()):
         info = pinst.get_device_info_by_index(i)
@@ -675,15 +659,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bind', type=str, default='0.0.0.0')
     parser.add_argument('--port', type=int, default=8000)
-    parser.add_argument('--backend', type=str, choices=['auto','sd','pyaudio'], default='auto',
-                        help='Escolhe backend de captura: auto (padrão), sd (sounddevice), pyaudio')
-    parser.add_argument('--no-pyaudio-fallback', action='store_true', help='Desativa fallback para PyAudio quando sounddevice falhar.')
+    parser.add_argument('--backend', type=str, choices=['auto','sd','pyaudio'], default='auto')
+    parser.add_argument('--no-pyaudio-fallback', action='store_true')
     parser.add_argument('--device', type=str, default=None)
-    parser.add_argument('--allow-mic', action='store_true', help='Permite capturar microfone quando explicitamente solicitado. No Linux o padrão é LINE-IN (sem --allow-mic).')
-    parser.add_argument('--mic-device', type=str, default=None, help='Seleciona o microfone a ser usado (requer --allow-mic).')
-    parser.add_argument('--linein-substr', type=str, default='ICUSBAUDIO7D,USB Audio,CM6206,CM106',
-                        help='Substrings separadas por vírgula que identificam dispositivos LINE-IN seguros no Linux/macOS (padrão inclui ICUSBAUDIO7D).')
-    parser.add_argument('--list-devices', action='store_true', help='Lista dispositivos PortAudio e sai.')
+    parser.add_argument('--allow-mic', action='store_true')
+    parser.add_argument('--mic-device', type=str, default=None)
+    parser.add_argument('--linein-substr', type=str, default='ICUSBAUDIO7D,USB Audio,CM6206,CM106')
+    parser.add_argument('--list-devices', action='store_true')
 
     parser.add_argument('--raspberry-ip', type=str, default=RASPBERRY_IP)
     parser.add_argument('--udp-port', type=int, default=UDP_PORT)
@@ -699,22 +681,18 @@ def main():
     parser.add_argument('--require-sync', action='store_true')
     parser.add_argument('--no-require-sync', action='store_true')
     parser.add_argument('--resync', type=float, default=RESYNC_INTERVAL_SEC)
-    # Gate de silencio
     parser.add_argument('--silence-bands', type=float, default=28.0)
     parser.add_argument('--silence-rms', type=float, default=0.0015)
     parser.add_argument('--silence-duration', type=float, default=0.8)
     parser.add_argument('--resume-factor', type=float, default=1.8)
     parser.add_argument('--resume-stable', type=float, default=0.35)
-    # Alphas
     parser.add_argument('--avg-ema', type=float, default=0.05)
     parser.add_argument('--rms-ema', type=float, default=0.05)
     parser.add_argument('--norm-peak-ema', type=float, default=PEAK_EMA_DEFAULT)
-    # Reset
-    parser.add_argument('--no-reset-on-start', action='store_true', help='Não envia RESET (B1) ao iniciar')
-    # Perfil de silêncio / ruído
-    parser.add_argument('--noise-profile', action='store_true', help='Habilita perfil de silêncio por banda e subtração pós-FFT/MEL')
-    parser.add_argument('--noise-headroom', type=float, default=1.12, help='Fator >1 para ampliar o perfil antes de subtrair')
-    parser.add_argument('--min-band', type=int, default=0, help='Valor mínimo (0..255) por banda após subtração')
+    parser.add_argument('--no-reset-on-start', action='store_true')
+    parser.add_argument('--noise-profile', action='store_true')
+    parser.add_argument('--noise-headroom', type=float, default=1.12)
+    parser.add_argument('--min-band', type=int, default=0)
 
     args = parser.parse_args()
 
@@ -724,14 +702,11 @@ def main():
             print(f"{i:3d}  {d['name']}  in={d.get('max_input_channels',0)}  out={d.get('max_output_channels',0)}  sr={d.get('default_samplerate')}")
         return
 
-    # Guardar cfg
     app["cfg"] = {"rpi_ip": args.raspberry_ip, "rpi_port": args.udp_port}
 
-    # FPS TX efetivo
     TX_FPS = max(1, int(args.tx_fps))
     MIN_SEND_INTERVAL = 1.0 / TX_FPS
 
-    # Estado do servidor
     server_state = {
         "silence_bands": float(args.silence_bands),
         "silence_rms": float(args.silence_rms),
@@ -756,27 +731,24 @@ def main():
     }
     app["server_state"] = server_state
 
-    # Config de servidor para features
     app["server_cfg"] = {
         "noise_profile_enabled": bool(args.noise_profile),
         "noise_headroom": float(args.noise_headroom),
         "min_band": int(args.min_band),
     }
 
-    # shared
     n_bands = int(args.bands)
     shared = Shared(n_bands)
     app["shared"] = shared
 
-    # Servidor web (em thread) — desabilita signals no aiohttp
     def start_web():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         web.run_app(app, host=args.bind, port=args.port, handle_signals=False)
     threading.Thread(target=start_web, daemon=True).start()
-    print(f"\n[WEB] http://{args.bind}:{args.port}")
+    print(f"
+[WEB] http://{args.bind}:{args.port}")
 
-    # Time-sync
     require_sync = REQUIRE_TIME_SYNC
     if args.no_require_sync:
         require_sync = False
@@ -787,7 +759,6 @@ def main():
         time_sync_over_tcp(args.raspberry_ip)
         threading.Thread(target=resync_worker, args=(args.raspberry_ip, float(args.resync)), daemon=True).start()
 
-    # ---- Preparar LOG ou MEL ----
     scale_mode = args.scale.lower()
     peak_ema_alpha = float(args.norm_peak_ema)
     compute_bands = None
@@ -800,7 +771,6 @@ def main():
         compute_bands_builder = ("log", n_bands)
         shared.bands = np.zeros(n_bands, dtype=np.uint8)
 
-    # ---- callback comum ----
     energy_buf = np.zeros(ENERGY_BUFFER_SIZE, dtype=np.float32)
     energy_idx = 0
     energy_count = 0
@@ -835,13 +805,18 @@ def main():
             last_energy = energy
         return audio_cb
 
-    # ---- abrir backend ----
     backend_used = None
     stream = None
     pa_instance = None
 
     def _build_compute(sr):
         nonlocal compute_bands, shared
+        if compute_bands_builder[0] == "mel":
+            mel_bands = compute_bands_builder[1]
+            mel_fb = build_mel_filterbank(sr, NFFT, mel_bands, FMIN, min(FMAX, sr/2.0))
+            if not args.mel_no_area_nrom if False else not args.mel_no_area_nrom:
+                pass
+        # area norm and tilt
         if compute_bands_builder[0] == "mel":
             mel_bands = compute_bands_builder[1]
             mel_fb = build_mel_filterbank(sr, NFFT, mel_bands, FMIN, min(FMAX, sr/2.0))
@@ -865,9 +840,15 @@ def main():
     if args.backend in ("auto","sd"):
         try:
             audio_cb = make_audio_cb()
+            # CORRECT sounddevice callback signature wrapper
+            def sd_wrapper(indata, frames, time_info, status):
+                arr = indata.copy().astype(np.float32)
+                if arr.ndim > 1 and arr.shape[1] > 1:
+                    arr = arr.mean(axis=1)
+                audio_cb(arr.ravel(), frames, time_info, status)
             s, sr_eff, ch_eff, desc, is_loop = _sd_choose_and_open(
                 args.device, allow_mic=args.allow_mic, mic_device=args.mic_device,
-                audio_cb=lambda b, *_: audio_cb(b.astype(np.float32)),
+                audio_cb=sd_wrapper,
                 linein_substrings=linein_substrings
             )
             _build_compute(sr_eff)
@@ -882,13 +863,16 @@ def main():
             except Exception:
                 sr_def = sr_eff; name = desc
             backend_used = f"sounddevice {desc}"
-            print(f"\n[AUDIO] Dispositivo: {name} | SR(default)={sr_def} | SR(abrido)={sr_eff} | CH={ch_eff}")
+            print(f"
+[AUDIO] Dispositivo: {name} | SR(default)={sr_def} | SR(abrido)={sr_eff} | CH={ch_eff}")
         except Exception as e_sd:
             if args.backend == "sd" or args.no_pyaudio_fallback:
-                print(f"\n[FATAL] sounddevice falhou: {e_sd}")
+                print(f"
+[FATAL] sounddevice falhou: {e_sd}")
                 sys.exit(1)
             else:
-                print(f"\n[WARN] sounddevice falhou, tentando PyAudio... ({e_sd})")
+                print(f"
+[WARN] sounddevice falhou, tentando PyAudio... ({e_sd})")
 
     if stream is None and args.backend in ("auto","pyaudio"):
         try:
@@ -901,11 +885,13 @@ def main():
             shared.channels = ch_eff
             backend_used = tag
         except Exception as e_pa:
-            print(f"\n[FATAL] PyAudio falhou: {e_pa}")
+            print(f"
+[FATAL] PyAudio falhou: {e_pa}")
             sys.exit(1)
 
     if stream is None:
-        print("\n[FATAL] Nenhum backend de áudio pôde ser aberto.")
+        print("
+[FATAL] Nenhum backend de áudio pôde ser aberto.")
         sys.exit(1)
 
     try:
@@ -1008,7 +994,8 @@ def main():
                 ss["calib_started"] = 0.0
                 ss["calib_avg"].clear(); ss["calib_rms"].clear()
                 ss["noise_profile_frames"] = None
-                print(f"\n[CALIB] OK: th_avg={th_avg:.1f} th_rms={th_rms:.6f} resume_x={resume_factor:.2f}")
+                print(f"
+[CALIB] OK: th_avg={th_avg:.1f} th_rms={th_rms:.6f} resume_x={resume_factor:.2f}")
 
             if ss["auto_mode"] and (now - last_auto_update) >= 0.5:
                 arr_avg = np.array([v for _,v in hist_avg], dtype=np.float32) if hist_avg else np.array([avg_filtered],dtype=np.float32)
@@ -1129,7 +1116,8 @@ def main():
                     pass
         except Exception:
             pass
-        sys.stdout.write("\n"); sys.stdout.flush()
+        sys.stdout.write("
+"); sys.stdout.flush()
 
 
 if __name__ == '__main__':
