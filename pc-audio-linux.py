@@ -3,6 +3,7 @@
 # Preferência: sounddevice (WASAPI loopback no Windows). No Linux/macOS o padrão é LINE-IN (ICUSBAUDIO7D etc.).
 # Fallback: PyAudio quando solicitado. Web server em thread sem signals (handle_signals=False) para evitar set_wakeup_fd.
 # Fabio Bonilha + M365 Copilot — 2025-11-13
+# CORRIGIDO: buffer de energia com deque (evita IndexError no callback)
 
 import asyncio
 import socket
@@ -301,12 +302,12 @@ class Shared:
         self.beat = 0
         self.avg = 0.0
         self.rms = 0.0
-        self.active= False
+        self.active = False
         self.tx_count = 0
         self.device = ""
         self.samplerate = 0
         self.channels = 0
-        self.last_update= 0.0
+        self.last_update = 0.0
 
 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
@@ -451,8 +452,8 @@ def print_status(shared, tag_extra: str = "", require_sync=True):
     global _last_status, _time_sync_ok
     now = time.time()
     if (now - _last_status) > 0.25:
-        tag = "SYNC✓" if _time_sync_ok else ("SYNC OFF" if not require_sync else "WAITING SYNC")
-        sys.stdout.write(f"TX: {shared.tx_count} {tag}{tag_extra}")
+        tag = "SYNCOK" if _time_sync_ok else ("SYNC OFF" if not require_sync else "WAITING SYNC")
+        sys.stdout.write(f"\rTX: {shared.tx_count} {tag}{tag_extra}   ")
         sys.stdout.flush()
         _last_status = now
 
@@ -525,7 +526,7 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
                 return s, int(s.samplerate), int(s.channels), f"(WASAPI loopback): '{d['name']}'", True
             except Exception:
                 continue
-        raise RuntimeError("Nenhuma saída com WASAPI loopback disponível para o sounddevice.")
+        raise RuntimeError("Nenhuma saídaada com WASAPI loopback disponível para o sounddevice.")
 
     preferred = None
     for i, d in enumerate(devs):
@@ -688,7 +689,7 @@ def main():
 
     args = parser.parse_args()
 
-    if args.list_devices:
+    if args3.list_devices:
         devs = sd.query_devices()
         for i, d in enumerate(devs):
             print(f"{i:3d}  {d['name']}  in={d.get('max_input_channels',0)}  out={d.get('max_output_channels',0)}  sr={d.get('default_samplerate')}")
@@ -762,38 +763,51 @@ def main():
         compute_bands_builder = ("log", n_bands)
         shared.bands = np.zeros(n_bands, dtype=np.uint8)
 
-    energy_buf = np.zeros(ENERGY_BUFFER_SIZE, dtype=np.float32)
-    energy_idx = 0
-    energy_count = 0
-    last_energy = 0.0
+    # Buffer de energia: agora com deque
+    energy_buf = deque(maxlen=ENERGY_BUFFER_SIZE)
 
     def make_audio_cb():
-        nonlocal compute_bands, energy_idx, energy_count, last_energy
+        """
+        Cria o callback de áudio.
+        Usa deque para o buffer de energia → elimina IndexError.
+        """
+        nonlocal compute_bands
+
+        last_energy = 0.0
+
         def audio_cb(block, frames, time_info, status):
+            nonlocal last_energy
+
             b = block
             if b.shape[0] < BLOCK_SIZE:
                 b = np.pad(b, (0, BLOCK_SIZE - b.shape[0]), 'constant')
+
             bands = compute_bands(b[:BLOCK_SIZE]) if compute_bands is not None else None
             if bands is None:
                 return
+
             app["shared"].bands = bands
             avg = float(np.mean(bands))
-            rms = float(np.sqrt(np.mean((b[:BLOCK_SIZE]*b[:BLOCK_SIZE])) + 1e-12))
+            rms = float(np.sqrt(np.mean((b[:BLOCK_SIZE] * b[:BLOCK_SIZE])) + 1e-12))
+
             app["shared"].avg = avg
             app["shared"].rms = rms
             app["shared"].last_update = time.time()
+
             lb = bands[:max(8, len(bands)//12)]
-            energy = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
-            energy_buf[energy_idx] = energy
-            energy_idx = (energy_idx + 1) % ENERGY_BUFFER_SIZE
-            energy_count = min(energy_count + 1, ENERGY_BUFFER_SIZE)
-            buf_view = energy_buf if energy_count == ENERGY_BUFFER_SIZE else energy_buf[:energy_count]
-            avg_energy = float(np.mean(buf_view)) if energy_count>0 else 0.0
-            std_energy = float(np.std(buf_view)) if energy_count>1 else 0.0
+            energy = float(np.mean(lb))/255.0 if lb.size > 0 else 0.0
+
+            energy_buf.append(energy)
+
+            buf_view = list(energy_buf)
+            avg_energy = float(np.mean(buf_view)) if buf_view else 0.0
+            std_energy = float(np.std(buf_view)) if len(buf_view) > 1 else 0.0
+
             dyn_thr = avg_energy + BEAT_THRESHOLD * std_energy
             is_peak_now = (energy >= max(dyn_thr, BEAT_HEIGHT_MIN)) and (energy >= last_energy)
             app["shared"].beat = 1 if is_peak_now else 0
             last_energy = energy
+
         return audio_cb
 
     backend_used = None
@@ -802,12 +816,6 @@ def main():
 
     def _build_compute(sr):
         nonlocal compute_bands, shared
-        if compute_bands_builder[0] == "mel":
-            mel_bands = compute_bands_builder[1]
-            mel_fb = build_mel_filterbank(sr, NFFT, mel_bands, FMIN, min(FMAX, sr/2.0))
-            if not args.mel_no_area_nrom if False else not args.mel_no_area_nrom:
-                pass
-        # area norm and tilt
         if compute_bands_builder[0] == "mel":
             mel_bands = compute_bands_builder[1]
             mel_fb = build_mel_filterbank(sr, NFFT, mel_bands, FMIN, min(FMAX, sr/2.0))
@@ -831,7 +839,6 @@ def main():
     if args.backend in ("auto","sd"):
         try:
             audio_cb = make_audio_cb()
-            # CORRECT sounddevice callback signature wrapper
             def sd_wrapper(indata, frames, time_info, status):
                 arr = indata.copy().astype(np.float32)
                 if arr.ndim > 1 and arr.shape[1] > 1:
@@ -854,7 +861,7 @@ def main():
             except Exception:
                 sr_def = sr_eff; name = desc
             backend_used = f"sounddevice {desc}"
-            print(f"[AUDIO] Dispositivo: {name} | SR(default)={sr_def} | SR(abrido)={sr_eff} | CH={ch_eff}")
+            print(f"[AUDIO] Dis189: {name} | SR(default)={sr_def} | SR(abrido)={sr_eff} | CH={ch_eff}")
         except Exception as e_sd:
             if args.backend == "sd" or args.no_pyaudio_fallback:
                 print(f"[FATAL] sounddevice falhou: {e_sd}")
@@ -1101,7 +1108,7 @@ def main():
                     pass
         except Exception:
             pass
-        sys.stdout.write(""); sys.stdout.flush()
+        sys.stdout.write("\n"); sys.stdout.flush()
 
 
 if __name__ == '__main__':
