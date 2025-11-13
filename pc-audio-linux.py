@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # pc-audio.py - Web UI + WebSocket + Captura de áudio
-# Preferência: sounddevice (WASAPI loopback). Fallback: PyAudio (PyAudioWPatch) se necessário.
-# LOG/MEL; pacotes A1/A2; B0 (cfg) e B1 (reset); proteção anti-mic; frontend completo.
-# Fabio Bonilha + M365 Copilot — 2025-11-12
+# Preferência: sounddevice (WASAPI loopback no Windows). Fallback: PyAudio (PyAudioWPatch) se necessário.
+# LOG/MEL; pacotes A1/A2; B0 (cfg) e B1 (reset); proteção; frontend completo.
+# Fabio Bonilha + M365 Copilot — 2025-11-13
 
 import asyncio
 import socket
@@ -12,15 +12,16 @@ import platform
 import threading
 import argparse
 from collections import deque
-from typing import Optional, Union, Deque, Tuple
+from typing import Optional, Union, Deque, Tuple, List
+
 import numpy as np
 import sounddevice as sd
 from aiohttp import web
 import os
 
-# --------- PyAudio (opcional) ---------
-_PAW = None  # módulo pyaudiowpatch (preferido)
-_PA  = None  # módulo pyaudio (oficial)
+# --- PyAudio (opcional)
+_PAW = None  # módulo pyaudiowpatch (preferido no Windows)
+_PA = None   # módulo pyaudio (oficial)
 try:
     import pyaudiowpatch as pyaudio
     _PAW = pyaudio
@@ -30,21 +31,17 @@ except Exception:
         _PA = pyaudio
     except Exception:
         _PAW = None
-        _PA  = None
-# --------------------------------------
+        _PA = None
 
 # ============================= Config padrao =============================
 RASPBERRY_IP = "192.168.66.71"
 UDP_PORT = 5005
 TCP_TIME_PORT = 5006
-
 DEFAULT_NUM_BANDS = 150
 BLOCK_SIZE = 1024  # samples
 NFFT = 4096        # zero-padding
-
 # FMIN, FMAX = 20.0, 16000.0
 FMIN, FMAX = 20.0, 4000.0
-
 EMA_ALPHA = 0.75
 PEAK_EMA_DEFAULT = 0.10
 
@@ -66,389 +63,69 @@ PKT_CFG = 0xB0
 PKT_RESET = 0xB1
 
 # ============================= HTML (Frontend) =============================
-HTML = r"""<!doctype html>
-<html lang="pt-BR">
+HTML = r"""
+<!doctype html>
+<html>
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta charset="utf-8"/>
 <title>Reactive LEDs — Monitor</title>
 <style>
-  :root{
-    --bg:#0b0f14;--panel:#121923;--elev:#0f141c;--text:#e6edf3;--muted:#9fb1c7;
-    --brand:#6ee7ff;--brand-2:#22d3ee;--ok:#22c55e;--warn:#f59e0b;--err:#ef4444;
-    --card:#0e141c;--chip:#0b1520;--border:#1f2a37;--accent:#1b2531;
-  }
-  *{box-sizing:border-box}
-  html,body{height:100%}
-  body{
-    margin:0;background:linear-gradient(180deg,var(--bg),#0a1016 45%,#0a0f15);
-    color:var(--text);font:500 15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial;
-    letter-spacing:.2px;
-  }
-  .shell{max-width:1100px;margin:auto;padding:20px;display:flex;flex-direction:column;gap:16px}
-  header{
-    display:flex;gap:16px;align-items:center;justify-content:space-between;
-    padding:14px 16px;border:1px solid var(--border);border-radius:14px;background:linear-gradient(180deg,var(--panel),#0f1720);
-    box-shadow:0 10px 30px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.03);
-  }
-  .brand{display:flex;gap:12px;align-items:center}
-  .logo{
-    width:34px;height:34px;border-radius:10px;background:
-      radial-gradient(60% 60% at 30% 30%, var(--brand) 0%, transparent 60%),
-      radial-gradient(80% 80% at 70% 70%, var(--brand-2) 0%, transparent 70%),
-      linear-gradient(135deg,#0b1f2c,#06141e);
-    border:1px solid var(--border);box-shadow:0 2px 8px rgba(0,0,0,.4), inset 0 0 0 1px rgba(255,255,255,.04);
-  }
-  h1{font-size:18px;margin:0;letter-spacing:.3px}
-  .status-line{display:flex;flex-wrap:wrap;gap:10px;color:var(--muted);font-size:13px}
-  .chip{
-    background:var(--chip);border:1px solid var(--border);padding:6px 10px;border-radius:999px;
-  }
-  .chip.ok{border-color:rgba(34,197,94,.35);color:#a7f3d0}
-  .chip.bad{border-color:rgba(239,68,68,.35);color:#fecaca}
-  .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}
-  @media (max-width:900px){.grid{grid-template-columns:1fr}}
-  .panel{
-    border:1px solid var(--border);border-radius:14px;background:linear-gradient(180deg,var(--panel),#0e1620);
-    box-shadow:0 8px 24px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.03);
-    padding:14px;
-  }
-  .panel h2{margin:0 0 10px 0;font-size:14px;font-weight:600;color:#c7d2fe;letter-spacing:.4px}
-  .controls{display:flex;flex-wrap:wrap;gap:10px}
-  button, .btn{
-    appearance:none;border:1px solid var(--border);background:linear-gradient(180deg,#162231,#0f1a26);
-    color:var(--text);padding:10px 12px;border-radius:10px;cursor:pointer;font-weight:600;
-    transition:.15s transform,.15s background,.15s border-color;
-  }
-  button:hover{transform:translateY(-1px);border-color:#334155}
-  button:active{transform:translateY(0)}
-  .btn-primary{background:linear-gradient(180deg,#0ea5b1,#097c8a);border-color:#0ea5b1}
-  .btn-danger{background:linear-gradient(180deg,#b91c1c,#991b1b);border-color:#7f1d1d}
-  .btn-ghost{background:transparent}
-  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-  label{font-size:13px;color:var(--muted)}
-  input[type="number"],select{
-    background:#0c131b;color:var(--text);border:1px solid var(--border);border-radius:10px;padding:8px 10px;min-width:80px
-  }
-  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:8px}
-  @media(max-width:700px){.kpis{grid-template-columns:repeat(2,1fr)}}
-  .card{
-    background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px;
-  }
-  .card .title{color:#9fb1c7;font-size:12px}
-  .card .value{font-size:22px;font-weight:700;margin-top:2px}
-  .bar-wrap{height:8px;background:#0a131b;border:1px solid var(--border);border-radius:999px;overflow:hidden;margin-top:8px}
-  .bar{height:100%;background:linear-gradient(90deg,var(--brand),#60a5fa);width:0%}
-  canvas{width:100%;height:260px;display:block;background:
-    repeating-linear-gradient(to right, transparent 0 6px, rgba(255,255,255,.02) 6px 7px),
-    linear-gradient(180deg,#0a121a,#0a121a)}
-  .legend{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:6px}
-  .beat{
-    width:10px;height:10px;border-radius:3px;background:#1f2937;border:1px solid var(--border);box-shadow:0 0 0 0 rgba(34,197,94,.0);
-    transition:.1s box-shadow,.1s background;
-  }
-  .beat.on{background:#16a34a;box-shadow:0 0 0 6px rgba(34,197,94,.12)}
-  .toast{
-    position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:10
-  }
-  .toast .t{
-    background:#0d1620;border:1px solid var(--border);padding:10px 12px;border-radius:10px;color:#cce2ff;box-shadow:0 8px 24px rgba(0,0,0,.35)
-  }
-  .progress{
-    height:8px;background:#0b131b;border:1px solid var(--border);border-radius:999px;overflow:hidden
-  }
-  .progress .p{height:100%;width:0;background:linear-gradient(90deg,#22d3ee,#38bdf8)}
-  .split{display:flex;align-items:center;gap:10px;justify-content:space-between;flex-wrap:wrap}
-  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;font-size:12px;color:#9fb1c7}
+body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:20px;color:#222}
+#bands{display:grid;grid-template-columns:repeat(75,1fr);gap:1px;height:120px;background:#eee}
+.bar{background:#4b9fff}
+small{color:#666}
+button{margin-right:8px}
 </style>
 </head>
 <body>
-  <div class="shell">
-    <header>
-      <div class="brand">
-        <div class="logo" aria-hidden="true"></div>
-        <div>
-          <h1>Reactive LEDs — Monitor</h1>
-          <div class="status-line">
-            <span id="conn" class="chip bad">Desconectado</span>
-            <span id="fps" class="chip">FPS: —</span>
-            <span id="dev" class="chip">Dispositivo: —</span>
-            <span id="srch" class="chip">SR/CH: —</span>
-            <span id="tx" class="chip">TX: 0</span>
-          </div>
-        </div>
-      </div>
-      <div class="row">
-        <div class="beat" id="beat" title="Beat"></div>
-      </div>
-    </header>
+<h2>Reactive LEDs — Monitor</h2>
+<div id="conn">Desconectado</div>
+<div id="info">
+  <small>FPS: <span id="fps">—</span> • Dispositivo: <span id="dev">—</span> • SR/CH: <span id="srch">—</span> • TX: <span id="tx">0</span></small>
+</div>
+<h3>Visualização de Bandas</h3>
+<div id="bands"></div>
+<p><small>Bandas: <span id="nb">—</span> • Silêncio: <span id="sil">—</span></small></p>
+<h3>Controles</h3>
+<button onclick="post('/api/mode',{mode:'auto_on'})">AUTO: ON</button>
+<button onclick="post('/api/mode',{mode:'auto_off'})">AUTO: OFF</button>
+<button onclick="post('/api/mode',{mode:'calibrate_silence',duration_sec:5})">Calibrar Silêncio</button>
+<button onclick="post('/api/mode',{mode:'true_silence'})">Forçar Silêncio</button>
+<button onclick="post('/api/reset',{})">Reset (B1)</button>
 
-    <div class="grid">
-      <!-- Visualização -->
-      <section class="panel">
-        <div class="split">
-          <h2>Visualização de Bandas</h2>
-          <div class="row mono" id="bandsMeta">Bandas: — • Silêncio: —</div>
-        </div>
-        <canvas id="viz" height="260"></canvas>
-        <div class="legend">
-          <span>grave</span><span>agudo</span>
-        </div>
-      </section>
-
-      <!-- Controles + KPIs -->
-      <section class="panel">
-        <h2>Controles</h2>
-        <div class="controls">
-          <button id="btnAuto" class="btn-primary">AUTO: OFF</button>
-          <div class="row">
-            <label for="dur">Calibrar Silêncio</label>
-            <input id="dur" type="number" min="1" max="15" value="5" /> 
-            <button id="btnCalib">Iniciar</button>
-          </div>
-          <button id="btnSilence" class="btn-ghost">Forçar Silêncio</button>
-          <button id="btnReset" class="btn-danger" title="Enviar B1">Reset (B1)</button>
-        </div>
-
-        <div id="calibBox" style="margin-top:12px;display:none">
-          <div class="row split">
-            <label>Calibrando silêncio… <span id="calibEta" class="mono">(—s)</span></label>
-            <span class="mono">Coletando amostras</span>
-          </div>
-          <div class="progress" style="margin-top:6px"><div class="p" id="calibProg"></div></div>
-        </div>
-
-        <div class="kpis">
-          <div class="card"><div class="title">AVG</div><div class="value" id="avg">—</div><div class="bar-wrap"><div class="bar" id="avgBar"></div></div></div>
-          <div class="card"><div class="title">RMS</div><div class="value" id="rms">—</div><div class="bar-wrap"><div class="bar" id="rmsBar"></div></div></div>
-          <div class="card"><div class="title">TH (Silence Bands)</div><div class="value" id="thBands">—</div></div>
-          <div class="card"><div class="title">TH (Silence RMS)</div><div class="value" id="thRms">—</div></div>
-        </div>
-
-        <div class="kpis" style="margin-top:10px">
-          <div class="card"><div class="title">Resume ×</div><div class="value" id="resumeX">—</div></div>
-          <div class="card"><div class="title">Estado</div><div class="value" id="state">—</div></div>
-          <div class="card"><div class="title">Calibração</div><div class="value" id="calibState">—</div></div>
-          <div class="card"><div class="title">Pacotes TX</div><div class="value" id="txCount">0</div></div>
-        </div>
-      </section>
-    </div>
-  </div>
-
-  <div class="toast" id="toast"></div>
-
+<pre id="state"></pre>
 <script>
-(function(){
-  const el = id => document.getElementById(id);
-  const fmt = (n, p=1) => (Number.isFinite(n)? n.toFixed(p) : "—");
+const bandsDiv = document.getElementById('bands');
+for(let i=0;i<150;i++){const d=document.createElement('div');d.className='bar';d.style.height='1px';bandsDiv.appendChild(d)}
 
-  const st = {
-    connected:false, auto:false, lastBandsLen:0, lastSilence:false,
-    calib:false, calibUntil:0, calibEta:0, calibDur:5,
-  };
+function post(url, data){fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})}
 
-  // --- UI refs
-  const conn=el("conn"), fps=el("fps"), dev=el("dev"), srch=el("srch"), tx=el("tx");
-  const avg=el("avg"), rms=el("rms"), avgBar=el("avgBar"), rmsBar=el("rmsBar");
-  const thBands=el("thBands"), thRms=el("thRms"), resumeX=el("resumeX"), state=el("state");
-  const txCount=el("txCount"), bandsMeta=el("bandsMeta"), beatEl=el("beat");
-  const btnAuto=el("btnAuto"), btnCalib=el("btnCalib"), btnSilence=el("btnSilence"), btnReset=el("btnReset"), dur=el("dur");
-  const calibBox=el("calibBox"), calibProg=el("calibProg"), calibEta=el("calibEta");
-  const viz = el("viz"); const g = viz.getContext("2d");
-  let W, H, DPR=window.devicePixelRatio||1;
-
-  function resize(){
-    const cssW = viz.clientWidth, cssH = viz.clientHeight;
-    viz.width = Math.floor(cssW*DPR); viz.height = Math.floor(cssH*DPR);
-    W = viz.width; H = viz.height;
-  }
-  resize(); window.addEventListener("resize", resize);
-
-  function toast(msg, type="info"){
-    const holder = el("toast");
-    const t = document.createElement("div");
-    t.className = "t";
-    t.style.borderColor = (type==="error")?"rgba(239,68,68,.35)":(type==="warn"?"rgba(245,158,11,.35)":"#334155");
-    t.textContent = msg;
-    holder.appendChild(t);
-    setTimeout(()=>{t.style.opacity=".0"; t.style.transform="translateY(4px)";}, 2400);
-    setTimeout(()=>holder.removeChild(t), 3000);
-  }
-
-  // --- Drawing
-  function drawBands(arr, beat=false, silence=false){
-    g.clearRect(0,0,W,H);
-    const n = arr.length||0;
-    if(!n){ return; }
-    const pad = 6*DPR;
-    const w = (W - pad*2)/n;
-    const base = H-8*DPR;
-    const maxH = H - 16*DPR;
-
-    // gradient fill
-    const grad = g.createLinearGradient(0,0,0,H);
-    grad.addColorStop(0, "#6ee7ff");
-    grad.addColorStop(.55, "#60a5fa");
-    grad.addColorStop(1, "#3b82f6");
-
-    for(let i=0;i<n;i++){
-      const v = arr[i] / 255;
-      const h = Math.max(2, v * maxH);
-      const x = Math.floor(pad + i*w);
-      const y = Math.floor(base - h);
-      g.fillStyle = grad;
-      g.fillRect(x, y, Math.max(1, w*0.9), h);
+function connect(){
+  const ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws');
+  ws.onopen=()=>{document.getElementById('conn').textContent='Conectado'};
+  ws.onclose=()=>{document.getElementById('conn').textContent='Desconectado'; setTimeout(connect,1500)};
+  ws.onmessage=(ev)=>{
+    const j=JSON.parse(ev.data);
+    document.getElementById('fps').textContent=j.fps;
+    document.getElementById('dev').textContent=j.device;
+    document.getElementById('srch').textContent=j.sr_ch;
+    document.getElementById('tx').textContent=j.tx_count;
+    document.getElementById('nb').textContent=j.bands.length;
+    document.getElementById('sil').textContent=j.silence?'Sim':'Não';
+    const bars = bandsDiv.children;
+    for(let i=0;i<j.bands.length && i<bars.length;i++){
+      bars[i].style.height=(1+j.bands[i])+'px';
+      bars[i].style.background = j.silence? '#bbb' : '#4b9fff';
     }
-
-    // baseline and overlay
-    g.strokeStyle = "rgba(255,255,255,.06)";
-    g.beginPath();
-    g.moveTo(pad, base+.5); g.lineTo(W-pad, base+.5); g.stroke();
-
-    // beat overlay
-    if(beat){
-      g.fillStyle = "rgba(34,197,94,.08)";
-      g.fillRect(0,0,W,H);
-    }
-    // silence overlay
-    if(silence){
-      g.fillStyle = "rgba(148,163,184,.06)";
-      g.fillRect(0,0,W,H);
-    }
-  }
-
-  function setConn(ok){
-    st.connected = ok;
-    conn.textContent = ok ? "Conectado" : "Desconectado";
-    conn.classList.toggle("ok", ok);
-    conn.classList.toggle("bad", !ok);
-  }
-
-  // --- Actions
-  btnAuto.onclick = async ()=>{
-    const target = st.auto ? "auto_off" : "auto_on";
-    try{
-      await fetch("/api/mode",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode:target})});
-      st.auto = !st.auto; btnAuto.textContent = "AUTO: " + (st.auto?"ON":"OFF");
-      btnAuto.classList.toggle("btn-primary", st.auto);
-      toast(st.auto?"Modo AUTO ligado":"Modo AUTO desligado");
-    }catch(e){ toast("Falha ao alternar AUTO","error"); }
   };
-
-  btnCalib.onclick = async()=>{
-    const seconds = Math.max(1, Math.min(15, Number(dur.value)||5));
-    try{
-      await fetch("/api/mode",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({mode:"calibrate_silence", duration_sec:seconds})});
-      st.calib = true; st.calibDur = seconds;
-      calibBox.style.display="block";
-      calibProg.style.width="0%";
-      calibEta.textContent = `(${seconds.toFixed(0)}s)`;
-      toast(`Calibração iniciada por ${seconds}s`);
-    }catch(e){ toast("Falha ao iniciar calibração","error"); }
-  };
-
-  btnSilence.onclick = async()=>{
-    try{
-      await fetch("/api/mode",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({mode:"true_silence"})});
-      toast("Silêncio forçado enviado");
-    }catch(e){ toast("Falha ao forçar silêncio","error"); }
-  };
-
-  btnReset.onclick = async()=>{
-    try{
-      const res = await fetch("/api/reset",{method:"POST"});
-      const j = await res.json();
-      toast(j.status==="ok"?"Reset B1 enviado":"Falha no reset", j.status==="ok"?"info":"error");
-    }catch(e){ toast("Erro ao enviar reset","error"); }
-  };
-
-  // --- WS + status polling
-  let ws;
-  function connectWS(){
-    ws = new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/ws");
-    ws.onopen = ()=> setConn(true);
-    ws.onclose = ()=> { setConn(false); setTimeout(connectWS, 800); };
-    ws.onerror = ()=> { setConn(false); };
-    ws.onmessage = ev =>{
-      try{
-        const d = JSON.parse(ev.data);
-        // Header stats
-        fps.textContent = "FPS: " + (d.fps??"—");
-        dev.textContent = "Dispositivo: " + (d.device || "—");
-        srch.textContent = "SR/CH: " + (d.sr_ch || "—");
-        tx.textContent = "TX: " + (d.tx_count ?? 0);
-        txCount.textContent = (d.tx_count ?? 0);
-
-        // KPIs
-        avg.textContent = fmt(d.avg,1);
-        rms.textContent = fmt(d.rms,5);
-        avgBar.style.width = Math.min(100, (Number(d.avg)||0)) + "%";
-        rmsBar.style.width = Math.min(100, (Number(d.rms||0)*4000)) + "%"; // escala visual
-
-        thBands.textContent = fmt(d.th_silence_bands,1);
-        thRms.textContent = fmt(d.th_silence_rms,6);
-        resumeX.textContent = fmt(d.th_resume_factor,2);
-
-        // Estados
-        state.textContent = d.silence ? "Silencioso" : "Ativo";
-        bandsMeta.textContent = `Bandas: ${d.bands?.length ?? "—"} • Silêncio: ${d.silence?"sim":"não"}`;
-
-        // AUTO/calib visuais
-        st.auto = !!d.auto_mode;
-        btnAuto.textContent = "AUTO: " + (st.auto?"ON":"OFF");
-        btnAuto.classList.toggle("btn-primary", st.auto);
-
-        const isCalib = !!d.calibrating;
-        calibBox.style.display = isCalib ? "block" : "none";
-        if(isCalib){
-          const eta = Math.max(0, Number(d.calib_eta||0));
-          const total = st.calibDur || 5;
-          const prog = Math.min(1, (total - eta)/Math.max(1,total));
-          calibProg.style.width = (prog*100).toFixed(1)+"%";
-          calibEta.textContent = `(${eta.toFixed(1)}s)`;
-        }else if(st.calib){ // terminou
-          st.calib=false; calibProg.style.width="100%";
-          setTimeout(()=>{calibBox.style.display="none"; calibProg.style.width="0%"}, 500);
-          toast("Calibração concluída");
-        }
-
-        // Beat
-        beatEl.classList.toggle("on", !!d.beat);
-
-        // Bands
-        const bands = (d.bands||[]).map(x=>+x||0);
-        if (bands.length) drawBands(bands, !!d.beat, !!d.silence);
-      }catch(e){}
-    }
-  }
-  connectWS();
-
-  // Poll de /api/status para manter headers saudáveis caso WS reconecte e para exibir info inicial
-  async function pollStatus(){
-    try{
-      const r = await fetch("/api/status"); const s = await r.json();
-      dev.textContent = "Dispositivo: " + (s.device || "—");
-      srch.textContent = "SR/CH: " + (s.samplerate? `${s.samplerate} / ${s.channels}` : "—");
-      thBands.textContent = fmt(s.th_silence_bands,1);
-      thRms.textContent = fmt(s.th_silence_rms,6);
-      resumeX.textContent = fmt(s.th_resume_factor,2);
-      state.textContent = s.active ? "Ativo" : "Silencioso";
-      bandsMeta.textContent = `Bandas: ${s.bands_len ?? "—"} • Silêncio: ${s.active? "não":"sim"}`;
-    }catch(e){}
-    setTimeout(pollStatus, 1200);
-  }
-  pollStatus();
-
-})();
+}
+connect();
 </script>
 </body>
 </html>
 """
 
-
-# ============================= Helpers de Device (Windows loopback) =============================
+# ============================= Helpers de Device =============================
 def resolve_device_index(name_or_index: Optional[Union[str, int]]):
     if name_or_index is None:
         return None
@@ -493,7 +170,7 @@ def make_bands_indices(nfft, sr, num_bands, fmin, fmax_limit, min_bins=1):
     for i in range(1, len(a)):
         if a[i] < b[i-1]:
             a[i] = b[i-1]
-            b[i] = max(b[i], a[i] + min_bins)
+        b[i] = max(b[i], a[i] + min_bins)
     b = np.minimum(b, freqs.size-1)
     a = np.minimum(a, b-1)
     return a, b
@@ -519,8 +196,11 @@ def make_compute_bands_log(sr, block_size, nfft, band_starts, band_ends, ema_alp
     return compute
 
 # ============================= MEL filterbank =============================
-def hz_to_mel(f): return 2595.0 * np.log10(1.0 + f / 700.0)
-def mel_to_hz(m): return 700.0 * (10.0**(m / 2595.0) - 1.0)
+def hz_to_mel(f):
+    return 2595.0 * np.log10(1.0 + f / 700.0)
+
+def mel_to_hz(m):
+    return 700.0 * (10.0**(m / 2595.0) - 1.0)
 
 def build_mel_filterbank(sr, nfft, n_mels, fmin=20.0, fmax=None):
     if fmax is None:
@@ -535,8 +215,10 @@ def build_mel_filterbank(sr, nfft, n_mels, fmin=20.0, fmax=None):
     fb = np.zeros((n_mels, freqs.size), dtype=np.float32)
     for m in range(1, n_mels+1):
         f_left, f_center, f_right = bins[m-1], bins[m], bins[m+1]
-        if f_center <= f_left: f_center = min(f_left + 1, freqs.size-1)
-        if f_right <= f_center: f_right = min(f_center + 1, freqs.size-1)
+        if f_center <= f_left:
+            f_center = min(f_left + 1, freqs.size-1)
+        if f_right <= f_center:
+            f_right = min(f_center + 1, freqs.size-1)
         if f_center > f_left:
             fb[m-1, f_left:f_center] = (np.arange(f_left, f_center) - f_left) / max(1, (f_center - f_left))
         if f_right > f_center:
@@ -595,17 +277,19 @@ def time_sync_over_tcp(raspberry_ip, port=TCP_TIME_PORT, samples=TIME_SYNC_SAMPL
                 mid = t0 + rtt//2
                 offset = tr_pi - mid
                 results.append((rtt, offset))
-            if not results:
-                _time_sync_ok = False
-                print("\n[WARN] Time sync TCP falhou (sem amostras validas).")
-                return False
-            rtt_min, offset_best = sorted(results, key=lambda x: x[0])[0]
+        if not results:
+            _time_sync_ok = False
+            print("\n[WARN] Time sync TCP falhou (sem amostras validas).")
+            return False
+        rtt_min, offset_best = sorted(results, key=lambda x: x[0])[0]
+        with socket.create_connection((raspberry_ip, port), timeout=1.8) as s:
+            s.settimeout(timeout)
             s.sendall(b"TS3" + int(offset_best).to_bytes(8, 'little', signed=True))
             ack = _recv_exact(s, 3 + 8)
-            ok = (ack[:3] == b"TS3" and int.from_bytes(ack[3:11], 'little', signed=True) == int(offset_best))
-            _time_sync_ok = bool(ok)
-            print(f"\n[INFO] Time sync TCP: RTT_min={rtt_min/1e6:.2f} ms, offset={offset_best/1e6:.3f} ms, ack={'OK' if ok else 'NOK'}")
-            return _time_sync_ok
+        ok = (ack[:3] == b"TS3" and int.from_bytes(ack[3:11], 'little', signed=True) == int(offset_best))
+        _time_sync_ok = bool(ok)
+        print(f"\n[INFO] Time sync TCP: RTT_min={rtt_min/1e6:.2f} ms, offset={offset_best/1e6:.3f} ms, ack={'OK' if ok else 'NOK'}")
+        return _time_sync_ok
     except Exception as e:
         _time_sync_ok = False
         print(f"\n[WARN] Time sync TCP erro: {e}")
@@ -619,7 +303,7 @@ def resync_worker(raspberry_ip, resync_interval):
         else:
             if _stop_resync.wait(RESYNC_RETRY_INTERVAL):
                 break
-            time_sync_over_tcp(raspberry_ip)
+        time_sync_over_tcp(raspberry_ip)
 
 # ============================= Estado compartilhado =============================
 class Shared:
@@ -655,7 +339,8 @@ def send_packet_a2(bands_u8, beat_flag, transition_flag, dyn_floor, kick, rpi_ip
     shared.tx_count += 1
 
 def send_cfg_b0(rpi_ip, rpi_port, bands, fps, hold_ms, vis_fps):
-    def le16(x): return [x & 0xFF, (x >> 8) & 0xFF]
+    def le16(x):
+        return [x & 0xFF, (x >> 8) & 0xFF]
     pkt = bytearray([PKT_CFG, 1])
     pkt += bytes(le16(int(bands)))
     pkt += bytes(le16(int(fps)))
@@ -670,9 +355,7 @@ def send_reset_b1(rpi_ip, rpi_port):
 app = web.Application()
 
 async def handle_root(request):
-    # charset separado (evita ValueError no aiohttp)
     return web.Response(text=HTML, content_type='text/html', charset='utf-8')
-
 app.router.add_get('/', handle_root)
 
 async def handle_status(request):
@@ -697,7 +380,6 @@ async def handle_status(request):
         "calib_eta": round(calib_eta, 2),
         "time": time.time(),
     })
-
 app.router.add_get('/api/status', handle_status)
 
 async def handle_mode(request):
@@ -723,7 +405,6 @@ async def handle_mode(request):
         ss["force_silence_once"] = True
         print("\n[SILENCIO] Forçando apagamento...")
     return web.json_response({"status": "ok"})
-
 app.router.add_post('/api/mode', handle_mode)
 
 async def handle_reset(request):
@@ -733,7 +414,6 @@ async def handle_reset(request):
         return web.json_response({"status": "ok", "sent": "B1 RESET"})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)}, status=500)
-
 app.router.add_post('/api/reset', handle_reset)
 
 async def handle_ws(request):
@@ -778,7 +458,6 @@ async def handle_ws(request):
     finally:
         print("[WS] Cliente desconectado")
     return ws
-
 app.router.add_get('/ws', handle_ws)
 
 # ============================= Util status console =============================
@@ -792,11 +471,13 @@ def print_status(shared, tag_extra: str = "", require_sync=True):
         _last_status = now
 
 # ============================= Backends de captura =============================
-def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union[str,int]],
-                        audio_cb):
+
+def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union[str,int]], audio_cb, linein_substrings: List[str]):
     """
-    Tenta abrir com python-sounddevice em WASAPI loopback (Windows).
-    Não cai em microfone (a menos que allow_mic=True com mic explicitado).
+    sounddevice/PortAudio:
+    - Windows: preferir WASAPI loopback de saídas.
+    - Linux/macOS: padrão é LINE-IN. Abrir entrada 'segura' (line-in) sem exigir --allow-mic.
+      Exigir --allow-mic somente para dispositivos que não casem com os substrings de line-in.
     """
     devs = sd.query_devices()
     system = platform.system().lower()
@@ -804,15 +485,24 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
     def is_output(i): return devs[i].get("max_output_channels",0) > 0
     def is_input(i):  return devs[i].get("max_input_channels",0)  > 0
 
-    # 1) mic explícito via mic_device
+    def is_linein_name(name: str) -> bool:
+        n = name.lower()
+        for s in linein_substrings:
+            if s and s.lower() in n:
+                return True
+        return False
+
+    # 1) mic explícito via --mic-device (neste caso assume microfone mesmo)
     if mic_device is not None:
         if not allow_mic:
             raise RuntimeError("Uso de microfone requer --allow-mic.")
         midx = resolve_device_index(mic_device)
         if midx is None or not is_input(midx):
             raise RuntimeError(f"--mic-device não encontrado ou não é entrada: {mic_device}")
-        s = sd.InputStream(channels=2, samplerate=int(devs[midx].get("default_samplerate", 44100)),
-                           dtype='float32', blocksize=BLOCK_SIZE, device=midx, callback=audio_cb)
+        s = sd.InputStream(channels=2,
+                           samplerate=int(devs[midx].get("default_samplerate", 44100)),
+                           dtype='float32', blocksize=BLOCK_SIZE,
+                           device=midx, callback=audio_cb)
         return s, int(s.samplerate), int(s.channels), f"(INPUT mic): '{devs[midx]['name']}'", False
 
     # 2) --device informado
@@ -822,73 +512,103 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
             raise RuntimeError(f"--device '{override}' não encontrado.")
         d = devs[idx]
         if is_output(idx) and system.startswith("win"):
-            # tentar loopback
+            # tentar loopback no Windows
             try:
-                extra = sd.WasapiSettings(loopback=True)  # requer PortAudio com WASAPI loopback
+                extra = sd.WasapiSettings(loopback=True)
                 s = sd.InputStream(samplerate=int(d.get("default_samplerate", 44100)),
                                    channels=max(1, int(d.get("max_output_channels", 2))),
-                                   dtype='float32', blocksize=BLOCK_SIZE, device=idx,
-                                   callback=audio_cb, latency='low', extra_settings=extra)
+                                   dtype='float32', blocksize=BLOCK_SIZE,
+                                   device=idx, callback=audio_cb, latency='low',
+                                   extra_settings=extra)
                 return s, int(s.samplerate), int(s.channels), f"(WASAPI loopback): '{d['name']}'", True
             except Exception as e:
-                raise RuntimeError(f"O dispositivo '{d['name']}' não abriu em loopback (SD): {e}")  # [6](https://github.com/spatialaudio/portaudio-binaries/issues/6)
+                raise RuntimeError(f"O dispositivo '{d['name']}' não abriu em loopback (SD): {e}")
+        # Entrada: aceitar se for line-in "seguro" ou se --allow-mic foi dado
         if is_input(idx):
-            if not allow_mic:
-                raise RuntimeError("Dispositivo de entrada só é permitido com --allow-mic.")
+            if not (is_linein_name(d['name']) or allow_mic):
+                raise RuntimeError("Dispositivo de entrada parece ser microfone. Use --allow-mic para permitir.")
             s = sd.InputStream(samplerate=int(d.get("default_samplerate", 44100)),
                                channels=max(1, int(d.get("max_input_channels",2))),
-                               dtype='float32', blocksize=BLOCK_SIZE, device=idx, callback=audio_cb)
-            return s, int(s.samplerate), int(s.channels), f"(INPUT mic via --device): '{d['name']}'", False
+                               dtype='float32', blocksize=BLOCK_SIZE,
+                               device=idx, callback=audio_cb)
+            return s, int(s.samplerate), int(s.channels), f"(INPUT via --device): '{d['name']}'", False
         raise RuntimeError(f"Dispositivo '{d['name']}' não é válido para captura.")
 
-    # 3) Autodetectar WASAPI loopback
+    # 3) Autodetectar WASAPI loopback (Windows)
     if system.startswith("win"):
-        cands = []
         for i in auto_candidate_outputs():
-            if not is_output(i): continue
+            if not is_output(i):
+                continue
             d = devs[i]
             try:
                 extra = sd.WasapiSettings(loopback=True)
                 s = sd.InputStream(samplerate=int(d.get("default_samplerate", 44100)),
                                    channels=max(1, int(d.get("max_output_channels", 2))),
-                                   dtype='float32', blocksize=BLOCK_SIZE, device=i,
-                                   callback=audio_cb, latency='low', extra_settings=extra)
+                                   dtype='float32', blocksize=BLOCK_SIZE,
+                                   device=i, callback=audio_cb, latency='low',
+                                   extra_settings=extra)
                 return s, int(s.samplerate), int(s.channels), f"(WASAPI loopback): '{d['name']}'", True
             except Exception:
                 continue
-        raise RuntimeError("Nenhuma saída com WASAPI loopback disponível para o sounddevice.")  # [6](https://github.com/spatialaudio/portaudio-binaries/issues/6)
+        raise RuntimeError("Nenhuma saída com WASAPI loopback disponível para o sounddevice.")
 
-    # Outras plataformas: exigir mic explícito
-    raise RuntimeError("Sem loopback nesta plataforma via sounddevice; use --allow-mic e --mic-device.")
+    # 4) Linux/macOS: AUTO entrada (padrão LINE-IN). Procurar nomes line-in preferidos
+    # Tentar priorizar ICUSBAUDIO7D e similares
+    preferred = None
+    for i, d in enumerate(devs):
+        if is_input(i) and is_linein_name(d['name']):
+            preferred = i
+            break
+    # Se não achar, usar default input ou primeiro input
+    target = preferred
+    if target is None:
+        di = sd.default.device[0]
+        if isinstance(di, int) and di >= 0 and is_input(di):
+            target = di
+    if target is None:
+        for i, d in enumerate(devs):
+            if is_input(i):
+                # Se parecer microfone e não temos --allow-mic, tente achar outro input
+                if not allow_mic and not is_linein_name(d['name']):
+                    continue
+                target = i
+                break
+    if target is None:
+        raise RuntimeError("Nenhum dispositivo de entrada disponível para captura.")
+    d = devs[target]
+    s = sd.InputStream(samplerate=int(d.get("default_samplerate", 44100)),
+                       channels=max(1, int(d.get("max_input_channels",2))),
+                       dtype='float32', blocksize=BLOCK_SIZE,
+                       device=target, callback=audio_cb)
+    return s, int(s.samplerate), int(s.channels), f"(INPUT auto): '{d['name']}'", False
+
 
 def _paw_choose_and_open(allow_mic: bool, mic_device: Optional[str], audio_cb):
     """
-    PyAudio (preferindo PyAudioWPatch). Abre WASAPI loopback do default output.
-    Cai em mic apenas se allow_mic=True e mic explicitado.
+    PyAudio (preferindo PyAudioWPatch). No Linux, abre entrada somente se permitido (line-in ou allow_mic).
+    No Windows, tenta WASAPI loopback via PyAudioWPatch.
     """
     if _PAW is None and _PA is None:
-        raise RuntimeError("PyAudioWPatch/PyAudio não encontrado. Instale com: pip install PyAudioWPatch")  # [2](https://pypi.org/project/PyAudioWPatch/)
-
+        raise RuntimeError("PyAudioWPatch/PyAudio não encontrado. Instale com: pip install PyAudioWPatch ou PyAudio")
     pmod = _PAW or _PA
     pinst = pmod.PyAudio()
 
-    # Mic explícito?
+    # Mic explícito
     if mic_device:
         if not allow_mic:
+            pinst.terminate()
             raise RuntimeError("Uso de microfone requer --allow-mic.")
-        # localizar mic por nome
         target_idx = None
         for i in range(pinst.get_device_count()):
             info = pinst.get_device_info_by_index(i)
-            if mic_device.lower() in info.get("name","").lower() and info.get("maxInputChannels",0) > 0:
+            if mic_device.lower() in info.get("name"," ").lower() and info.get("maxInputChannels",0) > 0:
                 target_idx = i; break
         if target_idx is None:
             pinst.terminate()
             raise RuntimeError(f"--mic-device '{mic_device}' não encontrado no PyAudio.")
         info = pinst.get_device_info_by_index(target_idx)
         rate = int(info.get("defaultSampleRate", 44100))
-        ch   = max(1, int(info.get("maxInputChannels", 1)))
-        # callback pyaudio -> numpy
+        ch = max(1, int(info.get("maxInputChannels", 1)))
         def _py_cb(in_data, frame_count, time_info, status):
             try:
                 block = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
@@ -898,29 +618,27 @@ def _paw_choose_and_open(allow_mic: bool, mic_device: Optional[str], audio_cb):
             except Exception:
                 pass
             return (None, pmod.paContinue)
-        stream = pinst.open(format=pmod.paInt16, channels=ch, rate=rate,
-                            input=True, input_device_index=target_idx,
-                            frames_per_buffer=BLOCK_SIZE, stream_callback=_py_cb)
+        stream = pinst.open(format=pmod.paInt16, channels=ch, rate=rate, input=True,
+                            input_device_index=target_idx, frames_per_buffer=BLOCK_SIZE,
+                            stream_callback=_py_cb)
         return ("PyAudio (mic)", pinst, stream, rate, ch)
 
-    # WASAPI loopback (preferido no PyAudioWPatch)
+    # WASAPI loopback via PyAudioWPatch (Windows)
     try:
-        if _PAW is not None:
-            # Default speakers loopback
+        if _PAW is not None and platform.system().lower().startswith('win'):
             wasapi = pinst.get_host_api_info_by_type(pmod.paWASAPI)
             spk = pinst.get_device_info_by_index(wasapi["defaultOutputDevice"])
             if not spk.get("isLoopbackDevice", False):
-                # localizar o análogo loopback
                 found = None
                 for lb in pinst.get_loopback_device_info_generator():
                     if spk["name"] in lb["name"]:
                         found = lb; break
                 if found is None:
+                    pinst.terminate()
                     raise RuntimeError("Loopback padrão não encontrado no PyAudioWPatch.")
                 spk = found
             rate = int(spk["defaultSampleRate"])
-            ch   = max(1, int(spk["maxInputChannels"]))
-
+            ch = max(1, int(spk["maxInputChannels"]))
             def _py_cb(in_data, frame_count, time_info, status):
                 try:
                     block = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
@@ -930,55 +648,56 @@ def _paw_choose_and_open(allow_mic: bool, mic_device: Optional[str], audio_cb):
                 except Exception:
                     pass
                 return (None, pmod.paContinue)
+            stream = pinst.open(format=pmod.paInt16, channels=ch, rate=rate, input=True,
+                                input_device_index=spk["index"], frames_per_buffer=BLOCK_SIZE,
+                                stream_callback=_py_cb)
+            return ("PyAudioWPatch (WASAPI loopback)", pinst, stream, rate, ch)
+    except Exception:
+        pass
 
-            stream = pinst.open(format=pmod.paInt16, channels=ch, rate=rate,
-                                input=True, input_device_index=spk["index"],
-                                frames_per_buffer=BLOCK_SIZE, stream_callback=_py_cb)
-            return ("PyAudioWPatch (WASAPI loopback)", pinst, stream, rate, ch)  # [7](https://github.com/s0d3s/PyAudioWPatch/blob/master/examples/pawp_record_wasapi_loopback.py)[2](https://pypi.org/project/PyAudioWPatch/)
-        else:
-            # PyAudio oficial: tentar achar dispositivos "[Loopback]" (se a build expõe)
-            loop_idx = None; rate=48000; ch=2
-            for i in range(pinst.get_device_count()):
-                info = pinst.get_device_info_by_index(i)
-                nm = info.get("name","")
-                if "loopback" in nm.lower() and info.get("maxInputChannels",0)>0:
-                    loop_idx=i; rate=int(info.get("defaultSampleRate",48000)); ch=int(info.get("maxInputChannels",2)); break
-            if loop_idx is None:
-                pinst.terminate()
-                raise RuntimeError("PyAudio não expõe loopback nesta build. Instale PyAudioWPatch.")
-            def _py_cb(in_data, frame_count, time_info, status):
-                try:
-                    block = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
-                    if ch > 1:
-                        block = block.reshape(-1, ch).mean(axis=1)
-                    audio_cb(block, frame_count, time_info, status)
-                except Exception:
-                    pass
-                return (None, pmod.paContinue)
-            stream = pinst.open(format=pmod.paInt16, channels=ch, rate=rate,
-                                input=True, input_device_index=loop_idx,
-                                frames_per_buffer=BLOCK_SIZE, stream_callback=_py_cb)
-            return ("PyAudio (loopback exposto)", pinst, stream, rate, ch)  # [5](https://pypi.org/project/PyAudio/)
-    except Exception as e:
+    # PyAudio oficial: tentar dispositivo de entrada default
+    # (neste caminho não distinguimos mic/line-in — deixar o usuário habilitar explicitamente via --backend pyaudio)
+    target_idx = None
+    for i in range(pinst.get_device_count()):
+        info = pinst.get_device_info_by_index(i)
+        if info.get("maxInputChannels",0) > 0:
+            target_idx = i; break
+    if target_idx is None:
         pinst.terminate()
-        raise
+        raise RuntimeError("PyAudio: nenhum dispositivo de entrada disponível.")
+    info = pinst.get_device_info_by_index(target_idx)
+    rate = int(info.get("defaultSampleRate", 44100))
+    ch = max(1, int(info.get("maxInputChannels", 1)))
+    def _py_cb(in_data, frame_count, time_info, status):
+        try:
+            block = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
+            if ch > 1:
+                block = block.reshape(-1, ch).mean(axis=1)
+            audio_cb(block, frame_count, time_info, status)
+        except Exception:
+            pass
+        return (None, pmod.paContinue)
+    stream = pinst.open(format=pmod.paInt16, channels=ch, rate=rate, input=True,
+                        input_device_index=target_idx, frames_per_buffer=BLOCK_SIZE,
+                        stream_callback=_py_cb)
+    return ("PyAudio (input)", pinst, stream, rate, ch)
 
 # ============================= Main =============================
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bind', type=str, default='0.0.0.0')
     parser.add_argument('--port', type=int, default=8000)
     parser.add_argument('--backend', type=str, choices=['auto','sd','pyaudio'], default='auto',
                         help='Escolhe backend de captura: auto (padrão), sd (sounddevice), pyaudio')
-    parser.add_argument('--no-pyaudio-fallback', action='store_true',
-                        help='Desativa fallback para PyAudio quando sounddevice falhar.')
+    parser.add_argument('--no-pyaudio-fallback', action='store_true', help='Desativa fallback para PyAudio quando sounddevice falhar.')
     parser.add_argument('--device', type=str, default=None)
-    parser.add_argument('--usb-linein', action='store_true', help='Força usar primeiro dispositivo com entrada (PipeWire/Linux)')
-    parser.add_argument('--device-index', type=int, default=None, help='Seleciona dispositivo pelo índice (veja lista)')
-    parser.add_argument('--allow-mic', action='store_true',
-                        help='Permite capturar microfone quando explicitamente solicitado (nunca usado por padrão).')
-    parser.add_argument('--mic-device', type=str, default=None,
-                        help='Seleciona o microfone a ser usado (requer --allow-mic).')
+    parser.add_argument('--allow-mic', action='store_true', help='Permite capturar microfone quando explicitamente solicitado. No Linux o padrão é LINE-IN (sem --allow-mic).')
+    parser.add_argument('--mic-device', type=str, default=None, help='Seleciona o microfone a ser usado (requer --allow-mic).')
+    parser.add_argument('--linein-substr', type=str, default='ICUSBAUDIO7D,USB Audio,CM6206,CM106',
+                        help='Substrings separadas por vírgula que identificam dispositivos LINE-IN seguros no Linux/macOS (padrão inclui ICUSBAUDIO7D).')
+    parser.add_argument('--list-devices', action='store_true', help='Lista dispositivos PortAudio e sai.')
+
     parser.add_argument('--raspberry-ip', type=str, default=RASPBERRY_IP)
     parser.add_argument('--udp-port', type=int, default=UDP_PORT)
     parser.add_argument('--bands', type=int, default=DEFAULT_NUM_BANDS)
@@ -1011,6 +730,12 @@ def main():
     parser.add_argument('--min-band', type=int, default=0, help='Valor mínimo (0..255) por banda após subtração')
 
     args = parser.parse_args()
+
+    if args.list_devices:
+        devs = sd.query_devices()
+        for i, d in enumerate(devs):
+            print(f"{i:3d}  {d['name']}  in={d.get('max_input_channels',0)}  out={d.get('max_output_channels',0)}  sr={d.get('default_samplerate')}")
+        return
 
     # Guardar cfg
     app["cfg"] = {"rpi_ip": args.raspberry_ip, "rpi_port": args.udp_port}
@@ -1076,18 +801,17 @@ def main():
     # ---- Preparar LOG ou MEL ----
     scale_mode = args.scale.lower()
     peak_ema_alpha = float(args.norm_peak_ema)
-
     compute_bands = None
+
     if scale_mode == 'mel':
         mel_bands = int(args.mel_bands or n_bands)
-        # sr real será conhecido após abrir stream -> reconfiguramos depois se necessário
         compute_bands_builder = ("mel", mel_bands)
         shared.bands = np.zeros(mel_bands, dtype=np.uint8)
     else:
         compute_bands_builder = ("log", n_bands)
         shared.bands = np.zeros(n_bands, dtype=np.uint8)
 
-    # ---- callback comum (recebe bloco float32 mono 0..1/±1) ----
+    # ---- callback comum ----
     energy_buf = np.zeros(ENERGY_BUFFER_SIZE, dtype=np.float32)
     energy_idx = 0
     energy_count = 0
@@ -1096,14 +820,13 @@ def main():
     def make_audio_cb():
         nonlocal compute_bands, energy_idx, energy_count, last_energy
         def audio_cb(block, frames, time_info, status):
-            # block: np.float32 mono (tam variável). Normalizamos para BLOCK_SIZE
+            # block: np.float32 mono
             b = block
             if b.shape[0] < BLOCK_SIZE:
                 b = np.pad(b, (0, BLOCK_SIZE - b.shape[0]), 'constant')
             bands = compute_bands(b[:BLOCK_SIZE]) if compute_bands is not None else None
             if bands is None:
                 return
-            # atualizar shared
             app["shared"].bands = bands
             avg = float(np.mean(bands))
             rms = float(np.sqrt(np.mean((b[:BLOCK_SIZE]*b[:BLOCK_SIZE])) + 1e-12))
@@ -1112,13 +835,13 @@ def main():
             app["shared"].last_update = time.time()
             # beat simples
             lb = bands[:max(8, len(bands)//12)]
-            energy = float(np.mean(lb)) / 255.0 if lb.size>0 else 0.0
+            energy = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
             energy_buf[energy_idx] = energy
             energy_idx = (energy_idx + 1) % ENERGY_BUFFER_SIZE
             energy_count = min(energy_count + 1, ENERGY_BUFFER_SIZE)
             buf_view = energy_buf if energy_count == ENERGY_BUFFER_SIZE else energy_buf[:energy_count]
-            avg_energy = float(np.mean(buf_view)) if energy_count > 0 else 0.0
-            std_energy = float(np.std(buf_view)) if energy_count > 1 else 0.0
+            avg_energy = float(np.mean(buf_view)) if energy_count>0 else 0.0
+            std_energy = float(np.std(buf_view)) if energy_count>1 else 0.0
             dyn_thr = avg_energy + BEAT_THRESHOLD * std_energy
             is_peak_now = (energy >= max(dyn_thr, BEAT_HEIGHT_MIN)) and (energy >= last_energy)
             app["shared"].beat = 1 if is_peak_now else 0
@@ -1128,7 +851,7 @@ def main():
     # ---- abrir backend ----
     backend_used = None
     stream = None
-    pa_instance = None  # caso PyAudio
+    pa_instance = None
 
     def _build_compute(sr):
         nonlocal compute_bands, shared
@@ -1150,69 +873,32 @@ def main():
             compute_bands = make_compute_bands_log(sr, BLOCK_SIZE, NFFT, a_idx, b_idx, EMA_ALPHA, peak_ema_alpha)
             shared.bands = np.zeros(n_b, dtype=np.uint8)
 
-    
-    # Listar dispositivos disponíveis
-    print("[INFO] Dispositivos disponíveis (sounddevice):")
-    devs = sd.query_devices()
-    for i, d in enumerate(devs):
-        print(f"  {i}: {d.get('name')} (in={d.get('max_input_channels',0)}, out={d.get('max_output_channels',0)})")
-
-    # Se --device-index foi informado
-    if args.device_index is not None:
-        if 0 <= args.device_index < len(devs):
-            print(f"[INFO] Usando índice {args.device_index}: {devs[args.device_index]['name']}")
-            audio_cb = make_audio_cb()
-            s = sd.InputStream(channels=max(1, int(devs[args.device_index].get('max_input_channels', 1))),
-                               samplerate=int(devs[args.device_index].get('default_samplerate', 44100)),
-                               dtype='float32', blocksize=BLOCK_SIZE, device=args.device_index,
-                               callback=lambda b, *_: audio_cb(b.astype(np.float32)))
-            _build_compute(int(devs[args.device_index].get('default_samplerate', 44100)))
-            stream = s; stream.start()
-            shared.samplerate = int(devs[args.device_index].get('default_samplerate', 44100))
-            shared.channels = int(devs[args.device_index].get('max_input_channels', 1))
-            backend_used = f"sounddevice (índice {args.device_index}): '{devs[args.device_index]['name']}'"
-        else:
-            print(f"[FATAL] Índice inválido: {args.device_index}"); sys.exit(1)
-
-    # Se --usb-linein foi informado e nenhum índice foi passado
-    elif args.usb_linein:
-        usb_idx = None
-        # Preferir dispositivos com 'USB' no nome
-        for i, d in enumerate(devs):
-            if d.get('max_input_channels',0) > 0 and 'usb' in d.get('name','').lower():
-                usb_idx = i; break
-        # Se não achou por nome, pegar primeiro com entrada
-        if usb_idx is None:
-            for i, d in enumerate(devs):
-                if d.get('max_input_channels',0) > 0:
-                    usb_idx = i; break
-        if usb_idx is not None:
-            print(f"[INFO] Usando dispositivo com entrada: {devs[usb_idx]['name']} (índice {usb_idx})")
-            audio_cb = make_audio_cb()
-            s = sd.InputStream(channels=max(1, int(devs[usb_idx].get('max_input_channels', 1))),
-                               samplerate=int(devs[usb_idx].get('default_samplerate', 44100)),
-                               dtype='float32', blocksize=BLOCK_SIZE, device=usb_idx,
-                               callback=lambda b, *_: audio_cb(b.astype(np.float32)))
-            _build_compute(int(devs[usb_idx].get('default_samplerate', 44100)))
-            stream = s; stream.start()
-            shared.samplerate = int(devs[usb_idx].get('default_samplerate', 44100))
-            shared.channels = int(devs[usb_idx].get('max_input_channels', 1))
-            backend_used = f"sounddevice (usb-linein): '{devs[usb_idx]['name']}'"
-        else:
-            print("[FATAL] Nenhum dispositivo com entrada encontrado."); sys.exit(1)
+    # Lista de substrings que caracterizam LINE-IN seguro no Linux/macOS
+    linein_substrings = [s.strip() for s in (args.linein_substr or '').split(',') if s.strip()]
 
     # tentativa 1: sounddevice (se backend=auto ou sd)
     if args.backend in ("auto","sd"):
         try:
             audio_cb = make_audio_cb()
-            s, sr_eff, ch_eff, desc, is_loop = _sd_choose_and_open(args.device, allow_mic=args.allow_mic,
-                                                                    mic_device=args.mic_device, audio_cb=lambda b, *_: audio_cb(b.astype(np.float32)))
+            s, sr_eff, ch_eff, desc, is_loop = _sd_choose_and_open(
+                args.device, allow_mic=args.allow_mic, mic_device=args.mic_device,
+                audio_cb=lambda b, *_: audio_cb(b.astype(np.float32)),
+                linein_substrings=linein_substrings
+            )
             _build_compute(sr_eff)
             stream = s
             stream.start()
             shared.samplerate = sr_eff
-            shared.channels   = ch_eff
+            shared.channels = ch_eff
+            # Log detalhado
+            try:
+                dev_info = sd.query_devices(resolve_device_index(args.device) if args.device is not None else stream.device)
+                sr_def = dev_info.get("default_samplerate", sr_eff)
+                name = dev_info.get("name", desc)
+            except Exception:
+                sr_def = sr_eff; name = desc
             backend_used = f"sounddevice {desc}"
+            print(f"\n[AUDIO] Dispositivo: {name} | SR(default)={sr_def} | SR(abrido)={sr_eff} | CH={ch_eff}")
         except Exception as e_sd:
             if args.backend == "sd" or args.no_pyaudio_fallback:
                 print(f"\n[FATAL] sounddevice falhou: {e_sd}")
@@ -1229,12 +915,10 @@ def main():
             pa_stream.start_stream()
             stream = pa_stream
             shared.samplerate = sr_eff
-            shared.channels   = ch_eff
+            shared.channels = ch_eff
             backend_used = tag
-            # dica: `PyAudioWPatch` disponibiliza devices loopback e helpers dedicados
-            # (ex.: get_loopback_device_info_generator)  [2](https://pypi.org/project/PyAudioWPatch/)[7](https://github.com/s0d3s/PyAudioWPatch/blob/master/examples/pawp_record_wasapi_loopback.py)
         except Exception as e_pa:
-            print(f"\n[FATAL] PyAudio falhou: {e_pa}\nDica: instale PyAudioWPatch: pip install PyAudioWPatch")
+            print(f"\n[FATAL] PyAudio falhou: {e_pa}\nDica: instale PyAudioWPatch (Windows) ou habilite sounddevice no Linux.")
             sys.exit(1)
 
     if stream is None:
@@ -1259,12 +943,11 @@ def main():
     print(f"[INFO] Capturando de: {backend_used}")
     print("[PRONTO] Monitor online - abra o navegador.")
 
-    # --- Loop principal (idêntico ao anterior; gate + envio) ---
+    # ---- Loop principal (gate + envio) ----
     rms_med = deque(maxlen=7)
     avg_med = deque(maxlen=7)
     last_tick = 0.0
     silence_since = None
-
     hist_avg: Deque[Tuple[float,float]] = deque()
     hist_rms: Deque[Tuple[float,float]] = deque()
     last_auto_update = 0.0
@@ -1292,14 +975,12 @@ def main():
 
             ss = app["server_state"]
             scfg = app["server_cfg"]
-
             if 'avg_ema_val' not in ss:
                 ss['avg_ema_val'] = avg_filtered
                 ss['rms_ema_val'] = rms_filtered
             else:
                 ss['avg_ema_val'] = ss['avg_ema_val']*(1.0-ss['avg_ema']) + ss['avg_ema']*avg_filtered
                 ss['rms_ema_val'] = ss['rms_ema_val']*(1.0-ss['rms_ema']) + ss['rms_ema']*rms_filtered
-
             avg_ema = ss['avg_ema_val']; rms_ema = ss['rms_ema_val']
 
             hist_avg.append((now, avg_filtered))
@@ -1322,7 +1003,6 @@ def main():
                 ss["silence_bands"] = th_avg
                 ss["silence_rms"] = th_rms
                 ss["resume_factor"] = resume_factor
-
                 if scfg["noise_profile_enabled"] and ss.get("noise_profile_frames"):
                     stack = np.stack(ss["noise_profile_frames"], axis=0).astype(np.float32)
                     p90 = np.percentile(stack, 90, axis=0).astype(np.float32)
@@ -1337,7 +1017,6 @@ def main():
                         print(f"[NOISE] Perfil salvo em {prof_path}")
                     except Exception as e:
                         print(f"[WARN] Falha ao salvar perfil: {e}")
-
                 ss["last_calib"] = {
                     "t": time.time(),
                     "th_avg": float(th_avg),
@@ -1402,14 +1081,12 @@ def main():
                         lb = bands_now[:max(8, len(bands_now)//12)]
                         energy_norm = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
                         kick_val = 220 if beat else int(max(0, min(255, round(energy_norm*255.0))))
-
                         b_send = bands_now
                         if app["server_cfg"]["noise_profile_enabled"] and ss.get("noise_profile") is not None:
                             prof = ss["noise_profile"] * float(app["server_cfg"]["noise_headroom"])
                             b_send = np.clip(bands_now.astype(np.float32) - prof, 0, 255).astype(np.uint8)
                         if app["server_cfg"]["min_band"] > 0:
                             b_send = np.maximum(b_send, app["server_cfg"]["min_band"]).astype(np.uint8)
-
                         if args.pkt=='a2':
                             send_packet_a2(b_send, beat, 1, dyn_floor, kick_val, args.raspberry_ip, args.udp_port, shared)
                         else:
@@ -1433,14 +1110,12 @@ def main():
             lb = bands_now[:max(8, len(bands_now)//12)]
             energy_norm = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
             kick_val = 220 if beat else int(max(0, min(255, round(energy_norm*255.0))))
-
             b_send = bands_now
             if app["server_cfg"]["noise_profile_enabled"] and ss.get("noise_profile") is not None:
                 prof = ss["noise_profile"] * float(app["server_cfg"]["noise_headroom"])
                 b_send = np.clip(bands_now.astype(np.float32) - prof, 0, 255).astype(np.uint8)
             if app["server_cfg"]["min_band"] > 0:
                 b_send = np.maximum(b_send, app["server_cfg"]["min_band"]).astype(np.uint8)
-
             if args.pkt=='a2':
                 send_packet_a2(b_send, beat, 0, dyn_floor, kick_val, args.raspberry_ip, args.udp_port, shared)
             else:
@@ -1453,27 +1128,32 @@ def main():
         _stop_resync.set()
         try:
             if pa_instance is not None:
-                # PyAudio
                 try:
-                    if stream.is_active(): stream.stop_stream()
-                except Exception: pass
+                    if stream.is_active():
+                        stream.stop_stream()
+                except Exception:
+                    pass
                 try:
                     stream.close()
-                except Exception: pass
+                except Exception:
+                    pass
                 try:
                     pa_instance.terminate()
-                except Exception: pass
+                except Exception:
+                    pass
             else:
-                # sounddevice
                 try:
                     stream.stop()
-                except Exception: pass
+                except Exception:
+                    pass
                 try:
                     stream.close()
-                except Exception: pass
+                except Exception:
+                    pass
         except Exception:
             pass
         sys.stdout.write("\n"); sys.stdout.flush()
+
 
 if __name__ == '__main__':
     main()
