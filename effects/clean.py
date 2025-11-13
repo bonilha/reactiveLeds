@@ -878,4 +878,222 @@ def effect_wavelength_reactive(ctx, bands_u8, beat_flag, active):
     # ---------------- 7) Envio (cap global ainda protege) ----------------
     ctx.to_pixels_and_show(rgb)
 
+# ==== STROBE REACTIVE — FAST/AGGRESSIVE (reatividade alta com consumo controlado) ====
+def effect_strobe_reactive(ctx, bands_u8, beat_flag, active):
+    """
+    Strobe 1D super reativo para música:
+      - Dispara no beat e em transientes (ataque entre envelopes rápido/lento)
+      - Listras alternadas (par/ímpar) por flash para reduzir corrente instantânea
+      - Leito (bed) baixo e tintado pela paleta para ocupar a fita sempre
+      - AGC pré-cap rápido para manter folga antes do cap global
+
+    Knobs principais (ajuste fino rápido):
+      ON_BASE, ON_E, ON_L, ON_T, ON_BEAT  -> duração do flash (em frames)
+      V_BASE, V_E, V_L, V_T, V_BEAT       -> brilho do flash
+      BED_E, BED_L                        -> brilho médio do leito
+      WHITE_MIX_BASE, WHITE_MIX_T, WHITE_MIX_BEAT -> quanto "branqueia" o flash
+      STRIPES                             -> 2 = par/ímpar; 3 = 1/3 dos LEDs por flash
+      F_TARGET                            -> fração de orçamento alvo do AGC pré-cap (0.0–1.0)
+    """
+    import numpy as np
+
+    L = ctx.LED_COUNT
+    n = int(len(bands_u8))
+    if L == 0 or n == 0:
+        ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.uint8))
+        return
+
+    # -------------------- Knobs --------------------
+    # Duração do flash (frames on)
+    ON_BASE, ON_E, ON_L, ON_T, ON_BEAT = 1.0, 1.4, 2.0, 2.8, 2.5
+    # Brilho do flash
+    V_BASE, V_E, V_L, V_T, V_BEAT = 90.0, 120.0, 140.0, 180.0, 110.0
+    # Brilho do "leito" (bed) — mantém a fita ocupada
+    BED_E, BED_L = 12.0, 10.0
+    # Mistura de branco no flash (0..1)
+    WHITE_MIX_BASE, WHITE_MIX_T, WHITE_MIX_BEAT = 0.28, 0.40, 0.22
+    # Quantas faixas por flash (2 = par/ímpar; 3 = 1/3)
+    STRIPES = 2
+    # Folga alvo do AGC pré-cap: menor = mais folga (menos brilho médio)
+    F_TARGET = 0.80
+
+    # -------------------- 1) Métricas de áudio --------------------
+    x = np.asarray(bands_u8, dtype=np.float32)  # 0..255
+    f = np.arange(n, dtype=np.float32) / max(1, n - 1)
+    w = 1.40 - 0.50 * (f ** 0.8)      # ênfase pró-grave
+    xw = x * w
+    xw *= (np.mean(x) + 1e-6) / (np.mean(xw) + 1e-6)
+
+    energy = np.clip(float(np.mean(xw)) / 255.0, 0.0, 1.0)
+    low_n = max(8, n // 6)
+    low_energy = np.clip(float(np.mean(xw[:low_n])) / 255.0, 0.0, 1.0)
+
+    # Envelopes p/ transiente
+    if not hasattr(ctx, "_stb_e_fast"):
+        ctx._stb_e_fast = energy
+    if not hasattr(ctx, "_stb_e_slow"):
+        ctx._stb_e_slow = energy
+    ctx._stb_e_fast = 0.55 * ctx._stb_e_fast + 0.45 * energy
+    ctx._stb_e_slow = 0.88 * ctx._stb_e_slow + 0.12 * energy
+    trans = max(0.0, ctx._stb_e_fast - ctx._stb_e_slow)  # 0..1
+
+    # Centroide (opcional para cor/variação de fase da paleta)
+    s = float(np.sum(xw)) + 1e-6
+    centroid = (float(np.sum(np.arange(n, dtype=np.float32) * xw)) / s) / max(1.0, n - 1.0)  # 0..1
+
+    # -------------------- 2) Estado do strobe --------------------
+    if not hasattr(ctx, "_stb_on_left"):
+        ctx._stb_on_left = 0.0
+    if not hasattr(ctx, "_stb_cool"):
+        ctx._stb_cool = 0.0
+    if not hasattr(ctx, "_stb_on_total"):
+        ctx._stb_on_total = 1.0
+    if not hasattr(ctx, "_stb_phase"):
+        ctx._stb_phase = 0  # alterna as listras
+    if not hasattr(ctx, "_stb_agc_ema"):
+        ctx._stb_agc_ema = 1.0
+
+    # Critérios de disparo: beat OU transiente forte OU grave alto
+    trans_thr = 0.08
+    grave_thr = 0.35
+    trigger = False
+    if ctx._stb_cool <= 0.0:
+        if beat_flag or trans > trans_thr or (low_energy > grave_thr and trans > 0.03):
+            trigger = True
+
+    # Quando dispara, define frames ON e cooldown
+    if trigger:
+        on_frames = (
+            ON_BASE
+            + ON_E * energy
+            + ON_L * low_energy
+            + ON_T * trans
+            + (ON_BEAT if beat_flag else 0.0)
+        )
+        on_frames = max(1.0, min(on_frames, 8.0))  # guarda-chuva
+        ctx._stb_on_left = on_frames
+        ctx._stb_on_total = on_frames
+        # cooldown mínimo para evitar flicker excessivo
+        ctx._stb_cool = max(2.0, 2.0 + 6.0 * energy)
+        # alterna padrão de listras para dividir corrente entre frames
+        ctx._stb_phase = (ctx._stb_phase + 1) % STRIPES
+
+    # -------------------- 3) Composição de Value (v_pre) --------------------
+    # Leito (sempre presente, baixo)
+    t = ctx.I_ALL.astype(np.float32) / max(1.0, float(L - 1))
+    bed_level = BED_E * (energy ** 0.7) + BED_L * (low_energy ** 0.9)
+    bed = np.full(L, bed_level, dtype=np.float32)
+
+    # Flash (apenas se on_left > 0)
+    v_pre = bed.copy()
+    if ctx._stb_on_left > 0.0:
+        # Decaimento ao longo do flash: mais forte no início
+        prog = 1.0 - (ctx._stb_on_left - 1.0) / max(1.0, ctx._stb_on_total)
+        decay = 0.85 + 0.15 * prog  # 0.85→1.0
+        v_on = (
+            V_BASE
+            + V_E * energy
+            + V_L * low_energy
+            + V_T * trans
+            + (V_BEAT if beat_flag else 0.0)
+        ) * decay
+        v_on = np.clip(v_on, 0.0, 255.0)
+
+        # Máscara de listras: reduz corrente instantânea
+        if STRIPES <= 1:
+            mask = np.ones(L, dtype=bool)
+        else:
+            mask = (ctx.I_ALL % STRIPES) == ctx._stb_phase
+
+        # Eleva somente nos LEDs da máscara
+        v_pre[mask] = np.maximum(v_pre[mask], v_on)
+
+        # Anda o relógio do flash
+        ctx._stb_on_left = max(0.0, ctx._stb_on_left - 1.0)
+    else:
+        # nenhum flash neste frame
+        pass
+
+    # Cooldown desce
+    ctx._stb_cool = max(0.0, ctx._stb_cool - 1.0)
+
+    # -------------------- 4) AGC PRÉ-CAP (rápido) --------------------
+    ma_per_ch = float(ctx.WS2812B_MA_PER_CHANNEL)
+    idle_ma   = float(ctx.WS2812B_IDLE_MA_PER_LED) * float(L)
+    budget_ma = float(ctx.CURRENT_BUDGET_A) * 1000.0
+    target_ma = max(0.0, (budget_ma - idle_ma) * float(F_TARGET))
+
+    i_color_ma = (ma_per_ch / 255.0) * float(np.sum(np.clip(v_pre, 0.0, 255.0))) * 3.0
+    pre_scale_raw = 1.0 if i_color_ma <= 1e-6 else min(1.0, target_ma / i_color_ma)
+    # EMA mais agressivo (50/50) para seguir flashes
+    ctx._stb_agc_ema = 0.50 * ctx._stb_agc_ema + 0.50 * pre_scale_raw
+    pre_scale = min(pre_scale_raw, ctx._stb_agc_ema)
+
+    # Se o cap global já está atuando, reduz mais o leito (não o pico do flash)
+    last_cap = float(ctx.last_cap_scale or 1.0) if hasattr(ctx, "last_cap_scale") else 1.0
+    bed_scale_extra = 1.0 if last_cap >= 0.95 else (0.88 + 0.12 * last_cap)  # 0.88..1.0
+
+    # Aplica pré-escala diferenciada: bed mais cortado, flash menos
+    if ctx._stb_on_left > 0.0:
+        # como não sabemos exatamente quais LEDs estão em flash agora, aproximamos:
+        # priorizamos preservar ~85% do nível acima do bed
+        v = bed * (pre_scale * bed_scale_extra) + np.maximum(0.0, v_pre - bed) * (0.85 * pre_scale + 0.15)
+    else:
+        v = v_pre * (pre_scale * bed_scale_extra)
+
+    v = np.clip(v, 0.0, 255.0).astype(np.uint8)
+    v = ctx.apply_floor_vec(v, active, None)
+
+    # -------------------- 5) Cor: paleta → HSV fallback + branco no flash --------------------
+    pal = getattr(ctx, "current_palette", None)
+    if isinstance(pal, (list, tuple)) and len(pal) >= 2:
+        pal_arr = np.asarray(pal, dtype=np.float32)
+        m = pal_arr.shape[0]
+        pal_phase = (centroid * 0.35) % 1.0
+        g = (t + pal_phase) % 1.0
+        g *= (m - 1)
+        j = np.clip(np.floor(g).astype(np.int32), 0, m - 1)
+        j2 = np.clip(j + 1, 0, m - 1)
+        frac = (g - j).reshape(-1, 1)
+        base_rgb = pal_arr[j] * (1.0 - frac) + pal_arr[j2] * frac  # (L,3)
+        rgb = np.clip(base_rgb * (v[:, None].astype(np.float32) / 255.0), 0, 255)
+
+        # Branco adicional nos LEDs em flash (mistura controlada)
+        if STRIPES <= 1:
+            in_flash_mask = v > bed.astype(np.uint8)
+        else:
+            in_flash_mask = (v > bed.astype(np.uint8))  # aproximação suficiente
+
+        white_mix = (
+            WHITE_MIX_BASE
+            + WHITE_MIX_T * trans
+            + (WHITE_MIX_BEAT if beat_flag else 0.0)
+        )
+        white_mix = np.clip(white_mix, 0.0, 1.0)
+        if np.any(in_flash_mask):
+            add = (v[in_flash_mask].astype(np.float32) * white_mix).reshape(-1, 1)
+            rgb[in_flash_mask] = np.clip(rgb[in_flash_mask] + add, 0, 255)
+
+        rgb = rgb.astype(np.uint8)
+    else:
+        hue_base = (int(ctx.base_hue_offset) + (int(ctx.hue_seed) >> 2)) % 256
+        hue = (hue_base + (centroid * 96.0)) % 256
+        hue_arr = np.full(L, int(hue) & 0xFF, dtype=np.uint8)
+        sat = np.full(L, max(170, int(ctx.base_saturation)), dtype=np.uint8)
+        rgb = ctx.hsv_to_rgb_bytes_vec(hue_arr, sat, v)
+        # toque de branco no flash (mesma lógica)
+        if STRIPES <= 1:
+            in_flash_mask = v > bed.astype(np.uint8)
+        else:
+            in_flash_mask = (v > bed.astype(np.uint8))
+        if np.any(in_flash_mask):
+            white_mix = np.clip(WHITE_MIX_BASE + WHITE_MIX_T * trans + (WHITE_MIX_BEAT if beat_flag else 0.0), 0.0, 1.0)
+            add = (v[in_flash_mask].astype(np.float32) * white_mix).reshape(-1, 1)
+            rgb[in_flash_mask] = np.clip(rgb[in_flash_mask].astype(np.float32) + add, 0, 255).astype(np.uint8)
+
+    # -------------------- 6) Envio (cap global ainda protege) --------------------
+    ctx.to_pixels_and_show(rgb)
+
+
+
 # ==== FIM DO ARQUIVO effects/clean.py ====
