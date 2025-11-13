@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# pc-audio.py - Web UI + WebSocket + Captura de áudio
-# Preferência: sounddevice (WASAPI loopback no Windows). Fallback: PyAudio (PyAudioWPatch) se necessário.
-# LOG/MEL; pacotes A1/A2; B0 (cfg) e B1 (reset); proteção; frontend completo.
+# pc-audio-linux.py - Web UI + WebSocket + Captura de áudio (Linux-friendly)
+# Preferência: sounddevice (WASAPI loopback no Windows). No Linux/macOS o padrão é LINE-IN (ICUSBAUDIO7D etc.).
+# Fallback: PyAudio quando solicitado. Web server em thread sem signals (handle_signals=False) para evitar set_wakeup_fd.
 # Fabio Bonilha + M365 Copilot — 2025-11-13
 
 import asyncio
@@ -40,7 +40,6 @@ TCP_TIME_PORT = 5006
 DEFAULT_NUM_BANDS = 150
 BLOCK_SIZE = 1024  # samples
 NFFT = 4096        # zero-padding
-# FMIN, FMAX = 20.0, 16000.0
 FMIN, FMAX = 20.0, 4000.0
 EMA_ALPHA = 0.75
 PEAK_EMA_DEFAULT = 0.10
@@ -93,7 +92,6 @@ button{margin-right:8px}
 <button onclick="post('/api/mode',{mode:'true_silence'})">Forçar Silêncio</button>
 <button onclick="post('/api/reset',{})">Reset (B1)</button>
 
-<pre id="state"></pre>
 <script>
 const bandsDiv = document.getElementById('bands');
 for(let i=0;i<150;i++){const d=document.createElement('div');d.className='bar';d.style.height='1px';bandsDiv.appendChild(d)}
@@ -476,8 +474,8 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
     """
     sounddevice/PortAudio:
     - Windows: preferir WASAPI loopback de saídas.
-    - Linux/macOS: padrão é LINE-IN. Abrir entrada 'segura' (line-in) sem exigir --allow-mic.
-      Exigir --allow-mic somente para dispositivos que não casem com os substrings de line-in.
+    - Linux/macOS: padrão é LINE-IN. Abrir entrada 'segura' (line-in) SEM exigir --allow-mic.
+      Exigir --allow-mic somente para entradas que não casem com as substrings de line-in.
     """
     devs = sd.query_devices()
     system = platform.system().lower()
@@ -492,7 +490,7 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
                 return True
         return False
 
-    # 1) mic explícito via --mic-device (neste caso assume microfone mesmo)
+    # 1) mic explícito via --mic-device
     if mic_device is not None:
         if not allow_mic:
             raise RuntimeError("Uso de microfone requer --allow-mic.")
@@ -512,7 +510,6 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
             raise RuntimeError(f"--device '{override}' não encontrado.")
         d = devs[idx]
         if is_output(idx) and system.startswith("win"):
-            # tentar loopback no Windows
             try:
                 extra = sd.WasapiSettings(loopback=True)
                 s = sd.InputStream(samplerate=int(d.get("default_samplerate", 44100)),
@@ -523,10 +520,9 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
                 return s, int(s.samplerate), int(s.channels), f"(WASAPI loopback): '{d['name']}'", True
             except Exception as e:
                 raise RuntimeError(f"O dispositivo '{d['name']}' não abriu em loopback (SD): {e}")
-        # Entrada: aceitar se for line-in "seguro" ou se --allow-mic foi dado
         if is_input(idx):
             if not (is_linein_name(d['name']) or allow_mic):
-                raise RuntimeError("Dispositivo de entrada parece ser microfone. Use --allow-mic para permitir.")
+                raise RuntimeError("Entrada parece microfone. Use --allow-mic para permitir.")
             s = sd.InputStream(samplerate=int(d.get("default_samplerate", 44100)),
                                channels=max(1, int(d.get("max_input_channels",2))),
                                dtype='float32', blocksize=BLOCK_SIZE,
@@ -552,14 +548,12 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
                 continue
         raise RuntimeError("Nenhuma saída com WASAPI loopback disponível para o sounddevice.")
 
-    # 4) Linux/macOS: AUTO entrada (padrão LINE-IN). Procurar nomes line-in preferidos
-    # Tentar priorizar ICUSBAUDIO7D e similares
+    # 4) Linux/macOS: AUTO entrada (padrão LINE-IN)
     preferred = None
     for i, d in enumerate(devs):
         if is_input(i) and is_linein_name(d['name']):
             preferred = i
             break
-    # Se não achar, usar default input ou primeiro input
     target = preferred
     if target is None:
         di = sd.default.device[0]
@@ -568,8 +562,7 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
     if target is None:
         for i, d in enumerate(devs):
             if is_input(i):
-                # Se parecer microfone e não temos --allow-mic, tente achar outro input
-                if not allow_mic and not is_linein_name(d['name']):
+                if not is_linein_name(d['name']) and not allow_mic:
                     continue
                 target = i
                 break
@@ -584,16 +577,11 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
 
 
 def _paw_choose_and_open(allow_mic: bool, mic_device: Optional[str], audio_cb):
-    """
-    PyAudio (preferindo PyAudioWPatch). No Linux, abre entrada somente se permitido (line-in ou allow_mic).
-    No Windows, tenta WASAPI loopback via PyAudioWPatch.
-    """
     if _PAW is None and _PA is None:
         raise RuntimeError("PyAudioWPatch/PyAudio não encontrado. Instale com: pip install PyAudioWPatch ou PyAudio")
     pmod = _PAW or _PA
     pinst = pmod.PyAudio()
 
-    # Mic explícito
     if mic_device:
         if not allow_mic:
             pinst.terminate()
@@ -623,7 +611,7 @@ def _paw_choose_and_open(allow_mic: bool, mic_device: Optional[str], audio_cb):
                             stream_callback=_py_cb)
         return ("PyAudio (mic)", pinst, stream, rate, ch)
 
-    # WASAPI loopback via PyAudioWPatch (Windows)
+    # PyAudioWPatch WASAPI (Windows)
     try:
         if _PAW is not None and platform.system().lower().startswith('win'):
             wasapi = pinst.get_host_api_info_by_type(pmod.paWASAPI)
@@ -655,8 +643,7 @@ def _paw_choose_and_open(allow_mic: bool, mic_device: Optional[str], audio_cb):
     except Exception:
         pass
 
-    # PyAudio oficial: tentar dispositivo de entrada default
-    # (neste caminho não distinguimos mic/line-in — deixar o usuário habilitar explicitamente via --backend pyaudio)
+    # PyAudio oficial: pegar primeira entrada disponível
     target_idx = None
     for i in range(pinst.get_device_count()):
         info = pinst.get_device_info_by_index(i)
@@ -703,8 +690,8 @@ def main():
     parser.add_argument('--bands', type=int, default=DEFAULT_NUM_BANDS)
     parser.add_argument('--scale', type=str, choices=['log','mel'], default='log')
     parser.add_argument('--mel-bands', type=int, default=None)
-    parser.add_argument('--mel-tilt', type=float, default=-0.25, help='Expoente do tilt nas bandas MEL (negativo realça graves; 0 desliga tilt)')
-    parser.add_argument('--mel-no-area-norm', action='store_true', help='Desliga normalização de área dos filtros MEL')
+    parser.add_argument('--mel-tilt', type=float, default=-0.25)
+    parser.add_argument('--mel-no-area-norm', action='store_true')
     parser.add_argument('--pkt', type=str, choices=['a1','a2'], default='a1')
     parser.add_argument('--tx-fps', type=int, default=75)
     parser.add_argument('--signal-hold-ms', type=int, default=600)
@@ -781,9 +768,11 @@ def main():
     shared = Shared(n_bands)
     app["shared"] = shared
 
-    # Servidor web
+    # Servidor web (em thread) — desabilita signals no aiohttp
     def start_web():
-        web.run_app(app, host=args.bind, port=args.port)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        web.run_app(app, host=args.bind, port=args.port, handle_signals=False)
     threading.Thread(target=start_web, daemon=True).start()
     print(f"\n[WEB] http://{args.bind}:{args.port}")
 
@@ -820,7 +809,6 @@ def main():
     def make_audio_cb():
         nonlocal compute_bands, energy_idx, energy_count, last_energy
         def audio_cb(block, frames, time_info, status):
-            # block: np.float32 mono
             b = block
             if b.shape[0] < BLOCK_SIZE:
                 b = np.pad(b, (0, BLOCK_SIZE - b.shape[0]), 'constant')
@@ -833,7 +821,6 @@ def main():
             app["shared"].avg = avg
             app["shared"].rms = rms
             app["shared"].last_update = time.time()
-            # beat simples
             lb = bands[:max(8, len(bands)//12)]
             energy = float(np.mean(lb))/255.0 if lb.size>0 else 0.0
             energy_buf[energy_idx] = energy
@@ -873,10 +860,8 @@ def main():
             compute_bands = make_compute_bands_log(sr, BLOCK_SIZE, NFFT, a_idx, b_idx, EMA_ALPHA, peak_ema_alpha)
             shared.bands = np.zeros(n_b, dtype=np.uint8)
 
-    # Lista de substrings que caracterizam LINE-IN seguro no Linux/macOS
     linein_substrings = [s.strip() for s in (args.linein_substr or '').split(',') if s.strip()]
 
-    # tentativa 1: sounddevice (se backend=auto ou sd)
     if args.backend in ("auto","sd"):
         try:
             audio_cb = make_audio_cb()
@@ -890,7 +875,6 @@ def main():
             stream.start()
             shared.samplerate = sr_eff
             shared.channels = ch_eff
-            # Log detalhado
             try:
                 dev_info = sd.query_devices(resolve_device_index(args.device) if args.device is not None else stream.device)
                 sr_def = dev_info.get("default_samplerate", sr_eff)
@@ -906,7 +890,6 @@ def main():
             else:
                 print(f"\n[WARN] sounddevice falhou, tentando PyAudio... ({e_sd})")
 
-    # tentativa 2: PyAudio (se backend=auto caiu aqui, ou backend=pyaudio)
     if stream is None and args.backend in ("auto","pyaudio"):
         try:
             audio_cb = make_audio_cb()
@@ -918,21 +901,19 @@ def main():
             shared.channels = ch_eff
             backend_used = tag
         except Exception as e_pa:
-            print(f"\n[FATAL] PyAudio falhou: {e_pa}\nDica: instale PyAudioWPatch (Windows) ou habilite sounddevice no Linux.")
+            print(f"\n[FATAL] PyAudio falhou: {e_pa}")
             sys.exit(1)
 
     if stream is None:
         print("\n[FATAL] Nenhum backend de áudio pôde ser aberto.")
         sys.exit(1)
 
-    # Empurrar CFG
     try:
         send_cfg_b0(args.raspberry_ip, args.udp_port, len(shared.bands), TX_FPS, int(args.signal_hold_ms), int(args.vis_fps))
         print(f"[CFG->RPi] bands={len(shared.bands)} fps={TX_FPS} hold={int(args.signal_hold_ms)} vis_fps={int(args.vis_fps)}")
     except Exception as e:
         print(f"[WARN] Falha B0: {e}")
 
-    # Reset remoto no start
     if not args.no_reset_on_start:
         try:
             send_reset_b1(args.raspberry_ip, args.udp_port)
@@ -943,7 +924,6 @@ def main():
     print(f"[INFO] Capturando de: {backend_used}")
     print("[PRONTO] Monitor online - abra o navegador.")
 
-    # ---- Loop principal (gate + envio) ----
     rms_med = deque(maxlen=7)
     avg_med = deque(maxlen=7)
     last_tick = 0.0
@@ -989,7 +969,6 @@ def main():
             while hist_avg and hist_avg[0][0] < cutoff: hist_avg.popleft()
             while hist_rms and hist_rms[0][0] < cutoff: hist_rms.popleft()
 
-            # Fechar calibração
             if ss.get("calibrating", False) and now >= ss.get("calib_until", 0.0):
                 arr_avg = np.array(ss["calib_avg"] or [avg_filtered], dtype=np.float32)
                 arr_rms = np.array(ss["calib_rms"] or [rms_filtered], dtype=np.float32)
@@ -1031,7 +1010,6 @@ def main():
                 ss["noise_profile_frames"] = None
                 print(f"\n[CALIB] OK: th_avg={th_avg:.1f} th_rms={th_rms:.6f} resume_x={resume_factor:.2f}")
 
-            # Auto (opcional)
             if ss["auto_mode"] and (now - last_auto_update) >= 0.5:
                 arr_avg = np.array([v for _,v in hist_avg], dtype=np.float32) if hist_avg else np.array([avg_filtered],dtype=np.float32)
                 arr_rms = np.array([v for _,v in hist_rms], dtype=np.float32) if hist_rms else np.array([rms_filtered],dtype=np.float32)
@@ -1045,7 +1023,6 @@ def main():
                 ss["silence_bands"]=th_avg; ss["silence_rms"]=th_rms; ss["resume_factor"]=dyn_resume
                 last_auto_update = now
 
-            # Gate + envio
             avg_ema = ss['avg_ema_val']; rms_ema = ss['rms_ema_val']
             is_quiet = (avg_ema < ss['silence_bands']) and (rms_ema < ss['silence_rms'])
             resume_threshold = ss['silence_bands'] * ss['resume_factor']
