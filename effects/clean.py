@@ -262,19 +262,10 @@ def effect_bass_pulse_core(ctx, bands_u8, beat_flag, active):
 _peak_levels = None
 _peak_ema = np.zeros(1)  # evita alocação
 
-# ==== PEAK DOTS EXPANDED — NOVA VERSÃO (cheia, colorida, impactante) ====
-
-# ==== PEAK DOTS EXPANDED — V2 (graves mais reativos) ====
+# ==== PEAK DOTS EXPANDED — V2.1 (com AGC adaptativo ao cap global) ====
 _pdex_levels = None  # picos por banda (EMA)
 
 def effect_peak_dots_expanded(ctx, bands_u8, beat_flag, active):
-    """
-    Peak Dots Expanded v2:
-    - Mais reatividade nos graves (decay mais rápido, ganho por low_mean).
-    - Glow ligeiramente mais concentrado com grave alto.
-    - Leito responde mais ao grave para preencher melhor a fita.
-    - Respeita paletas, dynamic_floor e cap global.
-    """
     import numpy as np
 
     L = ctx.LED_COUNT
@@ -283,100 +274,112 @@ def effect_peak_dots_expanded(ctx, bands_u8, beat_flag, active):
         ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.uint8))
         return
 
-    # --- 0) Preparos e métricas de graves ---
+    # --- graves/energia ---
     x = np.asarray(bands_u8, dtype=np.float32)
     low_n = max(8, n // 8)
-    low_mean = float(np.mean(x[:low_n]))  # 0..255
-    low_energy = np.clip(low_mean / 255.0, 0.0, 1.0)    # 0..1
+    low_mean = float(np.mean(x[:low_n]))
+    low_energy = np.clip(low_mean / 255.0, 0.0, 1.0)
 
-    # --- 1) Níveis de pico por banda (EMA de picos, decay mais rápido) ---
+    # --- EMA de picos (mais reativo) ---
     global _pdex_levels
     if _pdex_levels is None or _pdex_levels.shape[0] != n:
         _pdex_levels = np.zeros(n, dtype=np.float32)
-    # Decay mais agressivo => sobe mais rápido quando há pico
     decay = 0.84 if active else 0.73
     _pdex_levels = np.maximum(_pdex_levels * decay, x)
 
-    # --- 2) Energia global e # de picos (dinâmico) ---
-    energy = float(np.mean(_pdex_levels)) / 255.0  # 0..1
+    # --- energia + k ---
+    energy = float(np.mean(_pdex_levels)) / 255.0
     energy = np.clip(energy, 0.0, 1.0)
     k_base, k_max = 8, 22
     k = int(k_base + (k_max - k_base) * (energy ** 0.7))
-    # leve viés: com grave alto, 1 ou 2 picos a mais
     k += 1 if low_energy > 0.35 else 0
     k = max(6, min(k, n, max(4, L // 6)))
 
-    # --- 3) Seleção dos k maiores picos ---
+    # --- maiores picos ---
     if k >= n:
         idx = np.arange(n, dtype=np.int32)
     else:
         idx = np.argpartition(_pdex_levels, -k)[-k:]
         idx = idx[np.argsort(-_pdex_levels[idx])]
-    peak_vals = _pdex_levels[idx]  # float
+    peak_vals = _pdex_levels[idx]
 
-    # --- 4) Mapeamento não-linear p/ a fita + espelhamento ---
-    band_norm = idx.astype(np.float32) / max(1, n - 1)  # 0..1
-    led_norm = 0.10 + 0.80 * np.sqrt(band_norm)         # favorece extremos
-    pos = (led_norm * (L - 1)).astype(np.int32)
-    pos = np.clip(pos, 0, L - 1)
+    # --- map + espelho ---
+    band_norm = idx.astype(np.float32) / max(1, n - 1)
+    led_norm = 0.10 + 0.80 * np.sqrt(band_norm)
+    pos = np.clip((led_norm * (L - 1)).astype(np.int32), 0, L - 1)
     pos_mirror = (L - 1 - pos).astype(np.int32)
     pos_all = np.concatenate([pos, pos_mirror], axis=0)
     val_all = np.concatenate([peak_vals, peak_vals], axis=0)
 
-    # --- 5) Ganhos e glow (graves influenciam) ---
-    # boost base + energia + grave
-    bass_boost = 1.0 + 0.55 * (low_energy ** 0.8)         # até ~1.55
+    # --- ganhos/graves ---
+    bass_boost = 1.0 + 0.55 * (low_energy ** 0.8)
     if beat_flag:
-        bass_boost *= 1.10  # pequeno punch extra no beat
+        bass_boost *= 1.10
     gain = (1.30 + 0.35 * energy) * bass_boost
     val_all = np.clip(val_all * gain, 0.0, 255.0)
 
-    # sigma reduz um pouco com grave alto -> pontos mais "chapados"/intensos
+    # --- glow gaussiano (sigma tende a reduzir com grave alto) ---
     sigma = (1.8 + 3.0 * (val_all / 255.0) + 5.0 * energy) * (1.0 - 0.20 * low_energy)
     sigma = np.maximum(sigma, 1.0)
 
-    # --- 6) Glow gaussiano vetorizado ---
-    I = ctx.I_ALL.astype(np.float32)[None, :]  # (1,L)
-    P = pos_all[:, None].astype(np.float32)    # (p,1)
+    I = ctx.I_ALL.astype(np.float32)[None, :]
+    P = pos_all[:, None].astype(np.float32)
     S = sigma[:, None].astype(np.float32)
     V = val_all[:, None].astype(np.float32)
     glow = np.exp(-0.5 * ((I - P) / S) ** 2) * V
-    glow_sum = np.sum(glow, axis=0)  # (L,)
+    glow_sum = np.sum(glow, axis=0)
 
-    # --- 7) Rastro + leito com ênfase em graves ---
+    # --- rastro + leito ---
     if not hasattr(ctx, "_pr_buf") or ctx._pr_buf.shape[0] != L:
         ctx._pr_buf = np.zeros(L, dtype=np.float32)
     if not hasattr(ctx, "_pr_phase"):
         ctx._pr_phase = 0.0
 
-    # rastro levemente mais persistente quando há grave
     base_decay = 0.86 if active else 0.80
-    ctx._pr_buf *= (base_decay + 0.02 * low_energy)  # 0.86..0.88
-
+    ctx._pr_buf *= (base_decay + 0.02 * low_energy)
     ctx._pr_buf = np.maximum(ctx._pr_buf, glow_sum)
 
-    # leito animado com componente adicional de grave
     ctx._pr_phase += (0.08 + 0.25 * energy + 0.18 * low_energy + (0.12 if beat_flag else 0.0))
     t = (ctx.I_ALL.astype(np.float32) / max(1.0, float(L - 1)))
-    bed_level = (energy ** 0.7) * 80.0 + (low_energy ** 0.9) * 50.0  # +50 vem do grave
+
+    # -------------------------------
+    # AGC ADAPTATIVO (cap-aware)
+    # - usa ctx.last_cap_scale (0..1) para criar headroom no frame seguinte
+    # - reduz leito e ganho se estivermos capando demais
+    # -------------------------------
+    last_cap = float(ctx.last_cap_scale or 1.0)
+    # alvo de folga: queremos ~0.92–0.95
+    # fator <1 reduz brilho médio; >1 libera
+    agc = 1.0
+    if last_cap < 0.90:
+        agc = max(0.72, 0.70 + 0.35 * last_cap)   # até ~0.95→1.03; 0.7→0.95
+    elif last_cap < 0.96:
+        agc = 0.93 + 0.08 * (last_cap - 0.90)     # 0.90→0.93; 0.96→0.98
+    else:
+        agc = 1.00 + 0.04 * (last_cap - 0.96)     # 0.96→1.00; 1.00→1.016
+
+    # leito base: energia + grave, modulados por AGC
+    bed_level = ((energy ** 0.7) * 80.0 + (low_energy ** 0.9) * 50.0) * agc
     bed = (0.55 + 0.45 * np.sin(2.0 * np.pi * (t + (ctx._pr_phase * 0.05)))) * bed_level
 
-    v_raw = np.clip(ctx._pr_buf + bed, 0.0, 255.0).astype(np.uint8)
+    # também aplicamos AGC leve no rastro (picos acumulados)
+    trail = ctx._pr_buf * (0.96 * agc + 0.04)  # mantém um mínimo de 4%
+
+    v_raw = np.clip(trail + bed, 0.0, 255.0).astype(np.uint8)
     v = ctx.apply_floor_vec(v_raw, active, None)
 
-    # --- 8) Cores: paleta ou HSV ---
+    # --- cores (paleta → HSV fallback) ---
     pal = getattr(ctx, "current_palette", None)
     if isinstance(pal, (list, tuple)) and len(pal) >= 2:
-        pal_arr = np.asarray(pal, dtype=np.float32)  # (m,3)
+        pal_arr = np.asarray(pal, dtype=np.float32)
         m = pal_arr.shape[0]
-        tpal = (t * (m - 1)).astype(np.float32)      # 0..m-1
+        tpal = (t * (m - 1)).astype(np.float32)
         j = np.clip(np.floor(tpal).astype(np.int32), 0, m - 1)
         j2 = np.clip(j + 1, 0, m - 1)
         frac = (tpal - j).reshape(-1, 1)
         base_rgb = (pal_arr[j] * (1.0 - frac) + pal_arr[j2] * frac)
         rgb = np.clip(base_rgb * (v[:, None].astype(np.float32) / 255.0), 0, 255)
         if beat_flag:
-            # brilho branco sutil proporcional ao grave
             rgb = np.clip(rgb + (v[:, None].astype(np.float32) * (0.10 + 0.20 * low_energy)), 0, 255)
         rgb = rgb.astype(np.uint8)
     else:
