@@ -259,13 +259,16 @@ def effect_bass_pulse_core(ctx, bands_u8, beat_flag, active):
     ctx.to_pixels_and_show(rgb)
 
 # ==== PEAK DOTS EXPANDED — USA TODA A FITA ====
-_peak_levels = None
-_peak_ema = np.zeros(1)  # evita alocação
-
-# ==== PEAK DOTS EXPANDED — V2.1 (com AGC adaptativo ao cap global) ====
 _pdex_levels = None  # picos por banda (EMA)
 
 def effect_peak_dots_expanded(ctx, bands_u8, beat_flag, active):
+    """
+    V3:
+    - Mais reatividade em graves (peso espectral + componente transiente).
+    - AGC pré-cap: reduz leito/ganho quando a corrente estimada se aproxima do orçamento.
+    - Soft-clip nos acúmulos para reduzir brilho médio sem perder impacto.
+    - Respeita paletas, dynamic_floor e cap global do FXContext.
+    """
     import numpy as np
 
     L = ctx.LED_COUNT
@@ -274,120 +277,167 @@ def effect_peak_dots_expanded(ctx, bands_u8, beat_flag, active):
         ctx.to_pixels_and_show(np.zeros((L, 3), dtype=np.uint8))
         return
 
-    # --- graves/energia ---
-    x = np.asarray(bands_u8, dtype=np.float32)
-    low_n = max(8, n // 8)
-    low_mean = float(np.mean(x[:low_n]))
-    low_energy = np.clip(low_mean / 255.0, 0.0, 1.0)
+    # -----------------------------
+    # 1) Entrada e ênfase de graves
+    # -----------------------------
+    x = np.asarray(bands_u8, dtype=np.float32)  # 0..255
+    # Curva de peso 0..1 (mais peso nos graves, menos nos agudos)
+    f = np.arange(n, dtype=np.float32) / max(1, n - 1)
+    w = 1.50 - 0.65 * (f ** 0.7)            # ~1.50 nos graves -> ~0.85 nos agudos
+    x_w = x * w
+    # Normaliza para não inflar energia total
+    mean_x = float(np.mean(x)) + 1e-6
+    mean_w = float(np.mean(x_w)) + 1e-6
+    x_w *= (mean_x / mean_w)
 
-    # --- EMA de picos (mais reativo) ---
+    # ----------------------------------
+    # 2) EMA de picos + componente "trans"
+    # ----------------------------------
     global _pdex_levels
     if _pdex_levels is None or _pdex_levels.shape[0] != n:
         _pdex_levels = np.zeros(n, dtype=np.float32)
-    decay = 0.84 if active else 0.73
-    _pdex_levels = np.maximum(_pdex_levels * decay, x)
 
-    # --- energia + k ---
-    energy = float(np.mean(_pdex_levels)) / 255.0
-    energy = np.clip(energy, 0.0, 1.0)
+    prev = _pdex_levels.copy()
+    # Decay mais rápido para responder melhor (especialmente samba)
+    decay = 0.80 if active else 0.70
+    _pdex_levels = np.maximum(_pdex_levels * decay, x_w)
+
+    # Transiente: ataque imediato quando x_w sobe acima do nível anterior
+    trans = np.maximum(0.0, x_w - prev)   # 0..255
+
+    # Métricas de energia (global e graves)
+    low_n = max(8, n // 6)                # pega um pouco mais de "baixo"
+    low_mean = float(np.mean(x_w[:low_n]))
+    low_energy = np.clip(low_mean / 255.0, 0.0, 1.0)
+    energy = np.clip(float(np.mean(_pdex_levels)) / 255.0, 0.0, 1.0)
+
+    # -----------------------------
+    # 3) Seleção de picos (dinâmica)
+    # -----------------------------
     k_base, k_max = 8, 22
     k = int(k_base + (k_max - k_base) * (energy ** 0.7))
-    k += 1 if low_energy > 0.35 else 0
-    k = max(6, min(k, n, max(4, L // 6)))
+    if low_energy > 0.35:
+        k += 1
+    k = max(8, min(k, n, max(6, L // 6)))
 
-    # --- maiores picos ---
     if k >= n:
         idx = np.arange(n, dtype=np.int32)
     else:
         idx = np.argpartition(_pdex_levels, -k)[-k:]
         idx = idx[np.argsort(-_pdex_levels[idx])]
-    peak_vals = _pdex_levels[idx]
 
-    # --- map + espelho ---
+    # Valores de pico + transiente com boost de grave
+    peak_vals = _pdex_levels[idx]
+    trans_vals = trans[idx]
+    bass_boost = 1.0 + 0.75 * (low_energy ** 0.9)       # mais presença no grave
+    if beat_flag:
+        bass_boost *= 1.12
+    gain = (1.20 + 0.30 * energy) * bass_boost
+    # mistura pico + trans, o trans reage MUITO rápido
+    val_peaks = np.clip(peak_vals * gain + trans_vals * (0.9 + 0.6 * low_energy), 0.0, 255.0)
+
+    # -----------------------------
+    # 4) Mapeamento + espelhamento
+    # -----------------------------
     band_norm = idx.astype(np.float32) / max(1, n - 1)
-    led_norm = 0.10 + 0.80 * np.sqrt(band_norm)
+    led_norm = 0.10 + 0.80 * np.sqrt(band_norm)         # empurra mais p/ longe
     pos = np.clip((led_norm * (L - 1)).astype(np.int32), 0, L - 1)
     pos_mirror = (L - 1 - pos).astype(np.int32)
     pos_all = np.concatenate([pos, pos_mirror], axis=0)
-    val_all = np.concatenate([peak_vals, peak_vals], axis=0)
+    val_all = np.concatenate([val_peaks, val_peaks], axis=0)
 
-    # --- ganhos/graves ---
-    bass_boost = 1.0 + 0.55 * (low_energy ** 0.8)
-    if beat_flag:
-        bass_boost *= 1.10
-    gain = (1.30 + 0.35 * energy) * bass_boost
-    val_all = np.clip(val_all * gain, 0.0, 255.0)
-
-    # --- glow gaussiano (sigma tende a reduzir com grave alto) ---
-    sigma = (1.8 + 3.0 * (val_all / 255.0) + 5.0 * energy) * (1.0 - 0.20 * low_energy)
+    # ------------------------------------
+    # 5) Glow gaussiano (com soft clip)
+    # ------------------------------------
+    # sigma fecha com grave alto (mais contundente)
+    sigma = (1.8 + 3.0 * (val_all / 255.0) + 4.0 * energy) * (1.0 - 0.25 * low_energy)
     sigma = np.maximum(sigma, 1.0)
 
-    I = ctx.I_ALL.astype(np.float32)[None, :]
-    P = pos_all[:, None].astype(np.float32)
+    I = ctx.I_ALL.astype(np.float32)[None, :]  # (1,L)
+    P = pos_all[:, None].astype(np.float32)    # (p,1)
     S = sigma[:, None].astype(np.float32)
     V = val_all[:, None].astype(np.float32)
     glow = np.exp(-0.5 * ((I - P) / S) ** 2) * V
-    glow_sum = np.sum(glow, axis=0)
+    glow_sum = np.sum(glow, axis=0)  # (L,)
 
-    # --- rastro + leito ---
+    # Soft-clip do somatório de glows para reduzir picos de brilho
+    # (curva ~exponencial; 180 controla a "dureza")
+    glow_sum = 255.0 * (1.0 - np.exp(-glow_sum / 180.0))
+
+    # ------------------------------------
+    # 6) Rastro + "leito" (bed) mais contido
+    # ------------------------------------
     if not hasattr(ctx, "_pr_buf") or ctx._pr_buf.shape[0] != L:
         ctx._pr_buf = np.zeros(L, dtype=np.float32)
     if not hasattr(ctx, "_pr_phase"):
         ctx._pr_phase = 0.0
 
-    base_decay = 0.86 if active else 0.80
+    # Rastro: ligeiro viés para persistir quando grave está alto
+    base_decay = 0.88 if active else 0.80
     ctx._pr_buf *= (base_decay + 0.02 * low_energy)
     ctx._pr_buf = np.maximum(ctx._pr_buf, glow_sum)
 
-    ctx._pr_phase += (0.08 + 0.25 * energy + 0.18 * low_energy + (0.12 if beat_flag else 0.0))
-    t = (ctx.I_ALL.astype(np.float32) / max(1.0, float(L - 1)))
+    # Leito animado: menor que antes, mas ainda cobre fita
+    ctx._pr_phase += (0.10 + 0.22 * energy + 0.22 * low_energy + (0.10 if beat_flag else 0.0))
+    tpos = (ctx.I_ALL.astype(np.float32) / max(1.0, float(L - 1)))
+    bed_level = (energy ** 0.7) * 45.0 + (low_energy ** 0.9) * 35.0  # ↓ valores base
+    bed = (0.55 + 0.45 * np.sin(2.0 * np.pi * (tpos + (ctx._pr_phase * 0.05)))) * bed_level
 
-    # -------------------------------
-    # AGC ADAPTATIVO (cap-aware)
-    # - usa ctx.last_cap_scale (0..1) para criar headroom no frame seguinte
-    # - reduz leito e ganho se estivermos capando demais
-    # -------------------------------
-    last_cap = float(ctx.last_cap_scale or 1.0)
-    # alvo de folga: queremos ~0.92–0.95
-    # fator <1 reduz brilho médio; >1 libera
-    agc = 1.0
-    if last_cap < 0.90:
-        agc = max(0.72, 0.70 + 0.35 * last_cap)   # até ~0.95→1.03; 0.7→0.95
-    elif last_cap < 0.96:
-        agc = 0.93 + 0.08 * (last_cap - 0.90)     # 0.90→0.93; 0.96→0.98
-    else:
-        agc = 1.00 + 0.04 * (last_cap - 0.96)     # 0.96→1.00; 1.00→1.016
+    # Pré-combinação (antes de AGC)
+    v_pre = ctx._pr_buf + bed  # float
 
-    # leito base: energia + grave, modulados por AGC
-    bed_level = ((energy ** 0.7) * 80.0 + (low_energy ** 0.9) * 50.0) * agc
-    bed = (0.55 + 0.45 * np.sin(2.0 * np.pi * (t + (ctx._pr_phase * 0.05)))) * bed_level
+    # ------------------------------------
+    # 7) AGC PRÉ-CAP (cap-aware de verdade)
+    #    - estima corrente como no FXContext e cria folga (~85%)
+    # ------------------------------------
+    ma_per_ch = float(ctx.WS2812B_MA_PER_CHANNEL)  # ~20 mA
+    idle_ma    = float(ctx.WS2812B_IDLE_MA_PER_LED) * float(L)
+    budget_ma  = float(ctx.CURRENT_BUDGET_A) * 1000.0
+    # estima consumo colorido (3 canais), antes de converter para RGB de fato
+    sum_v      = float(np.sum(np.clip(v_pre, 0.0, 255.0)))
+    i_color_ma = (ma_per_ch / 255.0) * sum_v * 3.0
+    target_ma  = max(0.0, (budget_ma - idle_ma) * 0.85)  # 15% de folga
 
-    # também aplicamos AGC leve no rastro (picos acumulados)
-    trail = ctx._pr_buf * (0.96 * agc + 0.04)  # mantém um mínimo de 4%
+    pre_scale_raw = 1.0 if i_color_ma <= 1e-6 else min(1.0, target_ma / i_color_ma)
 
-    v_raw = np.clip(trail + bed, 0.0, 255.0).astype(np.uint8)
+    # EMA do ganho para estabilidade entre frames
+    if not hasattr(ctx, "_agc_ema"):
+        ctx._agc_ema = 1.0
+    ctx._agc_ema = 0.70 * float(ctx._agc_ema) + 0.30 * float(pre_scale_raw)
+    pre_scale = min(pre_scale_raw, ctx._agc_ema)
+
+    # Reduz o bed agressivamente quando falta folga; mantém picos
+    bed_agc = bed * (0.55 * pre_scale + 0.25)  # cai rápido se pre_scale<1
+    trail_agc = ctx._pr_buf * (0.92 * pre_scale + 0.08)
+    v_raw = np.clip(trail_agc + bed_agc, 0.0, 255.0).astype(np.uint8)
+
+    # Piso dinâmico
     v = ctx.apply_floor_vec(v_raw, active, None)
 
-    # --- cores (paleta → HSV fallback) ---
+    # ------------------------------------
+    # 8) Cores (paleta → HSV fallback)
+    # ------------------------------------
     pal = getattr(ctx, "current_palette", None)
     if isinstance(pal, (list, tuple)) and len(pal) >= 2:
         pal_arr = np.asarray(pal, dtype=np.float32)
         m = pal_arr.shape[0]
-        tpal = (t * (m - 1)).astype(np.float32)
+        tpal = (tpos * (m - 1)).astype(np.float32)
         j = np.clip(np.floor(tpal).astype(np.int32), 0, m - 1)
         j2 = np.clip(j + 1, 0, m - 1)
         frac = (tpal - j).reshape(-1, 1)
         base_rgb = (pal_arr[j] * (1.0 - frac) + pal_arr[j2] * frac)
         rgb = np.clip(base_rgb * (v[:, None].astype(np.float32) / 255.0), 0, 255)
         if beat_flag:
-            rgb = np.clip(rgb + (v[:, None].astype(np.float32) * (0.10 + 0.20 * low_energy)), 0, 255)
+            # brilhozinho proporcional ao grave, mas já sob AGC
+            rgb = np.clip(rgb + (v[:, None].astype(np.float32) * (0.08 + 0.16 * low_energy)), 0, 255)
         rgb = rgb.astype(np.uint8)
     else:
         hue_base = (int(ctx.base_hue_offset) + (int(ctx.hue_seed) >> 1)) % 256
         hue = (hue_base + ((ctx.I_ALL * 96) // max(1, L)) + int((ctx._pr_phase * 10.0))) % 256
-        sat = np.full(L, max(160, int(ctx.base_saturation)), dtype=np.uint8)
+        sat = np.full(L, max(150, int(ctx.base_saturation)), dtype=np.uint8)  # sat um pouco menor
         rgb = ctx.hsv_to_rgb_bytes_vec(hue.astype(np.uint8), sat, v)
 
+    # Envia (cap global do FXContext ainda atua se necessário)
     ctx.to_pixels_and_show(rgb)
 
 # ==== CENTROID COMET EXPANDED — CORRIGIDO (sem NameError) ====
