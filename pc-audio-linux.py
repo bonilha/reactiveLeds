@@ -269,8 +269,7 @@ def time_sync_over_tcp(raspberry_ip, port=TCP_TIME_PORT, samples=TIME_SYNC_SAMPL
                 results.append((rtt, offset))
         if not results:
             _time_sync_ok = False
-            print("
-[WARN] Time sync TCP falhou (sem amostras validas).")
+            print("[WARN] Time sync TCP falhou (sem amostras validas).")
             return False
         rtt_min, offset_best = sorted(results, key=lambda x: x[0])[0]
         with socket.create_connection((raspberry_ip, port), timeout=1.8) as s:
