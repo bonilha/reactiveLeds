@@ -689,7 +689,7 @@ def main():
 
     args = parser.parse_args()
 
-    if args3.list_devices:
+    if args.list_devices:
         devs = sd.query_devices()
         for i, d in enumerate(devs):
             print(f"{i:3d}  {d['name']}  in={d.get('max_input_channels',0)}  out={d.get('max_output_channels',0)}  sr={d.get('default_samplerate')}")
