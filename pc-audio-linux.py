@@ -12,6 +12,7 @@
 # - Mirror opcional de pacotes A1/A2 para um host de coleta (--mirror-to IP:PORT)
 
 import asyncio
+import aiofiles
 import socket
 import time
 import sys
@@ -531,6 +532,27 @@ def ensure_pydub():
             pass
         return pydub
 
+def ensure_aiofiles():
+    try:
+        import aiofiles
+        return aiofiles
+    except Exception:
+        print('[INFO] aiofiles não encontrado — instalando via pip...')
+        try:
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'aiofiles'])
+        except Exception as e:
+            raise RuntimeError(f'Falha ao instalar aiofiles: {e}')
+        import importlib
+        aiofiles = importlib.import_module('aiofiles')
+        return aiofiles
+        try:
+            img = importlib.import_module('imageio_ffmpeg')
+            ff = img.get_ffmpeg_exe()
+            pydub.AudioSegment.converter = ff
+        except Exception:
+            pass
+        return pydub
+
 def start_mp3_worker(app, folder_path):
     """Start a background thread that decodes mp3 files (silent) and feeds analysis callback."""
     if not os.path.isdir(folder_path):
@@ -613,38 +635,83 @@ def stop_mp3_worker(app):
     # keep mp3_dir for possible reuse
 
 async def handle_upload_mp3(request):
-    """Receive multipart upload with field 'files' (multiple). Saves into temp folder and sets as mp3_dir."""
-    data = await request.post()
-    files = data.getall('files') if hasattr(data, 'getall') else []
-    if not files:
-        return web.json_response({'status':'error','error':'Nenhum arquivo recebido'}, status=400)
-    dst = tempfile.mkdtemp(prefix='rl_mp3_')
+    """Receive multipart upload (streamed) and save files into persistent server folder.
+    Writes are performed asynchronously using aiofiles to avoid blocking the aiohttp event loop.
+    Filenames are sanitized to prevent path traversal; only .mp3 files are accepted.
+    """
+    # choose persistent destination depending on OS
+    sysname = platform.system().lower()
+    if sysname.startswith('linux') or sysname.startswith('darwin'):
+        dst = os.path.expanduser('~/mp3')
+    elif sysname.startswith('win'):
+        homedrive = os.environ.get('HOMEDRIVE', '')
+        homepath = os.environ.get('HOMEPATH') or os.environ.get('USERPROFILE') or ''
+        if homedrive and homepath:
+            dst = os.path.join(homedrive + homepath, 'mp3')
+        else:
+            dst = os.path.expanduser('~/mp3')
+    else:
+        dst = os.path.expanduser('~/mp3')
+    os.makedirs(dst, exist_ok=True)
+
+    # Multipart streaming reader (does not buffer entire file in memory)
+    reader = await request.multipart()
+    aiofiles = ensure_aiofiles()
+    import re, uuid
     count = 0
     try:
-        for f in files:
-            # f can be either FileField or similar
-            name = getattr(f, 'filename', None) or getattr(f, 'name', None) or str(time.time())
-            # only keep mp3
-            if not name.lower().endswith('.mp3'):
+        async for part in reader:
+            # only process file parts
+            if part.filename is None:
                 continue
-            path = os.path.join(dst, os.path.basename(name))
-            with open(path, 'wb') as fh:
-                fh.write(f.file.read())
-            count += 1
+            raw_name = part.filename
+            # basic sanitization: basename + allow only safe chars
+            name = os.path.basename(raw_name)
+            # enforce .mp3
+            if not name.lower().endswith('.mp3'):
+                # consume and skip content
+                while True:
+                    chunk = await part.read_chunk()
+                    if not chunk:
+                        break
+                continue
+            # replace unsafe characters
+            safe = re.sub(r'[^A-Za-z0-9._-]', '_', name)
+            # avoid collisions: prefix with uuid
+            safe = f"{uuid.uuid4().hex}_{safe}"
+            out_path = os.path.join(dst, safe)
+            # stream write asynchronously
+            try:
+                async with aiofiles.open(out_path, 'wb') as out_f:
+                    while True:
+                        chunk = await part.read_chunk()
+                        if not chunk:
+                            break
+                        await out_f.write(chunk)
+                count += 1
+            except Exception as e:
+                # on write error, remove partial file
+                try: os.remove(out_path)
+                except Exception: pass
+                print(f"[UPLOAD] erro ao escrever '{out_path}': {e}")
+                # continue processing other parts
+                continue
+
         if count == 0:
-            shutil.rmtree(dst, ignore_errors=True)
             return web.json_response({'status':'error','error':'Nenhum MP3 encontrado nos arquivos enviados'}, status=400)
-        # replace previous mp3_dir (if previous was a temp upload folder, remove it)
+
+        # set as current mp3_dir (persistent)
         old = request.app.get('mp3_dir')
         old_was_temp = request.app.get('mp3_dir_is_temp', False)
         request.app['mp3_dir'] = dst
-        request.app['mp3_dir_is_temp'] = True
-        if old and os.path.isdir(old) and old_was_temp:
+        request.app['mp3_dir_is_temp'] = False
+        # remove old temp dir only
+        if old and os.path.isdir(old) and old_was_temp and old != dst:
             try: shutil.rmtree(old)
             except Exception: pass
+
         return web.json_response({'status':'ok','count': count, 'mp3_dir': dst})
     except Exception as e:
-        shutil.rmtree(dst, ignore_errors=True)
         return web.json_response({'status':'error','error': str(e)}, status=500)
 
 app.router.add_post('/api/upload_mp3', handle_upload_mp3)
