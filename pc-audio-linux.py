@@ -27,6 +27,12 @@ import os
 import csv
 import gzip
 from datetime import datetime
+import tempfile
+import shutil
+import random
+import subprocess
+import importlib
+from aiohttp import MultipartReader
 
 # ---- PyAudio (opcional) ----
 _PAW = None
@@ -73,57 +79,130 @@ HTML = r"""
 <!doctype html>
 <html lang="pt-br"><meta charset="utf-8">
 <title>Reactive LEDs — Monitor</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:20px;background:#111;color:#eee}
-.card{display:inline-block;min-width:320px;border:1px solid #333;border-radius:8px;padding:12px;margin:6px;background:#181818}
+body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:12px;background:#111;color:#eee}
+.card{display:block;width:100%;max-width:900px;margin:8px auto;border:1px solid #333;border-radius:8px;padding:12px;background:#181818}
 h2{margin:4px 0} .mono{font-family:ui-monospace,Consolas,Menlo,monospace}
-.bars{height:100px;background:#000;border:1px solid #333;border-radius:6px;display:flex;align-items:flex-end;padding:4px;gap:1px}
-.bar{width:2px;background:#39f}
-.kv{display:grid;grid-template-columns:120px 1fr;gap:6px;margin-top:6px}
+.bars{height:120px;background:#000;border:1px solid #333;border-radius:6px;display:flex;align-items:flex-end;padding:4px;gap:1px;overflow:hidden}
+.bar{width:3px;background:#39f}
+.kv{display:grid;grid-template-columns:130px 1fr;gap:6px;margin-top:6px}
 .badge{padding:2px 6px;border-radius:999px;background:#333;display:inline-block}
+.controls{display:grid;grid-template-columns:1fr;gap:8px;margin-top:8px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+.input-small{padding:6px;border-radius:6px;border:1px solid #333;background:#0f0f0f;color:#fff}
+.btn{padding:8px 12px;border-radius:6px;border:0;background:#39f;color:#001;font-weight:600}
+.status{margin-top:8px;padding:8px;border-radius:6px;background:#0b0b0b;border:1px solid #222}
+@media(max-width:420px){ .kv{grid-template-columns:110px 1fr} .bar{width:2px} }
 </style>
 <div class="card">
 <h2>Reactive LEDs — Monitor</h2>
 <div class="kv">
-  <div>Conexão:</div><div id="conn" class="badge">Desconectado</div>
-  <div>FPS:</div><div id="fps">—</div>
-  <div>Dispositivo:</div><div id="dev">—</div>
-  <div>SR/CH:</div><div id="srch">—</div>
-  <div>TX:</div><div id="tx">0</div>
-  <div>Auto:</div><div id="auto">OFF</div>
+    <div>Conexão:</div><div id="conn" class="badge">Desconectado</div>
+    <div>FPS:</div><div id="fps">—</div>
+    <div>Dispositivo:</div><div id="dev">—</div>
+    <div>SR/CH:</div><div id="srch">—</div>
+    <div>TX:</div><div id="tx">0</div>
+    <div>Auto:</div><div id="auto">OFF</div>
 </div>
 <h3>Bandas</h3>
 <div class="bars" id="bars"></div>
 <div class="kv">
-  <div>Bandas:</div><div id="nb">—</div>
-  <div>Silêncio:</div><div id="sil">—</div>
-  <div>AVG:</div><div id="avg">—</div>
-  <div>RMS:</div><div id="rms">—</div>
+    <div>Bandas:</div><div id="nb">—</div>
+    <div>Silêncio:</div><div id="sil">—</div>
+    <div>AVG:</div><div id="avg">—</div>
+    <div>RMS:</div><div id="rms">—</div>
+</div>
+
+<h3>Fonte de Áudio</h3>
+<div class="controls">
+    <div class="row">
+        <label class="input-small">Fonte:
+            <select id="src_select" class="input-small">
+                <option value="system">Sistema (Loopback)</option>
+                <option value="linein">Line In</option>
+                <option value="mp3">MP3 (pasta)</option>
+            </select>
+        </label>
+        <button id="apply_btn" class="btn">Aplicar Configuração</button>
+    </div>
+    <div id="mp3_area" style="display:none">
+        <div class="row">
+            <input id="mp3_folder_path" class="input-small" placeholder="Nenhuma pasta selecionada" readonly style="flex:1">
+            <label class="btn" style="padding:6px;display:inline-block">Selecionar Pasta
+                <input id="mp3_files" type="file" webkitdirectory directory multiple style="display:none">
+            </label>
+            <button id="upload_btn" class="btn">Upload</button>
+        </div>
+        <div style="font-size:12px;margin-top:6px;color:#aaa">O upload envia arquivos .mp3 para o servidor para reprodução silenciosa.</div>
+    </div>
+    <div class="status" id="src_status">Fonte atual: —</div>
 </div>
 </div>
+
 <script>
 const bars = document.getElementById('bars');
 for(let i=0;i<150;i++){ const d=document.createElement('div'); d.className='bar'; bars.appendChild(d);}
 const els = {
-  conn:document.getElementById('conn'), fps:document.getElementById('fps'), dev:document.getElementById('dev'),
-  srch:document.getElementById('srch'), tx:document.getElementById('tx'), auto:document.getElementById('auto'),
-  nb:document.getElementById('nb'), sil:document.getElementById('sil'), avg:document.getElementById('avg'),
-  rms:document.getElementById('rms')
+    conn:document.getElementById('conn'), fps:document.getElementById('fps'), dev:document.getElementById('dev'),
+    srch:document.getElementById('srch'), tx:document.getElementById('tx'), auto:document.getElementById('auto'),
+    nb:document.getElementById('nb'), sil:document.getElementById('sil'), avg:document.getElementById('avg'),
+    rms:document.getElementById('rms')
 };
+const srcSelect = document.getElementById('src_select');
+const mp3Area = document.getElementById('mp3_area');
+const mp3Files = document.getElementById('mp3_files');
+const mp3Path = document.getElementById('mp3_folder_path');
+const uploadBtn = document.getElementById('upload_btn');
+const applyBtn = document.getElementById('apply_btn');
+const statusDiv = document.getElementById('src_status');
+
+srcSelect.addEventListener('change', ()=>{ mp3Area.style.display = (srcSelect.value==='mp3')? 'block':'none'; });
+mp3Files.addEventListener('change', ()=>{
+    if(mp3Files.files.length>0){ mp3Path.value = mp3Files.files[0].webkitRelativePath ? mp3Files.files[0].webkitRelativePath.split('/')[0] : mp3Files.files[0].name; }
+});
+
+uploadBtn.addEventListener('click', async ()=>{
+    if(!mp3Files.files.length){ alert('Selecione uma pasta com arquivos .mp3 primeiro.'); return; }
+    const form = new FormData();
+    for(const f of mp3Files.files){ form.append('files', f, f.name); }
+    uploadBtn.disabled = true; uploadBtn.textContent='Enviando...';
+    try{
+        const r = await fetch('/api/upload_mp3', { method:'POST', body: form });
+        const j = await r.json();
+        if(r.ok){ statusDiv.textContent = 'MP3 upload OK — ' + (j.count||0) + ' arquivos'; }
+        else { statusDiv.textContent = 'Erro upload: ' + j.error; }
+    }catch(e){ statusDiv.textContent = 'Erro upload: '+e; }
+    uploadBtn.disabled = false; uploadBtn.textContent='Upload';
+});
+
+applyBtn.addEventListener('click', async ()=>{
+    const src = srcSelect.value;
+    applyBtn.disabled = true; applyBtn.textContent='Aplicando...';
+    const body = { source: src };
+    try{
+        const r = await fetch('/api/set_source', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body) });
+        const j = await r.json();
+        if(r.ok){ statusDiv.textContent = 'Fonte aplicada: ' + j.current; }
+        else { statusDiv.textContent = 'Erro: ' + j.error; }
+    }catch(e){ statusDiv.textContent = 'Erro: '+e; }
+    applyBtn.disabled = false; applyBtn.textContent='Aplicar Configuração';
+});
+
 function connect(){
-  const ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
-  ws.onopen=()=>{ els.conn.textContent='Conectado'; els.conn.style.background='#264'; };
-  ws.onclose=()=>{ els.conn.textContent='Desconectado'; els.conn.style.background='#633'; setTimeout(connect,1000); };
-  ws.onmessage=(ev)=>{
-    const j=JSON.parse(ev.data);
-    els.fps.textContent=j.fps; els.dev.textContent=j.device; els.srch.textContent=j.sr_ch;
-    els.tx.textContent=j.tx_count; els.auto.textContent=j.auto_mode?'ON':'OFF';
-    els.nb.textContent=j.bands.length; els.sil.textContent=j.silence?'Sim':'Não';
-    els.avg.textContent=j.avg; els.rms.textContent=j.rms;
-    const b=document.getElementsByClassName('bar');
-    const n=Math.min(b.length,j.bands.length);
-    for(let i=0;i<n;i++){ b[i].style.height=(j.bands[i]/255.0*100)+'%';}
-  };
+    const ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
+    ws.onopen=()=>{ els.conn.textContent='Conectado'; els.conn.style.background='#264'; };
+    ws.onclose=()=>{ els.conn.textContent='Desconectado'; els.conn.style.background='#633'; setTimeout(connect,1000); };
+    ws.onmessage=(ev)=>{
+        const j=JSON.parse(ev.data);
+        els.fps.textContent=j.fps; els.dev.textContent=j.device; els.srch.textContent=j.sr_ch;
+        els.tx.textContent=j.tx_count; els.auto.textContent=j.auto_mode?'ON':'OFF';
+        els.nb.textContent=j.bands.length; els.sil.textContent=j.silence?'Sim':'Não';
+        els.avg.textContent=j.avg; els.rms.textContent=j.rms;
+        const b=document.getElementsByClassName('bar');
+        const n=Math.min(b.length,j.bands.length);
+        for(let i=0;i<n;i++){ b[i].style.height=(j.bands[i]/255.0*100)+'%';}
+    };
 }
 connect();
 </script>
@@ -369,6 +448,9 @@ async def handle_status(request):
         "avg": round(float(sh.avg), 2), "rms": round(float(sh.rms), 6),
         "active": bool(sh.active), "tx_count": sh.tx_count,
         "bands_len": len(sh.bands), "auto_mode": bool(ss["auto_mode"]),
+        "current_source": request.app.get('current_source'),
+        "mp3_dir": request.app.get('mp3_dir'),
+        "hw_mode": request.app.get('hw_mode'),
         "th_silence_bands": round(ss["silence_bands"],1),
         "th_silence_rms": round(ss["silence_rms"],6),
         "th_resume_factor": round(ss["resume_factor"],2),
@@ -396,6 +478,179 @@ async def handle_mode(request):
         ss["force_silence_once"] = True; print("[SILENCIO] Forçando apagamento...")
     return web.json_response({"status": "ok"})
 app.router.add_post('/api/mode', handle_mode)
+
+
+# ----------------- Fonte / MP3 handling -----------------
+def ensure_pydub():
+    try:
+        import pydub
+        return pydub
+    except Exception:
+        print('[INFO] pydub não encontrado — instalando via pip...')
+        try:
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pydub', 'imageio-ffmpeg'])
+        except Exception as e:
+            raise RuntimeError(f'Falha ao instalar pydub: {e}')
+        import importlib
+        pydub = importlib.import_module('pydub')
+        try:
+            img = importlib.import_module('imageio_ffmpeg')
+            ff = img.get_ffmpeg_exe()
+            pydub.AudioSegment.converter = ff
+        except Exception:
+            pass
+        return pydub
+
+def start_mp3_worker(app, folder_path):
+    """Start a background thread that decodes mp3 files (silent) and feeds analysis callback."""
+    if not os.path.isdir(folder_path):
+        raise RuntimeError('Pasta MP3 inexistente')
+    # collect mp3 files
+    files = []
+    for root, _, fnames in os.walk(folder_path):
+        for f in fnames:
+            if f.lower().endswith('.mp3'):
+                files.append(os.path.join(root, f))
+    if not files:
+        raise RuntimeError('Nenhum MP3 encontrado na pasta')
+
+    pydub = ensure_pydub()
+    AudioSegment = pydub.AudioSegment
+
+    stop_event = threading.Event()
+    app['mp3_stop_event'] = stop_event
+
+    def worker():
+        shared = app['shared']
+        # determine playback rate
+        sr = int(shared.samplerate or 44100)
+        block_size = BLOCK_SIZE
+        while not stop_event.is_set():
+            order = files[:]
+            random.shuffle(order)
+            for fp in order:
+                if stop_event.is_set(): break
+                try:
+                    seg = AudioSegment.from_file(fp)
+                    seg = seg.set_channels(1)
+                    seg = seg.set_frame_rate(sr)
+                    arr = np.array(seg.get_array_of_samples())
+                    # pydub sample width handling
+                    sw = seg.sample_width
+                    if sw == 2:
+                        arr = arr.astype(np.float32) / 32768.0
+                    elif sw == 4:
+                        arr = arr.astype(np.float32) / (2**31)
+                    else:
+                        # fallback normalization
+                        arr = arr.astype(np.float32)
+                        arr /= np.max(np.abs(arr)) if arr.size else 1.0
+                    total = arr.shape[0]
+                    pos = 0
+                    # feed in blocks at realtime pace
+                    t_block = float(block_size) / float(sr)
+                    while pos < total and not stop_event.is_set():
+                        chunk = arr[pos:pos+block_size]
+                        if chunk.shape[0] < block_size:
+                            chunk = np.pad(chunk, (0, block_size - chunk.shape[0]), 'constant')
+                        try:
+                            # call core audio callback (bypassing hardware guard)
+                            cb = app.get('audio_cb_core')
+                            if cb:
+                                cb(chunk, chunk.shape[0], None, None)
+                        except Exception:
+                            pass
+                        pos += block_size
+                        time.sleep(t_block)
+                except Exception as e:
+                    print(f"[MP3] falha ao processar '{fp}': {e}")
+            # loop infinite
+
+    t = threading.Thread(target=worker, daemon=True)
+    app['mp3_thread'] = t
+    t.start()
+    print(f"[MP3] Worker iniciado (pasta={folder_path}, arquivos={len(files)})")
+
+def stop_mp3_worker(app):
+    ev = app.get('mp3_stop_event')
+    th = app.get('mp3_thread')
+    app['mp3_thread'] = None
+    app['mp3_stop_event'] = None
+    if ev is not None:
+        ev.set()
+    if th is not None:
+        th.join(timeout=1.0)
+    # keep mp3_dir for possible reuse
+
+async def handle_upload_mp3(request):
+    """Receive multipart upload with field 'files' (multiple). Saves into temp folder and sets as mp3_dir."""
+    data = await request.post()
+    files = data.getall('files') if hasattr(data, 'getall') else []
+    if not files:
+        return web.json_response({'status':'error','error':'Nenhum arquivo recebido'}, status=400)
+    dst = tempfile.mkdtemp(prefix='rl_mp3_')
+    count = 0
+    try:
+        for f in files:
+            # f can be either FileField or similar
+            name = getattr(f, 'filename', None) or getattr(f, 'name', None) or str(time.time())
+            # only keep mp3
+            if not name.lower().endswith('.mp3'):
+                continue
+            path = os.path.join(dst, os.path.basename(name))
+            with open(path, 'wb') as fh:
+                fh.write(f.file.read())
+            count += 1
+        if count == 0:
+            shutil.rmtree(dst, ignore_errors=True)
+            return web.json_response({'status':'error','error':'Nenhum MP3 encontrado nos arquivos enviados'}, status=400)
+        # replace previous mp3_dir
+        old = request.app.get('mp3_dir')
+        request.app['mp3_dir'] = dst
+        if old and os.path.isdir(old):
+            try: shutil.rmtree(old)
+            except Exception: pass
+        return web.json_response({'status':'ok','count': count, 'mp3_dir': dst})
+    except Exception as e:
+        shutil.rmtree(dst, ignore_errors=True)
+        return web.json_response({'status':'error','error': str(e)}, status=500)
+
+app.router.add_post('/api/upload_mp3', handle_upload_mp3)
+
+async def handle_set_source(request):
+    """Set source: {source: 'system'|'linein'|'mp3'}"""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({'status':'error','error':'JSON inválido'}, status=400)
+    src = data.get('source')
+    if src not in ('system','linein','mp3'):
+        return web.json_response({'status':'error','error':'Fonte inválida'}, status=400)
+    # stop MP3 if running
+    if src != 'mp3':
+        stop_mp3_worker(request.app)
+        request.app['current_source'] = 'hardware'
+        request.app['hw_mode'] = src
+        return web.json_response({'status':'ok','current': 'hardware'})
+    # src == mp3
+    mp3_dir = request.app.get('mp3_dir')
+    if not mp3_dir or not os.path.isdir(mp3_dir):
+        # fallback to linein
+        request.app['current_source'] = 'hardware'
+        request.app['hw_mode'] = 'linein'
+        return web.json_response({'status':'error','error':'Pasta MP3 inexistente ou vazia - voltando para Line In'}, status=400)
+    try:
+        stop_mp3_worker(request.app)
+        start_mp3_worker(request.app, mp3_dir)
+        request.app['current_source'] = 'mp3'
+        return web.json_response({'status':'ok','current':'mp3'})
+    except Exception as e:
+        request.app['current_source'] = 'hardware'
+        request.app['hw_mode'] = 'linein'
+        return web.json_response({'status':'error','error': str(e)}, status=500)
+
+app.router.add_post('/api/set_source', handle_set_source)
+
 
 async def handle_reset(request):
     cfg = request.app["cfg"]
@@ -557,7 +812,7 @@ class CSVLogger:
         b = int(row.get("bands_len", 0))
         if self._need_rotate(b):
             self._open_new(b)
-        if self._header is None or len(self._header) != (16 + b):  # 16 = base cols
+        if self._header is None or len(self._header) != (15 + b):  # 16 = base cols
             self._write_header(b, row)
         self._writer.writerow(row)
         self._written_bytes += sum(len(str(v)) for v in row.values()) + len(self._header)
@@ -846,6 +1101,13 @@ def main():
     n_bands = int(args.bands)
     shared = Shared(n_bands)
     app["shared"] = shared
+    # source control state (hardware vs mp3)
+    app["current_source"] = 'hardware'
+    app["hw_mode"] = 'system'
+    app["mp3_dir"] = None
+    app["mp3_thread"] = None
+    app["mp3_stop_event"] = None
+    app["audio_cb_core"] = None
 
     def start_web():
         loop = asyncio.new_event_loop()
@@ -940,7 +1202,12 @@ def main():
     if args.backend in ("auto","sd"):
         try:
             audio_cb = make_audio_cb()
+            # expose core callback for MP3 worker
+            app['audio_cb_core'] = audio_cb
             def sd_wrapper(indata, frames, time_info, status):
+                # only feed hardware audio when current source is hardware
+                if app.get('current_source', 'hardware') != 'hardware':
+                    return
                 arr = indata.copy().astype(np.float32)
                 if arr.ndim>1 and arr.shape[1]>1:
                     arr = arr.mean(axis=1)
@@ -969,6 +1236,7 @@ def main():
     if stream is None and args.backend in ("auto","pyaudio"):
         try:
             audio_cb = make_audio_cb()
+            app['audio_cb_core'] = audio_cb
             tag, pa_instance, pa_stream, sr_eff, ch_eff = _paw_choose_and_open(args.allow_mic, args.mic_device, audio_cb)
             _build_compute(sr_eff)
             pa_stream.start_stream()
