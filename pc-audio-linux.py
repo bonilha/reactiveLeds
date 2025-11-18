@@ -86,6 +86,7 @@ body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:12p
 h2{margin:4px 0} .mono{font-family:ui-monospace,Consolas,Menlo,monospace}
 .bars{height:120px;background:#000;border:1px solid #333;border-radius:6px;display:flex;align-items:flex-end;padding:4px;gap:1px;overflow:hidden}
 .bar{width:3px;background:#39f}
+.bar{width:auto;flex:1 1 auto;background:#39f}
 .kv{display:grid;grid-template-columns:130px 1fr;gap:6px;margin-top:6px}
 .badge{padding:2px 6px;border-radius:999px;background:#333;display:inline-block}
 .controls{display:grid;grid-template-columns:1fr;gap:8px;margin-top:8px}
@@ -128,13 +129,19 @@ h2{margin:4px 0} .mono{font-family:ui-monospace,Consolas,Menlo,monospace}
     </div>
     <div id="mp3_area" style="display:none">
         <div class="row">
-            <input id="mp3_folder_path" class="input-small" placeholder="Nenhuma pasta selecionada" readonly style="flex:1">
-            <label class="btn" style="padding:6px;display:inline-block">Selecionar Pasta
+            <input id="mp3_server_path" class="input-small" placeholder="Caminho da pasta no servidor (ex: /home/user/mp3)" style="flex:1">
+            <button id="use_server_btn" class="btn">Usar Pasta no Servidor</button>
+        </div>
+        <div style="font-size:12px;margin-top:6px;color:#aaa">Informe uma pasta existente no computador onde este servidor está rodando. O servidor lerá os arquivos .mp3 dessa pasta (shuffle, loop) e não reproduzirá som.</div>
+        <div style="height:6px"></div>
+        <div style="font-size:12px;color:#bbb">(Opcional) Enviar arquivos do cliente para o servidor:</div>
+        <div class="row">
+            <label class="btn" style="padding:6px;display:inline-block">Selecionar Pasta Local
                 <input id="mp3_files" type="file" webkitdirectory directory multiple style="display:none">
             </label>
+            <input id="mp3_folder_path" class="input-small" placeholder="Nenhuma pasta selecionada (upload)" readonly style="flex:1">
             <button id="upload_btn" class="btn">Upload</button>
         </div>
-        <div style="font-size:12px;margin-top:6px;color:#aaa">O upload envia arquivos .mp3 para o servidor para reprodução silenciosa.</div>
     </div>
     <div class="status" id="src_status">Fonte atual: —</div>
 </div>
@@ -156,10 +163,24 @@ const mp3Path = document.getElementById('mp3_folder_path');
 const uploadBtn = document.getElementById('upload_btn');
 const applyBtn = document.getElementById('apply_btn');
 const statusDiv = document.getElementById('src_status');
+const useServerBtn = document.getElementById('use_server_btn');
 
 srcSelect.addEventListener('change', ()=>{ mp3Area.style.display = (srcSelect.value==='mp3')? 'block':'none'; });
 mp3Files.addEventListener('change', ()=>{
-    if(mp3Files.files.length>0){ mp3Path.value = mp3Files.files[0].webkitRelativePath ? mp3Files.files[0].webkitRelativePath.split('/')[0] : mp3Files.files[0].name; }
+    if(mp3Files.files.length>0){ document.getElementById('mp3_folder_path').value = mp3Files.files[0].webkitRelativePath ? mp3Files.files[0].webkitRelativePath.split('/')[0] : mp3Files.files[0].name; }
+});
+
+useServerBtn.addEventListener('click', async ()=>{
+    const p = document.getElementById('mp3_server_path').value.trim();
+    if(!p){ alert('Informe o caminho da pasta no servidor.'); return; }
+    useServerBtn.disabled = true; useServerBtn.textContent='Verificando...';
+    try{
+        const r = await fetch('/api/set_mp3_dir', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({path: p}) });
+        const j = await r.json();
+        if(r.ok){ statusDiv.textContent = 'Pasta no servidor definida — ' + (j.count||0) + ' arquivos'; }
+        else { statusDiv.textContent = 'Erro: ' + j.error; }
+    }catch(e){ statusDiv.textContent = 'Erro: '+e; }
+    useServerBtn.disabled = false; useServerBtn.textContent='Usar Pasta no Servidor';
 });
 
 uploadBtn.addEventListener('click', async ()=>{
@@ -199,7 +220,16 @@ function connect(){
         els.tx.textContent=j.tx_count; els.auto.textContent=j.auto_mode?'ON':'OFF';
         els.nb.textContent=j.bands.length; els.sil.textContent=j.silence?'Sim':'Não';
         els.avg.textContent=j.avg; els.rms.textContent=j.rms;
-        const b=document.getElementsByClassName('bar');
+        // ensure bar count matches bands length
+        const barsContainer = document.getElementById('bars');
+        const cur = barsContainer.children.length;
+        const want = j.bands.length || 0;
+        if(cur !== want){
+            // rebuild
+            barsContainer.innerHTML = '';
+            for(let i=0;i<want;i++){ const d=document.createElement('div'); d.className='bar'; barsContainer.appendChild(d); }
+        }
+        const b = barsContainer.children;
         const n=Math.min(b.length,j.bands.length);
         for(let i=0;i<n;i++){ b[i].style.height=(j.bands[i]/255.0*100)+'%';}
     };
@@ -604,10 +634,12 @@ async def handle_upload_mp3(request):
         if count == 0:
             shutil.rmtree(dst, ignore_errors=True)
             return web.json_response({'status':'error','error':'Nenhum MP3 encontrado nos arquivos enviados'}, status=400)
-        # replace previous mp3_dir
+        # replace previous mp3_dir (if previous was a temp upload folder, remove it)
         old = request.app.get('mp3_dir')
+        old_was_temp = request.app.get('mp3_dir_is_temp', False)
         request.app['mp3_dir'] = dst
-        if old and os.path.isdir(old):
+        request.app['mp3_dir_is_temp'] = True
+        if old and os.path.isdir(old) and old_was_temp:
             try: shutil.rmtree(old)
             except Exception: pass
         return web.json_response({'status':'ok','count': count, 'mp3_dir': dst})
@@ -650,6 +682,38 @@ async def handle_set_source(request):
         return web.json_response({'status':'error','error': str(e)}, status=500)
 
 app.router.add_post('/api/set_source', handle_set_source)
+
+
+async def handle_set_mp3_dir(request):
+    """Set server-side mp3 directory: {path: '/path/to/folder'}"""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({'status':'error','error':'JSON inválido'}, status=400)
+    p = data.get('path')
+    if not p:
+        return web.json_response({'status':'error','error':'path ausente'}, status=400)
+    if not os.path.isdir(p):
+        return web.json_response({'status':'error','error':'pasta não encontrada no servidor'}, status=400)
+    # count mp3
+    files = []
+    for root, _, fnames in os.walk(p):
+        for f in fnames:
+            if f.lower().endswith('.mp3'):
+                files.append(os.path.join(root, f))
+    if not files:
+        return web.json_response({'status':'error','error':'nenhum mp3 na pasta'}, status=400)
+    # set and respond
+    old = request.app.get('mp3_dir')
+    old_was_temp = request.app.get('mp3_dir_is_temp', False)
+    request.app['mp3_dir'] = p
+    request.app['mp3_dir_is_temp'] = False
+    if old and os.path.isdir(old) and old_was_temp and old != p:
+        try: shutil.rmtree(old)
+        except Exception: pass
+    return web.json_response({'status':'ok','mp3_dir': p, 'count': len(files)})
+
+app.router.add_post('/api/set_mp3_dir', handle_set_mp3_dir)
 
 
 async def handle_reset(request):
