@@ -143,6 +143,10 @@ h2{margin:4px 0} .mono{font-family:ui-monospace,Consolas,Menlo,monospace}
             <input id="mp3_folder_path" class="input-small" placeholder="Nenhuma pasta selecionada (upload)" readonly style="flex:1">
             <button id="upload_btn" class="btn">Upload</button>
         </div>
+        <div style="margin-top:8px;">
+            <progress id="upload_progress" value="0" max="100" style="width:100%;display:none"></progress>
+            <div id="upload_info" style="font-size:12px;color:#ccc;margin-top:6px"></div>
+        </div>
     </div>
     <div class="status" id="src_status">Fonte atual: —</div>
 </div>
@@ -189,13 +193,40 @@ uploadBtn.addEventListener('click', async ()=>{
     const form = new FormData();
     for(const f of mp3Files.files){ form.append('files', f, f.name); }
     uploadBtn.disabled = true; uploadBtn.textContent='Enviando...';
+    const progress = document.getElementById('upload_progress');
+    const info = document.getElementById('upload_info');
+    progress.style.display = 'block'; progress.value = 0; info.textContent = '';
     try{
-        const r = await fetch('/api/upload_mp3', { method:'POST', body: form });
-        const j = await r.json();
-        if(r.ok){ statusDiv.textContent = 'MP3 upload OK — ' + (j.count||0) + ' arquivos'; }
-        else { statusDiv.textContent = 'Erro upload: ' + j.error; }
+        await new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/api/upload_mp3');
+            xhr.upload.onprogress = (ev) => {
+                if(ev.lengthComputable){
+                    const pct = Math.round((ev.loaded/ev.total)*100);
+                    progress.value = pct;
+                    info.textContent = `Enviando... ${pct}% (${(ev.loaded/1024/1024).toFixed(1)} MB)`;
+                } else {
+                    info.textContent = 'Enviando...';
+                }
+            };
+            xhr.onerror = () => { reject(new Error('Erro de rede durante upload')); };
+            xhr.onload = () => {
+                if(xhr.status >=200 && xhr.status < 300){
+                    try{ const j = JSON.parse(xhr.responseText); resolve(j); }
+                    catch(e){ resolve({}); }
+                } else {
+                    try{ const j = JSON.parse(xhr.responseText); reject(new Error(j.error||xhr.statusText)); }
+                    catch(e){ reject(new Error(xhr.statusText)); }
+                }
+            };
+            xhr.send(form);
+        }).then((j)=>{
+            statusDiv.textContent = 'MP3 upload OK — ' + (j.count||0) + ' arquivos';
+            const info = document.getElementById('upload_info');
+            if(j.mp3_dir) info.textContent = 'Salvo em: ' + j.mp3_dir;
+        }).catch((err)=>{ statusDiv.textContent = 'Erro upload: '+err; info.textContent = '' });
     }catch(e){ statusDiv.textContent = 'Erro upload: '+e; }
-    uploadBtn.disabled = false; uploadBtn.textContent='Upload';
+    uploadBtn.disabled = false; uploadBtn.textContent='Upload'; progress.style.display='none';
 });
 
 applyBtn.addEventListener('click', async ()=>{
@@ -639,20 +670,11 @@ async def handle_upload_mp3(request):
     Writes are performed asynchronously using aiofiles to avoid blocking the aiohttp event loop.
     Filenames are sanitized to prevent path traversal; only .mp3 files are accepted.
     """
-    # choose persistent destination depending on OS
-    sysname = platform.system().lower()
-    if sysname.startswith('linux') or sysname.startswith('darwin'):
-        dst = os.path.expanduser('~/mp3')
-    elif sysname.startswith('win'):
-        homedrive = os.environ.get('HOMEDRIVE', '')
-        homepath = os.environ.get('HOMEPATH') or os.environ.get('USERPROFILE') or ''
-        if homedrive and homepath:
-            dst = os.path.join(homedrive + homepath, 'mp3')
-        else:
-            dst = os.path.expanduser('~/mp3')
-    else:
-        dst = os.path.expanduser('~/mp3')
+    # choose persistent destination: use `mp3` folder next to this script (easier to find)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    dst = os.path.join(script_dir, 'mp3')
     os.makedirs(dst, exist_ok=True)
+    print(f"[UPLOAD] recebendo arquivos MP3 -> {dst}")
 
     # Multipart streaming reader (does not buffer entire file in memory)
     reader = await request.multipart()
