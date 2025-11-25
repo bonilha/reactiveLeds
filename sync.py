@@ -439,6 +439,7 @@ def main():
     last_rx_ts = time.time()
     next_frame = time.time()
     last_render_ts = 0.0
+    _last_solar_log = 0.0
     # --- Solar schedule state ---
     solar_date = None
     solar_sunrise = None
@@ -502,6 +503,15 @@ def main():
                             solar_on_time = None
                     # if we have valid sunrise/on-time, enforce off window
                     if solar_sunrise is not None and solar_on_time is not None:
+                        # log diagnostics at most once every 60s
+                        try:
+                            if (time.time() - _last_solar_log) > 60.0:
+                                cond = (solar_sunrise <= now_dt < solar_on_time)
+                                _last_solar_log = time.time()
+                                log_info(f"[SOLARDBG] now={now_dt.isoformat()} sunrise={solar_sunrise.isoformat()} on_time={solar_on_time.isoformat()} cond={cond} tz={getattr(now_dt,'tzinfo',None)}")
+                        except Exception:
+                            pass
+
                         if solar_sunrise <= now_dt < solar_on_time:
                             # within forced-off window
                             if not already_off:
