@@ -454,15 +454,21 @@ def main():
             solar_date = None
             solar_sunrise = None
             solar_on_time = None
-    # Diagnostic log about solar scheduling
+    # Diagnostic log about solar scheduling (also print to stdout to ensure visibility)
     try:
         if ENABLE_SOLAR_SCHEDULE:
-            log_info(f"[SOLAR] scheduling enabled; astral={'yes' if ASTRAL_AVAILABLE else 'no'}")
+            msg = f"[SOLAR] scheduling enabled; astral={'yes' if ASTRAL_AVAILABLE else 'no'}"
+            log_info(msg)
+            print(msg, flush=True)
             if solar_sunrise is not None and solar_on_time is not None:
                 tzname = SOLAR_TIMEZONE if ZoneInfo is not None else 'local'
-                log_info(f"[SOLAR] sunrise={solar_sunrise.isoformat()} on_time={solar_on_time.isoformat()} tz={tzname}")
+                msg2 = f"[SOLAR] sunrise={solar_sunrise.isoformat()} on_time={solar_on_time.isoformat()} tz={tzname}"
+                log_info(msg2)
+                print(msg2, flush=True)
             else:
-                log_info("[SOLAR] sunrise/on_time unavailable (scheduling will use fallback times)")
+                msg3 = "[SOLAR] sunrise/on_time unavailable (scheduling will use fallback times)"
+                log_info(msg3)
+                print(msg3, flush=True)
     except Exception:
         pass
 
@@ -503,12 +509,14 @@ def main():
                             solar_on_time = None
                     # if we have valid sunrise/on-time, enforce off window
                     if solar_sunrise is not None and solar_on_time is not None:
-                        # log diagnostics at most once every 60s
+                        # log diagnostics at most once every 10s (more aggressive for debugging)
                         try:
-                            if (time.time() - _last_solar_log) > 60.0:
+                            if (time.time() - _last_solar_log) > 10.0:
                                 cond = (solar_sunrise <= now_dt < solar_on_time)
                                 _last_solar_log = time.time()
-                                log_info(f"[SOLARDBG] now={now_dt.isoformat()} sunrise={solar_sunrise.isoformat()} on_time={solar_on_time.isoformat()} cond={cond} tz={getattr(now_dt,'tzinfo',None)}")
+                                dbg = f"[SOLARDBG] now={now_dt.isoformat()} sunrise={solar_sunrise.isoformat()} on_time={solar_on_time.isoformat()} cond={cond} tz={getattr(now_dt,'tzinfo',None)}"
+                                log_info(dbg)
+                                print(dbg, flush=True)
                         except Exception:
                             pass
 
