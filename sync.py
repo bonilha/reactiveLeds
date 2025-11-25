@@ -447,6 +447,22 @@ def main():
             solar_sunrise = None
             solar_on_time = None
 
+    # Enforce initial LED state according to solar schedule (startup behavior)
+    try:
+        if ENABLE_SOLAR_SCHEDULE and ASTRAL_AVAILABLE and solar_sunrise is not None and solar_on_time is not None:
+            tz = ZoneInfo(SOLAR_TIMEZONE) if ZoneInfo is not None else None
+            now_dt = datetime.now(tz) if tz is not None else datetime.now()
+            if solar_sunrise <= now_dt < solar_on_time:
+                pixels.fill((0,0,0)); pixels.show()
+                already_off = True
+                log_event_inline(f"[SOLAR] LEDs desligados na inicialização ({solar_date.isoformat()})")
+            else:
+                already_off = False
+                log_event_inline(f"[SOLAR] LEDs ativos na inicialização ({solar_date.isoformat()})")
+    except Exception:
+        # don't prevent startup on any error here
+        pass
+
     try:
         while True:
             now = time.time()
