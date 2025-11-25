@@ -75,14 +75,22 @@ except Exception:
 def _compute_sun_times_for(d: date):
     """Return (sunrise_dt, sunset_dt) for date d as timezone-aware datetimes.
     Returns (None, None) if calculation is not available."""
-    if not ASTRAL_AVAILABLE:
-        return None, None
+    # prefer astral when available, otherwise use simple fallback (06:00/18:00 local)
+    tz = ZoneInfo(SOLAR_TIMEZONE) if ZoneInfo is not None else None
+    if ASTRAL_AVAILABLE:
+        try:
+            observer = Observer(latitude=SOLAR_LATITUDE, longitude=SOLAR_LONGITUDE)
+            s = astral_sun(observer, date=d, tzinfo=tz)
+            sunrise = s.get('sunrise')
+            sunset = s.get('sunset')
+            return sunrise, sunset
+        except Exception:
+            # fall through to fallback heuristic
+            pass
+    # fallback times (naive but predictable): sunrise at 06:00, sunset at 18:00
     try:
-        observer = Observer(latitude=SOLAR_LATITUDE, longitude=SOLAR_LONGITUDE)
-        tz = ZoneInfo(SOLAR_TIMEZONE) if ZoneInfo is not None else None
-        s = astral_sun(observer, date=d, tzinfo=tz)
-        sunrise = s.get('sunrise')
-        sunset = s.get('sunset')
+        sunrise = datetime(d.year, d.month, d.day, 6, 0, tzinfo=tz)
+        sunset = datetime(d.year, d.month, d.day, 18, 0, tzinfo=tz)
         return sunrise, sunset
     except Exception:
         return None, None
@@ -435,21 +443,31 @@ def main():
     solar_date = None
     solar_sunrise = None
     solar_on_time = None
-    if ENABLE_SOLAR_SCHEDULE and ASTRAL_AVAILABLE:
+    if ENABLE_SOLAR_SCHEDULE:
         solar_date = date.today()
         sr, ss = _compute_sun_times_for(solar_date)
         if sr is not None and ss is not None:
             solar_sunrise = sr
             solar_on_time = ss - timedelta(minutes=30)
         else:
-            # disable if computation failed
             solar_date = None
             solar_sunrise = None
             solar_on_time = None
+    # Diagnostic log about solar scheduling
+    try:
+        if ENABLE_SOLAR_SCHEDULE:
+            log_info(f"[SOLAR] scheduling enabled; astral={'yes' if ASTRAL_AVAILABLE else 'no'}")
+            if solar_sunrise is not None and solar_on_time is not None:
+                tzname = SOLAR_TIMEZONE if ZoneInfo is not None else 'local'
+                log_info(f"[SOLAR] sunrise={solar_sunrise.isoformat()} on_time={solar_on_time.isoformat()} tz={tzname}")
+            else:
+                log_info("[SOLAR] sunrise/on_time unavailable (scheduling will use fallback times)")
+    except Exception:
+        pass
 
     # Enforce initial LED state according to solar schedule (startup behavior)
     try:
-        if ENABLE_SOLAR_SCHEDULE and ASTRAL_AVAILABLE and solar_sunrise is not None and solar_on_time is not None:
+        if ENABLE_SOLAR_SCHEDULE and solar_sunrise is not None and solar_on_time is not None:
             tz = ZoneInfo(SOLAR_TIMEZONE) if ZoneInfo is not None else None
             now_dt = datetime.now(tz) if tz is not None else datetime.now()
             if solar_sunrise <= now_dt < solar_on_time:
@@ -468,7 +486,7 @@ def main():
             now = time.time()
             # check solar schedule (if available) and force LEDs off between
             # sunrise and (sunset - 30 minutes)
-            if ENABLE_SOLAR_SCHEDULE and ASTRAL_AVAILABLE:
+            if ENABLE_SOLAR_SCHEDULE:
                 try:
                     tz = ZoneInfo(SOLAR_TIMEZONE) if ZoneInfo is not None else None
                     now_dt = datetime.now(tz) if tz is not None else datetime.now()
