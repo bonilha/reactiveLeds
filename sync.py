@@ -2,6 +2,7 @@
 # sync.py — Raspberry Pi renderer (A2/A1 + B0 + B1 reset) com log single/multi linha
 import socket, time, board, neopixel, random, threading, sys, select, tty, termios, os, argparse
 import numpy as np
+import traceback
 from datetime import datetime, date, timedelta
 from collections import deque
 from fxcore import FXContext
@@ -94,6 +95,17 @@ def _compute_sun_times_for(d: date):
         return sunrise, sunset
     except Exception:
         return None, None
+
+def _dt_to_timestamp(dt):
+    if dt is None:
+        return None
+    try:
+        if getattr(dt, 'tzinfo', None) is not None:
+            return dt.timestamp()
+        # naive datetime -> assume local
+        return time.mktime(dt.timetuple()) + dt.microsecond / 1e6
+    except Exception:
+        return None
 
 # -------------------- Estado dinâmico --------------------
 EXPECTED_BANDS = 150
@@ -454,6 +466,9 @@ def main():
             solar_date = None
             solar_sunrise = None
             solar_on_time = None
+        # compute epoch timestamps for robust comparison
+        solar_sunrise_ts = _dt_to_timestamp(solar_sunrise)
+        solar_on_time_ts = _dt_to_timestamp(solar_on_time)
     # Diagnostic log about solar scheduling (also print to stdout to ensure visibility)
     try:
         if ENABLE_SOLAR_SCHEDULE:
@@ -474,16 +489,21 @@ def main():
 
     # Enforce initial LED state according to solar schedule (startup behavior)
     try:
-        if ENABLE_SOLAR_SCHEDULE and solar_sunrise is not None and solar_on_time is not None:
-            tz = ZoneInfo(SOLAR_TIMEZONE) if ZoneInfo is not None else None
-            now_dt = datetime.now(tz) if tz is not None else datetime.now()
-            if solar_sunrise <= now_dt < solar_on_time:
-                pixels.fill((0,0,0)); pixels.show()
-                already_off = True
-                log_event_inline(f"[SOLAR] LEDs desligados na inicialização ({solar_date.isoformat()})")
-            else:
-                already_off = False
-                log_event_inline(f"[SOLAR] LEDs ativos na inicialização ({solar_date.isoformat()})")
+        if ENABLE_SOLAR_SCHEDULE and solar_sunrise_ts is not None and solar_on_time_ts is not None:
+            now_ts = time.time()
+            try:
+                cond = (solar_sunrise_ts <= now_ts < solar_on_time_ts)
+                print(f"[SOLAR-BOOT] now_ts={now_ts} sunrise_ts={solar_sunrise_ts} on_time_ts={solar_on_time_ts} cond={cond}", flush=True)
+                if cond:
+                    pixels.fill((0,0,0)); pixels.show()
+                    already_off = True
+                    log_event_inline(f"[SOLAR] LEDs desligados na inicialização ({solar_date.isoformat()})")
+                else:
+                    already_off = False
+                    log_event_inline(f"[SOLAR] LEDs ativos na inicialização ({solar_date.isoformat()})")
+            except Exception:
+                print("[SOLAR-BOOT] error evaluating condition:", flush=True)
+                traceback.print_exc()
     except Exception:
         # don't prevent startup on any error here
         pass
@@ -507,20 +527,24 @@ def main():
                         else:
                             solar_sunrise = None
                             solar_on_time = None
-                    # if we have valid sunrise/on-time, enforce off window
-                    if solar_sunrise is not None and solar_on_time is not None:
+                        # update epoch timestamps
+                        solar_sunrise_ts = _dt_to_timestamp(solar_sunrise)
+                        solar_on_time_ts = _dt_to_timestamp(solar_on_time)
+                    # if we have valid sunrise/on-time, enforce off window (compare epoch timestamps)
+                    if solar_sunrise_ts is not None and solar_on_time_ts is not None:
+                        now_ts = time.time()
                         # log diagnostics at most once every 10s (more aggressive for debugging)
                         try:
                             if (time.time() - _last_solar_log) > 10.0:
-                                cond = (solar_sunrise <= now_dt < solar_on_time)
+                                cond = (solar_sunrise_ts <= now_ts < solar_on_time_ts)
                                 _last_solar_log = time.time()
-                                dbg = f"[SOLARDBG] now={now_dt.isoformat()} sunrise={solar_sunrise.isoformat()} on_time={solar_on_time.isoformat()} cond={cond} tz={getattr(now_dt,'tzinfo',None)}"
+                                dbg = f"[SOLARDBG] now={now_dt.isoformat()} now_ts={now_ts} sunrise_ts={solar_sunrise_ts} on_time_ts={solar_on_time_ts} cond={cond} tz={getattr(now_dt,'tzinfo',None)}"
                                 log_info(dbg)
                                 print(dbg, flush=True)
                         except Exception:
                             pass
 
-                        if solar_sunrise <= now_dt < solar_on_time:
+                        if solar_sunrise_ts <= now_ts < solar_on_time_ts:
                             # within forced-off window
                             if not already_off:
                                 pixels.fill((0,0,0)); pixels.show()
@@ -534,7 +558,7 @@ def main():
                             continue
                         else:
                             # if we are past on_time and were off, re-enable
-                            if already_off and now_dt >= solar_on_time:
+                            if already_off and now_ts >= solar_on_time_ts:
                                 already_off = False
                                 log_event_inline(f"[SOLAR] LEDs ligados (após {solar_on_time.time().isoformat()})")
                 except Exception:
