@@ -2,6 +2,7 @@
 # sync.py — Raspberry Pi renderer (A2/A1 + B0 + B1 reset) com log single/multi linha
 import socket, time, board, neopixel, random, threading, sys, select, tty, termios, os, argparse
 import numpy as np
+from datetime import datetime, date, timedelta
 from collections import deque
 from fxcore import FXContext
 from effects import build_effects
@@ -43,6 +44,48 @@ except Exception:
     pass
 udp_sock.bind(("0.0.0.0", UDP_PORT))
 udp_sock.setblocking(True)
+
+# -------------------- Solar schedule (sunrise/sunset) --------------------
+# Default location: Curitiba, Paraná, Brazil
+# Latitude/Longitude values can be overridden by editing these variables
+SOLAR_DEFAULT_NAME = "Curitiba"
+SOLAR_DEFAULT_REGION = "Paraná"
+SOLAR_DEFAULT_COUNTRY = "Brazil"
+SOLAR_LATITUDE = -25.4278
+SOLAR_LONGITUDE = -49.2733
+SOLAR_TIMEZONE = "America/Sao_Paulo"
+# When True, the schedule will turn LEDs OFF at sunrise and ON at (sunset - 30min)
+ENABLE_SOLAR_SCHEDULE = True
+
+# Try to import astral/zoneinfo; if unavailable, solar scheduling will be disabled
+try:
+    from astral import Observer
+    from astral.sun import sun as astral_sun
+    try:
+        from zoneinfo import ZoneInfo
+    except Exception:
+        ZoneInfo = None
+    ASTRAL_AVAILABLE = True
+except Exception:
+    Observer = None
+    astral_sun = None
+    ZoneInfo = None
+    ASTRAL_AVAILABLE = False
+
+def _compute_sun_times_for(d: date):
+    """Return (sunrise_dt, sunset_dt) for date d as timezone-aware datetimes.
+    Returns (None, None) if calculation is not available."""
+    if not ASTRAL_AVAILABLE:
+        return None, None
+    try:
+        observer = Observer(latitude=SOLAR_LATITUDE, longitude=SOLAR_LONGITUDE)
+        tz = ZoneInfo(SOLAR_TIMEZONE) if ZoneInfo is not None else None
+        s = astral_sun(observer, date=d, tzinfo=tz)
+        sunrise = s.get('sunrise')
+        sunset = s.get('sunset')
+        return sunrise, sunset
+    except Exception:
+        return None, None
 
 # -------------------- Estado dinâmico --------------------
 EXPECTED_BANDS = 150
@@ -388,10 +431,63 @@ def main():
     last_rx_ts = time.time()
     next_frame = time.time()
     last_render_ts = 0.0
+    # --- Solar schedule state ---
+    solar_date = None
+    solar_sunrise = None
+    solar_on_time = None
+    if ENABLE_SOLAR_SCHEDULE and ASTRAL_AVAILABLE:
+        solar_date = date.today()
+        sr, ss = _compute_sun_times_for(solar_date)
+        if sr is not None and ss is not None:
+            solar_sunrise = sr
+            solar_on_time = ss - timedelta(minutes=30)
+        else:
+            # disable if computation failed
+            solar_date = None
+            solar_sunrise = None
+            solar_on_time = None
 
     try:
         while True:
             now = time.time()
+            # check solar schedule (if available) and force LEDs off between
+            # sunrise and (sunset - 30 minutes)
+            if ENABLE_SOLAR_SCHEDULE and ASTRAL_AVAILABLE:
+                try:
+                    tz = ZoneInfo(SOLAR_TIMEZONE) if ZoneInfo is not None else None
+                    now_dt = datetime.now(tz) if tz is not None else datetime.now()
+                    # recompute if date changed
+                    if solar_date is None or now_dt.date() != solar_date:
+                        solar_date = now_dt.date()
+                        sr, ss = _compute_sun_times_for(solar_date)
+                        if sr is not None and ss is not None:
+                            solar_sunrise = sr
+                            solar_on_time = ss - timedelta(minutes=30)
+                        else:
+                            solar_sunrise = None
+                            solar_on_time = None
+                    # if we have valid sunrise/on-time, enforce off window
+                    if solar_sunrise is not None and solar_on_time is not None:
+                        if solar_sunrise <= now_dt < solar_on_time:
+                            # within forced-off window
+                            if not already_off:
+                                pixels.fill((0,0,0)); pixels.show()
+                                already_off = True
+                                log_event_inline(f"[SOLAR] LEDs desligados ({solar_date.isoformat()})")
+                            unified_status_line("SolarOff", ctx, False, EXPECTED_BANDS, CFG_FPS, CFG_VIS_FPS, current_palette_name)
+                            next_frame += FRAME_DT
+                            sl = next_frame - time.time()
+                            if sl > 0: time.sleep(sl)
+                            else: next_frame = time.time()
+                            continue
+                        else:
+                            # if we are past on_time and were off, re-enable
+                            if already_off and now_dt >= solar_on_time:
+                                already_off = False
+                                log_event_inline(f"[SOLAR] LEDs ligados (após {solar_on_time.time().isoformat()})")
+                except Exception:
+                    # ignore solar scheduling errors and proceed normally
+                    pass
             desired_frame_dt = 1.0 / max(1, CFG_FPS)
             desired_hold = SIGNAL_HOLD_MS / 1000.0
             desired_render_dt = 1.0 / max(1, CFG_VIS_FPS)
