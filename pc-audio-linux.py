@@ -1067,6 +1067,13 @@ def _sd_choose_and_open(override, *, allow_mic: bool, mic_device: Optional[Union
             if is_input(i):
                 target = i; break
     if target is None:
+        try:
+            sys.stderr.write("[AUDIO] Nenhum dispositivo de entrada disponível para captura. Dispositivos detectados:\n")
+            for i, d in enumerate(devs):
+                sys.stderr.write(f"  {i:3d}: name='{d.get('name')}' in={d.get('max_input_channels',0)} out={d.get('max_output_channels',0)} sr={d.get('default_samplerate')}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
         raise RuntimeError("Nenhum dispositivo de entrada disponível para captura.")
     d = devs[target]
     s = sd.InputStream(samplerate=int(d.get("default_samplerate", 44100)),
