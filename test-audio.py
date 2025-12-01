@@ -1,4 +1,3 @@
-python3 << 'EOF'
 import sounddevice as sd
 import numpy as np
 import time
@@ -28,4 +27,3 @@ else:
 
 # Sample the data
 print(f"\nFirst 20 samples: {recording[:20, 0]}")
-EOF
